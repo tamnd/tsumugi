@@ -343,9 +343,12 @@ func TestEstimateBytesMatchesCode(t *testing.T) {
 // of the codes and the int8 rerank that are the bulk of the region. At 100k shards
 // this is the difference between the codes being resident and being OS-paged.
 func TestOpenIsZeroCopy(t *testing.T) {
-	const dim, n = 128, 6000
+	const dim, n = 128, 4000
 	corpus := clusteredCorpus(n, dim, 40, 3)
-	b := NewBuilder(dim)
+	// The zero-copy property is about the region's bytes, not the graph quality, so a
+	// cheap low-degree, low-ef build keeps the test fast under the race detector while
+	// the codes and int8 rerank are full size and a copy would still be plain to see.
+	b := NewBuilder(dim).WithHNSW(8, 16, 16)
 	for _, v := range corpus {
 		b.Add(v)
 	}
