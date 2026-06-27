@@ -96,6 +96,12 @@ type ParsedQuery struct {
 	Mode    Semantics
 	NormKey string
 
+	// LangConfident records whether the language detector was sure of Lang. When it is
+	// false the query was analyzed with the script-based default rather than a
+	// per-language chain, the spec's rule that a low-confidence guess must not drive
+	// analysis; the broker can use it to decide whether to trust Lang for anything else.
+	LangConfident bool
+
 	// Corrected is set when spell correction auto-substituted at least one term, so the
 	// broker can surface a "showing results for" notice. Suggestion holds the
 	// did-you-mean rendering when a correction was offered rather than applied; it is
@@ -372,6 +378,51 @@ func Parse(raw string, a Analyzer, mode Semantics) *ParsedQuery {
 		}
 	}
 	pq.NormKey = pq.normKey()
+	return pq
+}
+
+// Detector identifies a query's language, the n-gram identifier the broker holds. It
+// is an interface returning primitives so the query package depends on neither the
+// langid package nor a shared type; langid.Detector satisfies it structurally. lang is
+// the detected language code, empty for no signal or a low-confidence Latin guess;
+// confident reports whether the detection is sure enough to drive per-language
+// analysis rather than fall back to the script-based default.
+type Detector interface {
+	DetectLang(text string) (lang string, confident bool)
+}
+
+// AnalyzerFor selects the analyzer a detected language is analyzed with, the registry
+// the broker passes so the query package never imports the analyzer registry. The same
+// selector on the build side and the query side is what guarantees a document and a
+// query in one language are analyzed identically; lexical.ForLanguage wrapped in a
+// closure is the canonical implementation.
+type AnalyzerFor func(lang string) Analyzer
+
+// ParseDetected is the language-routing entry point: it detects the query's language,
+// selects that language's analyzer through sel, and parses with it, so language routing
+// falls out of analyzer selection rather than a separate router, the shape doc 10
+// pins. The detected language and its confidence are recorded on the parsed query. A
+// low-confidence detection routes on the empty language, which sel maps to the
+// script-based default, so a wrong guess never drives a per-language stem or fold. The
+// selector is the analyzer source, the same role the explicit Analyzer plays in Parse,
+// so it must be non-nil and return a non-nil analyzer; lexical.ForLanguage wrapped in a
+// closure is the canonical sel and never returns nil. A nil detector is safe and means
+// no language was detected: the query routes to the default analyzer with an empty Lang.
+func ParseDetected(raw string, sel AnalyzerFor, det Detector, mode Semantics) *ParsedQuery {
+	lang := ""
+	confident := false
+	if det != nil {
+		lang, confident = det.DetectLang(raw)
+	}
+	// The analyzer is chosen on the confident language; a low-confidence guess routes
+	// to the default by passing the empty language, never the guessed one.
+	routeLang := lang
+	if !confident {
+		routeLang = ""
+	}
+	pq := Parse(raw, sel(routeLang), mode)
+	pq.Lang = lang
+	pq.LangConfident = confident
 	return pq
 }
 
