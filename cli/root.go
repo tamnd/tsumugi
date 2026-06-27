@@ -35,5 +35,6 @@ func newRoot() *cobra.Command {
 		SilenceErrors: true,
 	}
 	root.AddCommand(newInspectCmd())
+	root.AddCommand(newServeCmd())
 	return root
 }
