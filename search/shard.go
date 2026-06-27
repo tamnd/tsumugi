@@ -135,7 +135,7 @@ func (s *Shard) retrieve(q Query) (lex, dense []scored, feats map[uint32][]float
 		k = s.l0
 	}
 	if s.lex != nil && q.Text != "" {
-		cands, err := s.lex.Search(q.Text, k)
+		cands, err := s.lexSearch(q, k)
 		if err == nil {
 			for _, c := range cands {
 				lex = append(lex, scored{docID: c.DocID, score: float64(c.Score)})
@@ -162,6 +162,25 @@ func (s *Shard) retrieve(q Query) (lex, dense []scored, feats map[uint32][]float
 		}
 	}
 	return lex, dense, feats
+}
+
+// lexSearch runs the lexical plane, scoring with the broker's pushed-down
+// collection-wide idf when the query carries one and the shard's local idf otherwise.
+func (s *Shard) lexSearch(q Query, k int) ([]lexical.Candidate, error) {
+	if q.TermIDF != nil {
+		return s.lex.SearchWithIDF(q.Text, k, q.TermIDF)
+	}
+	return s.lex.Search(q.Text, k)
+}
+
+// LexDocFreqs returns the local document frequency of each query term this shard's
+// lexical region holds, the first phase of the broker's distributed exact-idf scoring.
+// A shard with no lexical region contributes nothing.
+func (s *Shard) LexDocFreqs(text string) map[string]uint32 {
+	if s.lex == nil {
+		return nil
+	}
+	return s.lex.DocFreqs(text)
 }
 
 // Search runs the full cascade over this one shard and returns the model-ranked

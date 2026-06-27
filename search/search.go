@@ -27,6 +27,12 @@ type Query struct {
 	Sparse map[string]int
 	Vector []float32
 	K      int
+
+	// TermIDF, when set, overrides the lexical idf of each query term with a value
+	// computed from outside the shard, the collection-wide idf the broker pushes down
+	// so every shard scores a term against the same df and N. It is nil on the
+	// single-shard path, where the shard's local idf is already the collection idf.
+	TermIDF map[string]float64
 }
 
 // Hit is one ranked result: the global document id and its final model score. The
