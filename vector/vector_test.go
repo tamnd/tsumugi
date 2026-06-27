@@ -441,9 +441,11 @@ func nearDupRows(n, dim, clusters int, seed int64) [][]int8 {
 // requires every node reachable, with no node pushed past the layer-0 degree budget
 // the fixed-width serialized format silently truncates at.
 func TestRepairReconnectsOrphans(t *testing.T) {
-	const n, dim, m, m0 = 2500, 128, 16, 32
+	const n, dim, m, m0 = 2000, 128, 8, 16
 	rows := nearDupRows(n, dim, 30, 99)
-	g := newHNSW(rows, m, m0, 200, 7)
+	// A low ef keeps the serial build cheap under the race detector; a narrow beam
+	// also strands more nodes, not fewer, so it exercises the repair harder.
+	g := newHNSW(rows, m, m0, 16, 7)
 	if pre := g.reachableCount(); pre >= n {
 		t.Fatalf("expected the raw build to strand nodes so the repair is exercised, got all %d reachable", pre)
 	} else {
@@ -473,13 +475,15 @@ func TestRepairReconnectsOrphans(t *testing.T) {
 // which every document is reachable from the stored entry point, so the connectivity
 // the repair guarantees survives serialization and a search can reach any document.
 func TestBuildRegionFullyReachable(t *testing.T) {
-	const n, dim = 2000, 96
+	const n, dim = 1500, 96
 	rng := rand.New(rand.NewSource(5))
 	centers := make([][]float32, 25)
 	for c := range centers {
 		centers[c] = normalize(randVec(rng, dim))
 	}
-	b := NewBuilder(dim)
+	// A cheap low-degree, low-ef build keeps the test fast under the race detector; the
+	// connectivity invariant the test checks holds regardless of graph quality.
+	b := NewBuilder(dim).WithHNSW(8, 16, 16)
 	for i := 0; i < n; i++ {
 		c := centers[rng.Intn(len(centers))]
 		v := make([]float32, dim)
