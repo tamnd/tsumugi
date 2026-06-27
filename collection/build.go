@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"time"
 
 	"github.com/tamnd/tsumugi"
 	"github.com/tamnd/tsumugi/analyze"
@@ -105,6 +106,13 @@ func build(opts Options, baseStart uint32, indexStart int) (Result, error) {
 		base += uint32(hi - lo)
 		index++
 		res.Shards++
+	}
+	// Refresh the collection artifact so serve reads the manifest, the fleet-wide
+	// statistics, and the routing index from one file instead of rescanning every
+	// shard. The index covers the whole directory, so an add reindexes the union of
+	// the old and new shards, not just the slice this call wrote.
+	if err := WriteIndex(opts.Out, uint64(time.Now().Unix())); err != nil {
+		return Result{}, fmt.Errorf("write index: %w", err)
 	}
 	return res, nil
 }

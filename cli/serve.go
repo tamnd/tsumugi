@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/tamnd/tsumugi/collection"
 	"github.com/tamnd/tsumugi/rank"
 	"github.com/tamnd/tsumugi/search"
 )
@@ -25,11 +26,12 @@ func newServeCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Serve ranked search over a directory of shards",
-		Long: "serve opens every .tsumugi shard in a directory, builds the routing index\n" +
-			"and the fleet-wide statistics, and answers ranked queries over HTTP. Each\n" +
-			"request fans out to the shards that can contribute, gathers their candidates,\n" +
-			"and runs one global rerank, so the merged top-k is the result a single index\n" +
-			"over every shard would give.",
+		Long: "serve opens a directory of .tsumugi shards and answers ranked queries over\n" +
+			"HTTP. It loads the routing index and the fleet-wide statistics from the\n" +
+			"collection's index.tsm artifact, falling back to scanning the shards when no\n" +
+			"artifact is present. Each request fans out to the shards that can contribute,\n" +
+			"gathers their candidates, and runs one global rerank, so the merged top-k is the\n" +
+			"result a single index over every shard would give.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if dir == "" {
@@ -76,6 +78,16 @@ func openCollection(dir, modelPath string) (*search.Broker, error) {
 	}
 	model := ens.Compile()
 
+	// Prefer the persisted collection artifact: it carries the manifest, the fleet-wide
+	// statistics, and the routing index, so the broker starts without rescanning every
+	// shard's vocabulary, which is what lets serve start in time at fleet scale. A
+	// collection built before the artifact existed has none, so fall back to the scan.
+	if ix, err := collection.LoadIndex(dir); err == nil {
+		return brokerFromIndex(dir, model, ix)
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("load index: %w", err)
+	}
+
 	paths, err := filepath.Glob(filepath.Join(dir, "*.tsumugi"))
 	if err != nil {
 		return nil, err
@@ -95,6 +107,33 @@ func openCollection(dir, modelPath string) (*search.Broker, error) {
 		shards = append(shards, s)
 	}
 	return search.NewBroker(shards, newCascade(model)), nil
+}
+
+// brokerFromIndex opens the shards the artifact names, in the artifact's order, and
+// wires a broker over them with the persisted routing index and statistics. Opening in
+// the manifest's order is what keeps the routing index's shard ids aligned with the
+// shard slice, so a routed shard id always points at the shard the artifact recorded it
+// for.
+func brokerFromIndex(dir string, model *rank.Model, ix *collection.Index) (*search.Broker, error) {
+	shards := make([]*search.Shard, 0, len(ix.Shards))
+	for _, info := range ix.Shards {
+		p := filepath.Join(dir, filepath.Base(info.Path))
+		s, err := search.OpenShard(p, newCascade(model))
+		if err != nil {
+			for _, opened := range shards {
+				_ = opened.Close()
+			}
+			return nil, fmt.Errorf("open shard %s: %w", p, err)
+		}
+		shards = append(shards, s)
+	}
+	routing := search.NewRoutingIndex(ix.RoutingMap(), ix.AlwaysRouted(), len(shards))
+	stats := search.GlobalStats{
+		DocCount:   ix.Stats.DocCount,
+		TokenCount: ix.Stats.TokenCount,
+		AvgDocLen:  ix.Stats.AvgDocLen,
+	}
+	return search.NewBrokerWith(shards, newCascade(model), routing, stats), nil
 }
 
 func newCascade(model *rank.Model) *rank.Cascade {

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"github.com/tamnd/tsumugi"
 	"github.com/tamnd/tsumugi/convert"
@@ -85,6 +86,11 @@ func Compact(dir string, shardSize int) (Result, error) {
 	}
 	if err := os.RemoveAll(staging); err != nil {
 		return Result{}, err
+	}
+	// The shard set changed, so the old artifact's manifest and routing are stale.
+	// Rebuild it over the compacted shards.
+	if err := WriteIndex(dir, uint64(time.Now().Unix())); err != nil {
+		return Result{}, fmt.Errorf("write index: %w", err)
 	}
 	return res, nil
 }
