@@ -201,18 +201,22 @@ func TestSpimiBoundedMemory(t *testing.T) {
 
 // sampleHeapPeak runs f while polling HeapInuse on a ticker and returns the highest
 // reading seen. It is a coarse peak, enough to show the order-of-magnitude difference the
-// external merge buys, not a precise allocator measurement.
+// external merge buys, not a precise allocator measurement. The peak lives inside the
+// sampler goroutine and comes back over a channel, so there is no variable shared between
+// the sampler and the caller to race on.
 func sampleHeapPeak(f func()) uint64 {
 	runtime.GC()
-	var peak uint64
-	done := make(chan struct{})
+	stop := make(chan struct{})
+	result := make(chan uint64, 1)
 	go func() {
 		var ms runtime.MemStats
+		var peak uint64
 		tick := time.NewTicker(time.Millisecond)
 		defer tick.Stop()
 		for {
 			select {
-			case <-done:
+			case <-stop:
+				result <- peak
 				return
 			case <-tick.C:
 				runtime.ReadMemStats(&ms)
@@ -223,8 +227,8 @@ func sampleHeapPeak(f func()) uint64 {
 		}
 	}()
 	f()
-	close(done)
-	return peak
+	close(stop)
+	return <-result
 }
 
 // BenchmarkBuildCCrawl compares the two builders on real crawl data, reporting allocation
