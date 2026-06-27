@@ -1,0 +1,10 @@
+title       = "tsumugi"
+baseURL     = "https://tsumugi.tamnd.com/"
+description = "tsumugi (紡) weaves a crawl into a web-scale search and ranking engine on compact single-file shards. One self-describing file holds the inverted index, stored fields, a quantized feature matrix, the compressed link graph, and quantized vectors, and a broker merges an exact fleet-wide top-k in milliseconds."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/tsumugi"
