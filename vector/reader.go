@@ -128,25 +128,26 @@ func (r *Region) Dim() int { return int(r.h.dimKept) }
 func (r *Region) HasRerank() bool { return r.hasRerank }
 
 // Cosine returns the cosine of the query against the stored document vector at
-// docID, computed in the int8 rerank space the region keeps for exactly this
-// faithful comparison. The query is rotated and int8-quantized the same way the
-// document vectors were, so the dot is taken between comparable codes, then
-// normalized by both vectors' int8 norms to land in roughly [-1, 1]. The bool is
-// false when the region has no rerank copy or docID is out of range, the absent
-// case the L2 feature path encodes as a missing feature rather than a zero.
+// docID, computed asymmetrically: the full-precision rotated query is dotted against
+// the dequantized int8 document row, so the query's quantization error never enters
+// the score. The int8 scale cancels between the numerator's dequantization and the
+// document norm, so it drops out, and the result is normalized by the query's
+// full-precision norm and the document's int8 norm to land in roughly [-1, 1]. The
+// bool is false when the region has no rerank copy or docID is out of range, the
+// absent case the L2 feature path encodes as a missing feature rather than a zero.
 //
-// This is the L2 dense_cosine of doc 09: the one-bit code drives recall in L0,
-// but it is too lossy for a rerank score, so the sharp int8 copy is paged in only
-// for the small candidate set and dotted here.
+// This is the L2 dense_cosine of doc 09: the one-bit code drives recall in L0, but it
+// is too lossy for a rerank score, so the sharp int8 copy is paged in only for the
+// small candidate set and dotted against the float query here (05 line 544).
 func (r *Region) Cosine(query []float32, docID uint32) (float64, bool) {
 	if !r.hasRerank || int(docID) >= int(r.h.count) {
 		return 0, false
 	}
 	rdim := int(r.h.rdim)
-	qi8 := r.iq.encodeQuery(r.rot.rotate(query))
+	qRot := r.rot.rotate(query)
 	row := r.rerank[int(docID)*rdim : (int(docID)+1)*rdim]
-	dot := float64(dotI8(qi8, row))
-	qn := normI8(qi8)
+	dot := dotF32I8(qRot, row)
+	qn := normF32(qRot)
 	dn := normI8(row)
 	if qn == 0 || dn == 0 {
 		return 0, true
@@ -160,6 +161,15 @@ func normI8(v []int8) float64 {
 	var s float64
 	for _, x := range v {
 		s += float64(int32(x) * int32(x))
+	}
+	return math.Sqrt(s)
+}
+
+// normF32 is the Euclidean norm of a float32 vector, accumulated in float64.
+func normF32(v []float32) float64 {
+	var s float64
+	for _, x := range v {
+		s += float64(x) * float64(x)
 	}
 	return math.Sqrt(s)
 }
@@ -265,19 +275,21 @@ func (r *Region) walk(distQ func(int32) float64, efSearch int) []cand {
 }
 
 // rerankAndTop scores the candidate set sharply and returns the top-k. In the
-// two-part mode it dequantizes the int8 copy and dots against the int8 query; in
-// the no-rerank mode it uses the asymmetric RaBitQ estimator off the one-bit code.
+// two-part mode it dots the full-precision query against the dequantized int8 copy,
+// the asymmetric score the spec calls for (05 line 544), so the query's quantization
+// error never enters the ranking; in the no-rerank mode it uses the asymmetric RaBitQ
+// estimator off the one-bit code.
 func (r *Region) rerankAndTop(qRot []float32, qc queryCode, cands []cand, k, rerankDepth int) []Result {
 	if len(cands) > rerankDepth {
 		cands = cands[:rerankDepth]
 	}
 	scored := make([]Result, len(cands))
 	if r.hasRerank {
-		qi8 := r.iq.encodeQuery(qRot)
+		scale := float64(r.iq.scale)
 		rdim := int(r.h.rdim)
 		for i, c := range cands {
 			row := r.rerank[int(c.id)*rdim : (int(c.id)+1)*rdim]
-			scored[i] = Result{DocID: uint32(c.id), Score: float64(dotI8(qi8, row))}
+			scored[i] = Result{DocID: uint32(c.id), Score: scale * dotF32I8(qRot, row)}
 		}
 	} else {
 		for i, c := range cands {
@@ -308,11 +320,11 @@ func (r *Region) BruteForce(query []float32, k int) []Result {
 	n := int(r.h.count)
 	scored := make([]Result, n)
 	if r.hasRerank {
-		qi8 := r.iq.encodeQuery(qRot)
+		scale := float64(r.iq.scale)
 		rdim := int(r.h.rdim)
 		for i := 0; i < n; i++ {
 			row := r.rerank[i*rdim : (i+1)*rdim]
-			scored[i] = Result{DocID: uint32(i), Score: float64(dotI8(qi8, row))}
+			scored[i] = Result{DocID: uint32(i), Score: scale * dotF32I8(qRot, row)}
 		}
 	} else {
 		for i := 0; i < n; i++ {
