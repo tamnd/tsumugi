@@ -11,6 +11,7 @@ import (
 	"github.com/tamnd/tsumugi/analyze"
 	"github.com/tamnd/tsumugi/convert"
 	"github.com/tamnd/tsumugi/feature"
+	"github.com/tamnd/tsumugi/graph"
 )
 
 // TestGlobalRanksResolvesCrossHostLinks proves the collection-wide pass resolves
@@ -124,6 +125,78 @@ func TestBuildBakesCrossShardPageRank(t *testing.T) {
 	if hubRank <= lonelyRank {
 		t.Fatalf("hub rank %g should beat the unlinked page %g across the shard boundary", hubRank, lonelyRank)
 	}
+}
+
+// refRanksViaMap recomputes the collection PageRank with a plain map directory, the
+// straightforward reference the minimal-perfect-hash directory must match exactly.
+func refRanksViaMap(docs []convert.Document) []float64 {
+	urlToID := make(map[string]int, len(docs))
+	for i, d := range docs {
+		if cu, ok := analyze.CanonicalURL(d.URL); ok {
+			if _, dup := urlToID[cu]; !dup {
+				urlToID[cu] = i
+			}
+		}
+	}
+	gb := graph.NewBuilder(len(docs))
+	for i, d := range docs {
+		for _, tgt := range analyze.Links(d) {
+			if j, ok := urlToID[tgt]; ok && j != i {
+				gb.AddEdge(i, j)
+			}
+		}
+	}
+	g, err := graph.Open(gb.Build())
+	if err != nil {
+		panic(err)
+	}
+	return graph.PageRank(g, graph.DefaultPRConfig())
+}
+
+// TestMPHDirMatchesMapOnCCrawl proves the minimal-perfect-hash directory is a
+// drop-in for the plain map: over the whole real collection the ranks it produces
+// are bit-for-bit identical to the map's, so the few-bits-a-key directory changes
+// the build's memory, not its output. The membership fingerprint must reject every
+// one of the many link targets the crawl did not capture, or a spurious edge would
+// shift a rank and the vectors would diverge.
+func TestMPHDirMatchesMapOnCCrawl(t *testing.T) {
+	if _, err := os.Stat(ccrawlGraphParquet); err != nil {
+		t.Skipf("ccrawl parquet not present: %v", err)
+	}
+	src, err := convert.OpenSource(ccrawlGraphParquet)
+	if err != nil {
+		t.Fatalf("open source: %v", err)
+	}
+	var docs []convert.Document
+	for {
+		d, ok, err := src.Next()
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if !ok {
+			break
+		}
+		if d.Body == "" {
+			continue
+		}
+		docs = append(docs, d)
+	}
+	_ = src.Close()
+	if len(docs) == 0 {
+		t.Skip("no documents in parquet")
+	}
+
+	want := refRanksViaMap(docs)
+	got := globalRanks(docs)
+	if len(got) != len(want) {
+		t.Fatalf("length %d != reference %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("rank[%d] = %v, map reference = %v; the MPH directory diverged", i, got[i], want[i])
+		}
+	}
+	t.Logf("docs=%d ranks bit-for-bit identical to the plain-map directory", len(docs))
 }
 
 // TestGlobalGraphOnCCrawl records what the collection-wide resolution recovers on
