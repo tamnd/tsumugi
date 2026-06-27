@@ -1,6 +1,7 @@
 package vector
 
 import (
+	"fmt"
 	"math"
 
 	"github.com/tamnd/tsumugi/codec"
@@ -57,8 +58,10 @@ func (b *Builder) Add(vec []float32) {
 	b.vecs = append(b.vecs, cp)
 }
 
-// Build rotates, quantizes, indexes, and frames the region.
-func (b *Builder) Build() []byte {
+// Build rotates, quantizes, indexes, and frames the region. It returns an error
+// only if the graph cannot be made fully reachable from the entry point, which the
+// orphan repair below prevents on any normal corpus.
+func (b *Builder) Build() ([]byte, error) {
 	rot := newRotator(b.dim, b.seed)
 	rdim := rot.rdim
 	n := len(b.vecs)
@@ -112,6 +115,22 @@ func (b *Builder) Build() []byte {
 	}
 
 	g := newHNSW(rows, b.m, b.m0, b.efConstruction, b.seed)
+	// Guarantee the connectivity invariant the search relies on: every node must be
+	// reachable from the entry, or the document it holds is invisible to dense search.
+	// repair grafts orphans back in and a single pass reconnects the graph unless an
+	// eviction re-orphans a node, so loop until the reachable count stops rising.
+	prev := -1
+	for {
+		g.repair()
+		reached := g.reachableCount()
+		if reached == n {
+			break
+		}
+		if reached <= prev {
+			return nil, fmt.Errorf("%w: %d of %d nodes reachable", ErrUnreachable, reached, n)
+		}
+		prev = reached
+	}
 	linksPart := serializeLinks(g)
 
 	flags := uint32(0)
@@ -149,5 +168,5 @@ func (b *Builder) Build() []byte {
 	region = append(region, codesPart...)
 	region = append(region, rerankPart...)
 	region = append(region, linksPart...)
-	return region
+	return region, nil
 }

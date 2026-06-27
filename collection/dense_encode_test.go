@@ -82,7 +82,11 @@ func TestDenseEncodeCCrawl(t *testing.T) {
 		t.Skipf("only %d usable pages in the slice, too few to gate", len(pages))
 	}
 
-	region, err := vector.Open(b.Build())
+	vregion, err := b.Build()
+	if err != nil {
+		t.Fatalf("build region: %v", err)
+	}
+	region, err := vector.Open(vregion)
 	if err != nil {
 		t.Fatalf("open region: %v", err)
 	}
