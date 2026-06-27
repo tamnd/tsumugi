@@ -10,6 +10,7 @@ package codec
 import (
 	"encoding/binary"
 	"hash/crc32"
+	"math"
 
 	"github.com/cespare/xxhash/v2"
 )
@@ -76,6 +77,80 @@ func Uint64(b []byte) uint64 { return binary.LittleEndian.Uint64(b) }
 
 // Uint32 reads a little-endian uint32 from the front of b.
 func Uint32(b []byte) uint32 { return binary.LittleEndian.Uint32(b) }
+
+// Float16bits converts a float32 to its IEEE 754 half-precision (binary16) bit
+// pattern, rounding the mantissa to nearest even. It is the codec for the small
+// per-vector scalars a region stores at half width: a value that only needs three
+// or four significant digits (a calibration scalar, a unit norm) costs two bytes
+// instead of four. Overflow saturates to infinity, subnormals round toward zero,
+// and NaN is preserved as a quiet NaN.
+func Float16bits(f float32) uint16 {
+	b := math.Float32bits(f)
+	sign := uint16((b >> 16) & 0x8000)
+	exp := int32((b>>23)&0xff) - 127 + 15
+	mant := b & 0x7fffff
+	if (b>>23)&0xff == 0xff { // Inf or NaN
+		if mant != 0 {
+			return sign | 0x7e00 // quiet NaN
+		}
+		return sign | 0x7c00 // Inf
+	}
+	if exp >= 0x1f { // overflow to Inf
+		return sign | 0x7c00
+	}
+	if exp <= 0 { // subnormal or zero
+		if exp < -10 { // too small to represent, round to signed zero
+			return sign
+		}
+		mant |= 0x800000 // restore the implicit leading one
+		shift := uint32(14 - exp)
+		half := mant >> shift
+		rem := mant & ((1 << shift) - 1)
+		halfway := uint32(1) << (shift - 1)
+		if rem > halfway || (rem == halfway && half&1 == 1) {
+			half++
+		}
+		return sign | uint16(half)
+	}
+	// normal: 5-bit exponent, 10-bit mantissa, round to nearest even
+	half := sign | uint16(exp<<10) | uint16(mant>>13)
+	rem := mant & 0x1fff
+	if rem > 0x1000 || (rem == 0x1000 && (mant>>13)&1 == 1) {
+		half++ // a mantissa carry ripples into the exponent field correctly
+	}
+	return half
+}
+
+// Float16frombits converts an IEEE 754 half-precision bit pattern back to float32,
+// the exact inverse of Float16bits for every finite value it produced.
+func Float16frombits(h uint16) float32 {
+	sign := uint32(h&0x8000) << 16
+	exp := uint32(h>>10) & 0x1f
+	mant := uint32(h & 0x3ff)
+	switch exp {
+	case 0:
+		if mant == 0 {
+			return math.Float32frombits(sign)
+		}
+		// subnormal: shift the mantissa up until the implicit one appears
+		e := uint32(0)
+		for mant&0x400 == 0 {
+			mant <<= 1
+			e++
+		}
+		mant &= 0x3ff
+		exp32 := uint32(127 - 15 - e + 1)
+		return math.Float32frombits(sign | (exp32 << 23) | (mant << 13))
+	case 0x1f:
+		if mant == 0 {
+			return math.Float32frombits(sign | 0x7f800000) // Inf
+		}
+		return math.Float32frombits(sign | 0x7fc00000) // NaN
+	default:
+		exp32 := exp - 15 + 127
+		return math.Float32frombits(sign | (exp32 << 23) | (mant << 13))
+	}
+}
 
 // XXHash64 returns the 64-bit xxHash of b, the same hash kv and tatami use for
 // membership filters and routing.

@@ -586,3 +586,78 @@ func TestBuildRegionFullyReachable(t *testing.T) {
 		t.Fatalf("only %d of %d documents reachable from the entry in the built region", reached, n)
 	}
 }
+
+// TestFloat16CodeLayout is the M17 disk gate for the half-width per-code scalars. A
+// normalized region must store the scalar as a float16 and drop the norm entirely
+// (2 header bytes a code), a non-normalized region must store both the scalar and the
+// norm as float16 (4 header bytes), and either way the reader must read the scalars
+// back within the float16 rounding bound, so the savings cost nothing in recall.
+func TestFloat16CodeLayout(t *testing.T) {
+	const dim, n = 64, 400
+	corpus := clusteredCorpus(n, dim, 12, 21)
+
+	// Normalized: scalar only, norm dropped.
+	bn := NewBuilder(dim).WithHNSW(8, 16, 16)
+	for _, v := range corpus {
+		bn.Add(v)
+	}
+	rn, err := Open(mustBuild(t, bn))
+	if err != nil {
+		t.Fatalf("open normalized: %v", err)
+	}
+	words := int(rn.h.rdim) / 64
+	if rn.hasStoredNorm {
+		t.Fatal("normalized region stored the norm field, want it dropped")
+	}
+	if rn.bitsOff != 2 || rn.stride != 2+words*8 {
+		t.Fatalf("normalized stride %d bitsOff %d, want %d/2", rn.stride, rn.bitsOff, 2+words*8)
+	}
+	if got := rn.norm(0); got != 1 {
+		t.Fatalf("dropped norm read back as %v, want constant 1", got)
+	}
+
+	// Non-normalized: scalar and norm both stored as float16.
+	bu := NewBuilder(dim).WithNormalized(false).WithHNSW(8, 16, 16)
+	for _, v := range corpus {
+		bu.Add(v)
+	}
+	ru, err := Open(mustBuild(t, bu))
+	if err != nil {
+		t.Fatalf("open non-normalized: %v", err)
+	}
+	if !ru.hasStoredNorm {
+		t.Fatal("non-normalized region dropped the norm field, want it stored")
+	}
+	if ru.bitsOff != 4 || ru.stride != 4+words*8 {
+		t.Fatalf("non-normalized stride %d bitsOff %d, want %d/4", ru.stride, ru.bitsOff, 4+words*8)
+	}
+
+	// The reader must read each scalar and norm back within the float16 bound against
+	// the value the encoder computed from the rotated vector.
+	rot := newRotator(dim, defaultSeed)
+	for i := 0; i < n; i++ {
+		want := encodeOneBit(rot.rotate(corpus[i]))
+		if rel := relErr(ru.scalar(int32(i)), want.scalar); rel > 1.0/2048 {
+			t.Fatalf("doc %d scalar read %v want ~%v, rel %g", i, ru.scalar(int32(i)), want.scalar, rel)
+		}
+		if rel := relErr(ru.norm(int32(i)), want.norm); rel > 1.0/2048 {
+			t.Fatalf("doc %d norm read %v want ~%v, rel %g", i, ru.norm(int32(i)), want.norm, rel)
+		}
+	}
+
+	// Report the disk saving against the old four-byte float32 layout, so the gate
+	// records what the half-width scalars buy per code.
+	oldStride := 8 + words*8
+	t.Logf("dim %d (rdim %d, %d words): code stride normalized %d, non-normalized %d, old float32 %d; saved %d/%d bytes per code (%.0f%%/%.0f%%)",
+		dim, rn.h.rdim, words, rn.stride, ru.stride, oldStride,
+		oldStride-rn.stride, oldStride-ru.stride,
+		100*float64(oldStride-rn.stride)/float64(oldStride),
+		100*float64(oldStride-ru.stride)/float64(oldStride))
+}
+
+func relErr(got, want float32) float64 {
+	if want == 0 {
+		return math.Abs(float64(got))
+	}
+	return math.Abs(float64(got-want)) / math.Abs(float64(want))
+}
