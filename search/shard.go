@@ -3,6 +3,7 @@ package search
 import (
 	"github.com/tamnd/tsumugi"
 	"github.com/tamnd/tsumugi/feature"
+	"github.com/tamnd/tsumugi/forward"
 	"github.com/tamnd/tsumugi/lexical"
 	"github.com/tamnd/tsumugi/rank"
 	"github.com/tamnd/tsumugi/sparse"
@@ -27,6 +28,7 @@ type Shard struct {
 	vec  *vector.Region
 	sp   *sparse.Region
 	feat *feature.Region
+	fwd  *forward.Region
 
 	cols    []feature.Column
 	cascade *rank.Cascade
@@ -92,6 +94,18 @@ func newShard(r *tsumugi.Reader, cascade *rank.Cascade) (*Shard, error) {
 			return nil, err
 		}
 		if s.feat, err = feature.Open(b); err != nil {
+			return nil, err
+		}
+	}
+	// The forward region holds the candidate text the online L2 features decode:
+	// the title, body, and url a BM25F or proximity feature scores against. A shard
+	// without it serves the matrix features but extracts no online text features.
+	if r.HasRegion(tsumugi.RegionForward) {
+		b, err := r.Region(tsumugi.RegionForward)
+		if err != nil {
+			return nil, err
+		}
+		if s.fwd, err = forward.Open(b); err != nil {
 			return nil, err
 		}
 	}
@@ -191,13 +205,75 @@ func (s *Shard) Search(q Query) []Hit {
 	lex, dense, feats := s.retrieve(q)
 	lexIDs := localIDs(lex)
 	denseIDs := localIDs(dense)
-	feat := func(id uint32) []float64 { return feats[id] }
-	cands := s.cascade.Rank(lexIDs, denseIDs, feat, q.K)
+	// L1 reads the cheap matrix row; L2 reads the matrix row followed by the online
+	// query-dependent features the extractor computes per survivor. The single-shard
+	// path scores idf and the average body length against this shard's own counts,
+	// the local statistics that are the collection statistics when there is one shard.
+	ext := s.newOnline(q, q.TermIDF, s.localAvgBodyLen())
+	l1feat := func(id uint32) []float64 { return feats[id] }
+	l2feat := func(id uint32) []float64 { return s.l2Row(feats[id], ext, id) }
+	cands := s.cascade.Rank(lexIDs, denseIDs, l1feat, l2feat, q.K)
 	hits := make([]Hit, len(cands))
 	for i, c := range cands {
 		hits[i] = Hit{DocID: s.nodeBase + c.DocID, Score: c.Score}
 	}
 	return hits
+}
+
+// newOnline builds the per-query online feature extractor over this shard's
+// forward and vector regions. idfOf is the per-term idf to score BM25 with, the
+// broker's pushed-down collection idf on the fan-out path or the query's own
+// override; a nil map falls back to the shard-local idf when the lexical region can
+// supply it. avgBody is the average body length BM25 normalizes by.
+func (s *Shard) newOnline(q Query, idfOf map[string]float64, avgBody float64) *onlineExtractor {
+	if idfOf == nil && q.Text != "" && s.lex != nil {
+		idfOf = s.localIDF(q.Text)
+	}
+	return newOnlineExtractor(q, s.fwd, s.vec, idfOf, avgBody)
+}
+
+// l2Row assembles the full L2 feature vector for a candidate: the query-independent
+// matrix row followed by the online query-dependent features, the concatenated
+// width the L2 model is trained against. base is the candidate's matrix row, reused
+// without copying since the online features are appended onto a fresh backing array.
+func (s *Shard) l2Row(base []float64, ext *onlineExtractor, localID uint32) []float64 {
+	online := ext.features(localID)
+	row := make([]float64, 0, len(base)+len(online))
+	row = append(row, base...)
+	row = append(row, online...)
+	return row
+}
+
+// localIDF computes the shard-local idf of each query term from this shard's own
+// document count and the term's local document frequency, the idf the single-shard
+// path scores with when no collection-wide idf is pushed down.
+func (s *Shard) localIDF(text string) map[string]float64 {
+	if s.lex == nil {
+		return nil
+	}
+	df := s.lex.DocFreqs(text)
+	if len(df) == 0 {
+		return nil
+	}
+	out := make(map[string]float64, len(df))
+	for t, f := range df {
+		out[t] = lexical.IDF(uint64(s.docCount), uint64(f))
+	}
+	return out
+}
+
+// localAvgBodyLen is the shard's average body length in tokens, the BM25 length
+// normalizer for the single-shard path. It reads the token count the build recorded
+// and divides by the document count; a shard with neither recorded falls back to no
+// normalization.
+func (s *Shard) localAvgBodyLen() float64 {
+	if s.docCount == 0 {
+		return 0
+	}
+	if v, ok := s.r.Stat(tsumugi.StatTokenCount); ok {
+		return v / float64(s.docCount)
+	}
+	return 0
 }
 
 // localIDs drops the scores and returns the document ids in list order, the shape

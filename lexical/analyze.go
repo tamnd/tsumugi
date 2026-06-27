@@ -10,6 +10,7 @@ package lexical
 import (
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // Field identifies one of the four indexed fields. BM25F weights and
@@ -40,12 +41,38 @@ func Analyze(text string) []string {
 		}
 	}
 	for _, r := range text {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			b.WriteRune(unicode.ToLower(r))
+		if IsTokenRune(r) {
+			b.WriteRune(FoldRune(r))
 		} else {
 			flush()
 		}
 	}
 	flush()
 	return out
+}
+
+// IsTokenRune reports whether r belongs to a token: a letter or a digit. Token
+// boundaries are the runs of everything else. The ASCII range is decided inline so
+// the common case skips the Unicode tables; non-ASCII falls back to them. This is
+// the single source of the analyzer's token rule, so every reader of the index,
+// the query side and the online L2 feature scanner included, splits identically.
+func IsTokenRune(r rune) bool {
+	if r < utf8.RuneSelf {
+		return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+	}
+	return unicode.IsLetter(r) || unicode.IsDigit(r)
+}
+
+// FoldRune applies the analyzer's one normalization, lowercasing. ASCII upper case
+// folds inline; everything else defers to unicode.ToLower. Pairing it with
+// IsTokenRune keeps the build, the query, and the online scanner byte for byte in
+// agreement on what a term is.
+func FoldRune(r rune) rune {
+	if r < utf8.RuneSelf {
+		if r >= 'A' && r <= 'Z' {
+			return r + ('a' - 'A')
+		}
+		return r
+	}
+	return unicode.ToLower(r)
 }

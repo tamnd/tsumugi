@@ -163,7 +163,7 @@ func TestCascadeEndToEnd(t *testing.T) {
 
 	l1 := &Linear{Cols: []int{0}, Weights: []float64{1}, RetrievalWeight: 1}
 	c := NewCascade(l1, m)
-	got := c.Rank(lexical, dense, feat, 10)
+	got := c.Rank(lexical, dense, feat, feat, 10)
 	if len(got) == 0 || got[0].DocID != 42 {
 		t.Fatalf("cascade top = %v, want doc 42 first", got)
 	}
