@@ -31,11 +31,13 @@ var languageAnalyzers = map[string]*Analyzer{
 	"nl": {NFKC: true, FoldAccents: true},
 
 	// Non-Latin scripts: NFKC folds the width and compatibility variants their text
-	// carries so half-width and full-width forms match. Word segmentation for the CJK
-	// languages is the segmenting analyzer a later slice records here; until then the
-	// run-based tokenizer indexes each script run, and NFKC is the safe normalization.
-	"zh": {NFKC: true},
-	"ja": {NFKC: true},
+	// carries so half-width and full-width forms match. The CJK languages additionally
+	// segment, since they write without word spaces and the run-based tokenizer would
+	// otherwise emit a whole sentence as one term; Korean is space-separated so it keeps
+	// the run tokenizer. Segmentation and NFKC are both recorded in the analyzer_hash,
+	// so the build and the query segment the same text into the same words.
+	"zh": {NFKC: true, Segment: true},
+	"ja": {NFKC: true, Segment: true},
 	"ko": {NFKC: true},
 	"ru": {NFKC: true},
 	"ar": {NFKC: true},
