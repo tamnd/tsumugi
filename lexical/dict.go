@@ -314,3 +314,54 @@ func (d *dict) term(termID uint32) (string, bool) {
 	}
 	return "", false
 }
+
+// forEach calls fn for every term in the dictionary in sorted order, with its document
+// frequency. It walks each front-coding block from its anchor, reconstructing terms
+// from the shared-prefix-plus-suffix coding, the same decode the block scan does but
+// over the whole dictionary rather than to a single target. The spell-corrector
+// dictionary build and the reverse-lookup tooling use it.
+func (d *dict) forEach(fn func(term string, docFreq uint32)) {
+	for bi := 0; bi < len(d.anchorOffsets); bi++ {
+		off := int(d.anchorOffsets[bi])
+		end := len(d.blocks)
+		if bi+1 < len(d.anchorOffsets) {
+			end = int(d.anchorOffsets[bi+1])
+		}
+		al, n := codec.Uvarint(d.blocks[off:])
+		if n <= 0 {
+			return
+		}
+		off += n
+		cur := string(d.blocks[off : off+int(al)])
+		off += int(al)
+		e, off2, err := readEntry(d.blocks, off)
+		if err != nil {
+			return
+		}
+		off = off2
+		fn(cur, e.docFreq)
+		prev := cur
+		for off < end {
+			shared, n := codec.Uvarint(d.blocks[off:])
+			if n <= 0 {
+				return
+			}
+			off += n
+			sl, n := codec.Uvarint(d.blocks[off:])
+			if n <= 0 {
+				return
+			}
+			off += n
+			suffix := d.blocks[off : off+int(sl)]
+			off += int(sl)
+			cur = prev[:shared] + string(suffix)
+			e, off2, err := readEntry(d.blocks, off)
+			if err != nil {
+				return
+			}
+			off = off2
+			fn(cur, e.docFreq)
+			prev = cur
+		}
+	}
+}

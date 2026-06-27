@@ -95,6 +95,69 @@ type ParsedQuery struct {
 	Lang    string
 	Mode    Semantics
 	NormKey string
+
+	// Corrected is set when spell correction auto-substituted at least one term, so the
+	// broker can surface a "showing results for" notice. Suggestion holds the
+	// did-you-mean rendering when a correction was offered rather than applied; it is
+	// empty when nothing was suggested.
+	Corrected  bool
+	Suggestion string
+}
+
+// Corrector corrects a single analyzed query term, the SymSpell corrector the broker
+// holds. It is an interface returning primitives so the query package depends on
+// neither the spell package nor a shared type; spell.QueryCorrector satisfies it
+// structurally. ok is false to leave a term as typed, the common case for a correctly
+// spelled query; auto is true to substitute the replacement, false to only offer it.
+type Corrector interface {
+	Correct(term string) (replacement string, auto bool, ok bool)
+}
+
+// ApplyCorrection runs the corrector over the free and required terms after parsing,
+// the broker step doc 10 places between analysis and retrieval. An auto-correction
+// substitutes the term in place and marks the query corrected; a did-you-mean
+// correction leaves the term as typed and contributes to the Suggestion string the
+// broker can offer. The cache key is recomputed when an auto-correction changed the
+// terms, so the corrected query caches under its corrected form.
+func (pq *ParsedQuery) ApplyCorrection(c Corrector) {
+	if c == nil {
+		return
+	}
+	changed := false
+	suggested := false
+	var sugg strings.Builder
+	writeSugg := func(term string) {
+		if sugg.Len() > 0 {
+			sugg.WriteByte(' ')
+		}
+		sugg.WriteString(term)
+	}
+	fix := func(terms []QueryTerm) {
+		for i := range terms {
+			repl, auto, ok := c.Correct(terms[i].Term)
+			if !ok || repl == "" || repl == terms[i].Term {
+				writeSugg(terms[i].Term)
+				continue
+			}
+			if auto {
+				terms[i].Term = repl
+				changed = true
+				writeSugg(repl)
+			} else {
+				suggested = true
+				writeSugg(repl)
+			}
+		}
+	}
+	fix(pq.Terms)
+	fix(pq.Required)
+	if changed {
+		pq.Corrected = true
+		pq.NormKey = pq.normKey()
+	}
+	if suggested {
+		pq.Suggestion = sugg.String()
+	}
 }
 
 // piece is one raw fragment the operator scan produces, before the analysis chain runs
