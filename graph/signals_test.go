@@ -114,6 +114,36 @@ func TestSpamMass(t *testing.T) {
 	}
 }
 
+// TestInversePageRank checks the reversed-graph rank scores a node by its
+// out-reach: on a chain the head, which reaches every other node, must outrank the
+// tail, which reaches nobody. These are the trust-seed candidates.
+func TestInversePageRank(t *testing.T) {
+	// 0 -> 1 -> 2 -> 3: node 0 reaches the most, node 3 the least.
+	g := buildGraph(4, [][2]int{{0, 1}, {1, 2}, {2, 3}})
+	inv := InversePageRank(g, DefaultPRConfig())
+	if inv[0] <= inv[3] {
+		t.Fatalf("inverse pagerank head %g not above tail %g", inv[0], inv[3])
+	}
+	var sum float64
+	for _, v := range inv {
+		sum += v
+	}
+	if math.Abs(sum-1) > 1e-6 {
+		t.Fatalf("inverse pagerank sums to %g, not 1", sum)
+	}
+}
+
+// TestAntiTrustRank checks distrust flows backward from a spam seed to the pages
+// that link to it, not to an unrelated page. Nodes 0 and 1 link to the spam node
+// 2; node 3 is unrelated, so 0 and 1 must score above 3.
+func TestAntiTrustRank(t *testing.T) {
+	g := buildGraph(4, [][2]int{{0, 2}, {1, 2}})
+	at := AntiTrustRank(g, []int{2}, DefaultPRConfig())
+	if at[0] <= at[3] || at[1] <= at[3] {
+		t.Fatalf("distrust did not reach the spam linkers: %v", at)
+	}
+}
+
 // TestInDegrees checks the count matches the transpose.
 func TestInDegrees(t *testing.T) {
 	edges := [][2]int{{0, 3}, {1, 3}, {2, 3}, {0, 1}}

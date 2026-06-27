@@ -32,6 +32,13 @@ type Options struct {
 	Out       string // collection directory to write into
 	ShardSize int    // documents per shard
 	Limit     int    // cap on documents read, zero for all
+
+	// TrustSeeds and SpamSeeds are the curated TrustRank and Anti-TrustRank seed
+	// URLs, the spine the spec's doc 07 extends with inverse-PageRank candidates.
+	// They are recorded with the build so a rank is reproducible; an empty list
+	// seeds trust purely from inverse PageRank and leaves anti-trust uniform.
+	TrustSeeds []string
+	SpamSeeds  []string
 }
 
 // Result reports what a build or add produced.
@@ -90,12 +97,12 @@ func build(opts Options, baseStart uint32, indexStart int) (Result, error) {
 		return docs[i].URL < docs[j].URL
 	})
 
-	// Compute PageRank over the whole collection before cutting shards. The web
-	// graph is almost entirely cross-shard, so this is the only place a real rank
-	// exists; each shard then receives its slice of the rank vector to bake into
-	// its feature matrix. The ranks are indexed by the same host+url order the
-	// shards are cut from, so ranks[lo:hi] lines up with docs[lo:hi].
-	ranks := globalRanks(docs)
+	// Compute the link signals over the whole collection before cutting shards.
+	// The web graph is almost entirely cross-shard, so this is the only place a
+	// real signal exists; each shard then receives its slice of every signal vector
+	// to bake into its feature matrix. The signals are indexed by the same host+url
+	// order the shards are cut from, so sig.slice(lo, hi) lines up with docs[lo:hi].
+	sig := globalSignals(docs, opts.TrustSeeds, opts.SpamSeeds)
 
 	res := Result{Docs: len(docs), Hosts: hosts}
 	base := baseStart
@@ -106,7 +113,7 @@ func build(opts Options, baseStart uint32, indexStart int) (Result, error) {
 			hi = len(docs)
 		}
 		path := shardPath(opts.Out, index)
-		n, err := writeShard(path, docs[lo:hi], ranks[lo:hi], base)
+		n, err := writeShard(path, docs[lo:hi], sig.slice(lo, hi), base)
 		if err != nil {
 			return Result{}, err
 		}
@@ -162,10 +169,10 @@ func readSource(path string, limit int) ([]convert.Document, int, error) {
 // of documents and writes them into a single shard file at the given global base. It
 // returns the file size. The lexical index gets the title, body, and url fields; the
 // feature matrix gets the derived content and url signals plus the collection-wide
-// PageRank in ranks (one entry per document, aligned to docs); the forward store keeps
-// the url, title, and body so the shard holds the text it was built from; the graph
-// region carries the link graph recovered from the page bodies.
-func writeShard(path string, docs []convert.Document, ranks []float64, base uint32) (int64, error) {
+// link signals in sig (one entry per document, aligned to docs); the forward store
+// keeps the url, title, and body so the shard holds the text it was built from; the
+// graph region carries the link graph recovered from the page bodies.
+func writeShard(path string, docs []convert.Document, sig graphSignals, base uint32) (int64, error) {
 	lb := lexical.NewBuilder(lexical.DefaultParams())
 	fb := feature.NewBuilder(feature.DefaultSchema(), 1)
 	cols := docColumns()
@@ -203,9 +210,15 @@ func writeShard(path string, docs []convert.Document, ranks []float64, base uint
 		for fid, v := range a.Features {
 			fb.Set(id, fid, v)
 		}
-		// The collection-wide PageRank, the one link signal that needs the whole
-		// graph; the per-document analyze stage leaves this column at zero.
-		fb.Set(id, feature.FeatPageRank, ranks[i])
+		// The collection-wide link signals, the columns that need the whole graph;
+		// the per-document analyze stage leaves them at zero.
+		fb.Set(id, feature.FeatPageRank, sig.pageRank[i])
+		fb.Set(id, feature.FeatHostRank, sig.hostRank[i])
+		fb.Set(id, feature.FeatDomainRank, sig.domainRank[i])
+		fb.Set(id, feature.FeatTrust, sig.trust[i])
+		fb.Set(id, feature.FeatSpamMass, sig.spamMass[i])
+		fb.Set(id, feature.FeatInDegree, float64(sig.inDegree[i]))
+		fb.Set(id, feature.FeatLinkingDomains, float64(sig.linkingDomains[i]))
 		fwd.Set(id, "url", []byte(d.URL))
 		fwd.Set(id, "title", []byte(a.Title))
 		fwd.Set(id, "body", []byte(d.Body))

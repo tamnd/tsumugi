@@ -50,9 +50,11 @@ func Compact(dir string, shardSize int) (Result, error) {
 	if err := os.MkdirAll(staging, 0o755); err != nil {
 		return Result{}, err
 	}
-	// Recompute the collection-wide PageRank over the reordered set, the same pass
-	// a fresh build runs, so the compacted shards carry the rank as if built whole.
-	ranks := globalRanks(docs)
+	// Recompute the collection-wide link signals over the reordered set, the same
+	// pass a fresh build runs, so the compacted shards carry the signals as if built
+	// whole. A compact has no seed list to thread through, so it seeds trust from
+	// inverse PageRank alone, the same default a build with no curated seeds uses.
+	sig := globalSignals(docs, nil, nil)
 
 	res := Result{Docs: len(docs), Hosts: hosts}
 	var base uint32
@@ -62,7 +64,7 @@ func Compact(dir string, shardSize int) (Result, error) {
 		if hi > len(docs) {
 			hi = len(docs)
 		}
-		n, err := writeShard(shardPath(staging, index), docs[lo:hi], ranks[lo:hi], base)
+		n, err := writeShard(shardPath(staging, index), docs[lo:hi], sig.slice(lo, hi), base)
 		if err != nil {
 			_ = os.RemoveAll(staging)
 			return Result{}, err
