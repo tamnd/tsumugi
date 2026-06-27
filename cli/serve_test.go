@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -9,13 +10,23 @@ import (
 	"testing"
 
 	"github.com/tamnd/tsumugi"
+	"github.com/tamnd/tsumugi/collection"
 	"github.com/tamnd/tsumugi/feature"
 	"github.com/tamnd/tsumugi/lexical"
 	"github.com/tamnd/tsumugi/rank"
 )
 
-// writeShard builds a tiny lexical-plus-feature shard for the serve test.
+// writeShard builds a tiny lexical-plus-feature shard for the serve test, recording the
+// query-side analyzer hash so the shard matches the broker it is served by.
 func writeShard(t *testing.T, path string, texts []string, nodeBase uint32) {
+	t.Helper()
+	writeShardHash(t, path, texts, nodeBase, queryAnalyzerHash())
+}
+
+// writeShardHash is writeShard with an explicit recorded analyzer hash, so a test can
+// build a shard the broker will accept (matching hash) or refuse (mismatched hash). A
+// zero hash records nothing, the shard built before the hash existed.
+func writeShardHash(t *testing.T, path string, texts []string, nodeBase uint32, hash uint64) {
 	t.Helper()
 	lb := lexical.NewBuilder(lexical.DefaultParams())
 	fb := feature.NewBuilder(feature.DefaultSchema(), 1)
@@ -30,6 +41,9 @@ func writeShard(t *testing.T, path string, texts []string, nodeBase uint32) {
 	w.SetDocCount(uint32(len(texts)))
 	w.SetNodeBase(uint64(nodeBase))
 	w.SetStat(tsumugi.StatTokenCount, float64(len(texts)*3))
+	if hash != 0 {
+		w.SetAnalyzerHash(hash)
+	}
 	if err := w.AddRegion(tsumugi.RegionLexical, tsumugi.CodecZstd, 0, 0, lb.Build()); err != nil {
 		t.Fatalf("add lexical: %v", err)
 	}
@@ -129,5 +143,69 @@ func TestServeSearch(t *testing.T) {
 	}
 	if !sawHigh {
 		t.Fatalf("no hit from the second shard: %+v", got.Hits)
+	}
+}
+
+// TestServeRefusesMismatchedShard checks the glob fallback path refuses to serve a shard
+// recorded under an analyzer the broker does not query with. Serving it would match the
+// query against tokens the broker never produces, the silent wrong-results case the hash
+// exists to prevent.
+func TestServeRefusesMismatchedShard(t *testing.T) {
+	dir := t.TempDir()
+	writeShardHash(t, filepath.Join(dir, "a.tsumugi"), []string{"brown fox"}, 0, queryAnalyzerHash()^0xFF)
+	modelPath := filepath.Join(dir, "model.bin")
+	writeModel(t, modelPath)
+
+	_, err := openCollection(dir, modelPath)
+	if !errors.Is(err, collection.ErrAnalyzerMismatch) {
+		t.Fatalf("openCollection error = %v, want ErrAnalyzerMismatch", err)
+	}
+}
+
+// TestServeAcceptsMatchedShard checks the glob fallback path serves a shard whose recorded
+// analyzer matches the broker's, the healthy case the refusal must not block.
+func TestServeAcceptsMatchedShard(t *testing.T) {
+	dir := t.TempDir()
+	writeShardHash(t, filepath.Join(dir, "a.tsumugi"), []string{"brown fox"}, 0, queryAnalyzerHash())
+	modelPath := filepath.Join(dir, "model.bin")
+	writeModel(t, modelPath)
+
+	broker, err := openCollection(dir, modelPath)
+	if err != nil {
+		t.Fatalf("openCollection: %v", err)
+	}
+	_ = broker.Close()
+}
+
+// TestServeRefusesMismatchedManifest checks the manifest path refuses a collection whose
+// recorded analyzer does not match the broker's. The manifest carries one hash for the
+// whole collection, so the broker rejects in a single check without opening every shard.
+func TestServeRefusesMismatchedManifest(t *testing.T) {
+	dir := t.TempDir()
+	writeShardHash(t, filepath.Join(dir, "shard-00000.tsumugi"), []string{"brown fox"}, 0, queryAnalyzerHash()^0xAA)
+	writeShardHash(t, filepath.Join(dir, "shard-00001.tsumugi"), []string{"brown bear"}, 1000, queryAnalyzerHash()^0xAA)
+	if err := collection.WriteIndex(dir, collection.NoEpoch); err != nil {
+		t.Fatalf("WriteIndex: %v", err)
+	}
+	modelPath := filepath.Join(dir, "model.bin")
+	writeModel(t, modelPath)
+
+	_, err := openCollection(dir, modelPath)
+	if !errors.Is(err, collection.ErrAnalyzerMismatch) {
+		t.Fatalf("openCollection error = %v, want ErrAnalyzerMismatch", err)
+	}
+}
+
+// TestWriteIndexRefusesMixedAnalyzers checks WriteIndex refuses a collection whose shards
+// disagree on their analyzer hash: a mixed-analyzer collection cannot be queried
+// consistently, so the failure surfaces at build time rather than at serve time.
+func TestWriteIndexRefusesMixedAnalyzers(t *testing.T) {
+	dir := t.TempDir()
+	writeShardHash(t, filepath.Join(dir, "shard-00000.tsumugi"), []string{"brown fox"}, 0, 0x1111)
+	writeShardHash(t, filepath.Join(dir, "shard-00001.tsumugi"), []string{"brown bear"}, 1000, 0x2222)
+
+	err := collection.WriteIndex(dir, collection.NoEpoch)
+	if !errors.Is(err, collection.ErrAnalyzerMismatch) {
+		t.Fatalf("WriteIndex error = %v, want ErrAnalyzerMismatch", err)
 	}
 }

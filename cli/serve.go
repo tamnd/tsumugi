@@ -12,9 +12,16 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/tamnd/tsumugi/collection"
+	"github.com/tamnd/tsumugi/lexical"
 	"github.com/tamnd/tsumugi/rank"
 	"github.com/tamnd/tsumugi/search"
 )
+
+// queryAnalyzerHash is the hash of the analyzer the broker analyzes queries with, the
+// package-level lexical.Analyze. A shard or a collection built with any other analyzer
+// cannot be queried consistently, so startup compares this against the recorded hash and
+// refuses a mismatch rather than returning silently wrong results.
+func queryAnalyzerHash() uint64 { return lexical.DefaultAnalyzer.Hash() }
 
 func newServeCmd() *cobra.Command {
 	var (
@@ -83,6 +90,12 @@ func openCollection(dir, modelPath string) (*search.Broker, error) {
 	// shard's vocabulary, which is what lets serve start in time at fleet scale. A
 	// collection built before the artifact existed has none, so fall back to the scan.
 	if ix, err := collection.LoadIndex(dir); err == nil {
+		// The manifest records the collection-wide analyzer hash in one place, so the
+		// broker verifies it once here rather than opening every shard's footer.
+		if h := ix.AnalyzerHash; h != 0 && h != queryAnalyzerHash() {
+			return nil, fmt.Errorf("%w: collection is %#016x, broker analyzer is %#016x",
+				collection.ErrAnalyzerMismatch, h, queryAnalyzerHash())
+		}
 		return brokerFromIndex(dir, model, ix)
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("load index: %w", err)
@@ -96,13 +109,25 @@ func openCollection(dir, modelPath string) (*search.Broker, error) {
 		return nil, fmt.Errorf("no .tsumugi shards in %s", dir)
 	}
 	shards := make([]*search.Shard, 0, len(paths))
+	closeAll := func() {
+		for _, opened := range shards {
+			_ = opened.Close()
+		}
+	}
 	for _, p := range paths {
 		s, err := search.OpenShard(p, newCascade(model))
 		if err != nil {
-			for _, opened := range shards {
-				_ = opened.Close()
-			}
+			closeAll()
 			return nil, fmt.Errorf("open shard %s: %w", p, err)
+		}
+		// No manifest in this directory, so verify each shard's own recorded analyzer
+		// against the broker's. A shard built before the hash was recorded reports
+		// nothing and is left to the operator, the same unknown the reader returns.
+		if h, ok := s.AnalyzerHash(); ok && h != queryAnalyzerHash() {
+			_ = s.Close()
+			closeAll()
+			return nil, fmt.Errorf("%w: shard %s is %#016x, broker analyzer is %#016x",
+				collection.ErrAnalyzerMismatch, p, h, queryAnalyzerHash())
 		}
 		shards = append(shards, s)
 	}

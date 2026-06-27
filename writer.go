@@ -76,6 +76,12 @@ func (w *Writer) SetSchema(fields []Field) { w.schema = fields }
 // SetStat records a shard-level statistic.
 func (w *Writer) SetStat(key string, value float64) { w.stats[key] = value }
 
+// SetAnalyzerHash records the analyzer_hash, the hash of the analyzer the shard was
+// built with, so a broker can refuse to query the shard with an incompatible analyzer.
+// The hash is stored losslessly as a reinterpreted float64 because it is a full 64-bit
+// value the numeric stats map would otherwise truncate.
+func (w *Writer) SetAnalyzerHash(h uint64) { w.stats[StatAnalyzerHash] = AnalyzerHashStat(h) }
+
 // AddRegion appends a region built from raw. When c is CodecZstd the bytes are
 // compressed before they land; the descriptor records the on-disk length, the
 // raw length, and the CRC of the on-disk bytes. AddRegion also sets the matching

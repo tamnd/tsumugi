@@ -35,7 +35,10 @@ const IndexName = "index.tsm"
 // indexMagic marks the artifact, distinct from a shard's TSM1.
 const indexMagic = "TSMI"
 
-const indexVersion = 1
+// indexVersion 2 adds the collection-wide analyzer hash to the body. A reader refuses an
+// older version, so a stale artifact triggers a rebuild or the shard-scan fallback rather
+// than a misread.
+const indexVersion = 2
 
 // Stats are the fleet-wide collection statistics, summed across every shard. A single
 // shard describes only its slice of the collection, so any scoring that normalizes by
@@ -54,6 +57,13 @@ type Index struct {
 	BuildEpoch uint64
 	Stats      Stats
 	Shards     []ShardInfo
+
+	// AnalyzerHash is the analyzer the collection's shards were built with, the value
+	// every shard in a healthy collection agrees on. A broker compares it against its
+	// own query-side analyzer in one check at startup rather than opening every shard's
+	// footer. It is zero when no shard recorded one, the unknown case a broker treats as
+	// a skipped check rather than a mismatch.
+	AnalyzerHash uint64
 
 	// routing maps a term to the shard indices, into Shards, that carry a posting for
 	// it. A query routes to the union of its terms' shards, so fan-out is proportional
@@ -92,6 +102,7 @@ func WriteIndex(dir string, epoch uint64) error {
 		routing:    make(map[string][]int32),
 		numShd:     len(infos),
 	}
+	hashSeen := false
 	for si, info := range infos {
 		r, err := tsumugi.Open(info.Path)
 		if err != nil {
@@ -100,6 +111,19 @@ func WriteIndex(dir string, epoch uint64) error {
 		ix.Stats.DocCount += uint64(r.DocCount())
 		if v, ok := r.Stat(tsumugi.StatTokenCount); ok {
 			ix.Stats.TokenCount += v
+		}
+		// Record the collection-wide analyzer hash, refusing a collection whose shards
+		// disagree: a mixed-analyzer collection cannot be queried consistently, so the
+		// build fails here rather than serving silently inconsistent results.
+		if h, ok := r.AnalyzerHash(); ok {
+			if !hashSeen {
+				ix.AnalyzerHash = h
+				hashSeen = true
+			} else if h != ix.AnalyzerHash {
+				_ = r.Close()
+				return fmt.Errorf("%w: %s carries %#016x, the collection is %#016x",
+					ErrAnalyzerMismatch, filepath.Base(info.Path), h, ix.AnalyzerHash)
+			}
 		}
 		if err := ix.indexShardTerms(r, si); err != nil {
 			_ = r.Close()
@@ -255,6 +279,7 @@ func (ix *Index) encodeBody() []byte {
 	b = codec.AppendUint64(b, ix.Stats.DocCount)
 	b = codec.AppendUint64(b, math.Float64bits(ix.Stats.TokenCount))
 	b = codec.AppendUint64(b, math.Float64bits(ix.Stats.AvgDocLen))
+	b = codec.AppendUint64(b, ix.AnalyzerHash)
 
 	b = codec.AppendUint32(b, uint32(len(ix.Shards)))
 	for _, s := range ix.Shards {
@@ -293,6 +318,12 @@ func (ix *Index) encodeBody() []byte {
 
 var errBadIndex = errors.New("collection: corrupt index artifact")
 
+// ErrAnalyzerMismatch is returned when a collection's shards were built with different
+// analyzers, so no single analyzer can query them consistently, and at broker startup
+// when the broker's query-side analyzer does not match the collection's. It is the
+// consistency guard the analyzer_hash exists to enforce.
+var ErrAnalyzerMismatch = errors.New("collection: analyzer hash mismatch")
+
 // decodeIndex parses an artifact rendered by encode, verifying the magic, the version,
 // and the trailing CRC, then decompressing the body, before reading the fields, so a
 // torn or stale artifact is refused rather than read as garbage.
@@ -319,6 +350,7 @@ func decodeIndex(b []byte) (*Index, error) {
 	ix.Stats.DocCount = p.u64()
 	ix.Stats.TokenCount = math.Float64frombits(p.u64())
 	ix.Stats.AvgDocLen = math.Float64frombits(p.u64())
+	ix.AnalyzerHash = p.u64()
 
 	nShard := int(p.u32())
 	ix.Shards = make([]ShardInfo, nShard)
