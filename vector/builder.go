@@ -51,6 +51,13 @@ func (b *Builder) WithHNSW(m, m0, efConstruction int) *Builder {
 // no-rerank one-bit form and the search scores with the RaBitQ estimator.
 func (b *Builder) WithRerank(on bool) *Builder { b.rerank = on; return b }
 
+// WithNormalized declares whether the input vectors are unit norm. The default is
+// true, the common case for cosine-trained embeddings, and it lets the region drop
+// the per-code norm field entirely (the norm is then a constant one). Pass false for
+// vectors of varying magnitude, and the region stores each code's float16 norm so the
+// estimator can scale by it.
+func (b *Builder) WithNormalized(on bool) *Builder { b.normalized = on; return b }
+
 // Add records a document's embedding. The dense docID is the call order.
 func (b *Builder) Add(vec []float32) {
 	cp := make([]float32, b.dim)
@@ -86,13 +93,24 @@ func (b *Builder) Build() ([]byte, error) {
 	iq := newInt8Quant(i8scale)
 
 	words := rdim / 64
-	codeStride := 8 + words*8
+	// Each code row is a float16 scalar (2 bytes), an optional float16 norm (2 bytes,
+	// dropped when the vectors are normalized because the norm is then a constant one),
+	// then the words sign blocks. The sign words are read byte-wise (codec.Uint64), so
+	// the row needs no eight-byte alignment and the half-width scalars are pure savings
+	// against the four-byte float32 the budget would otherwise carry.
+	codeHdr := 2
+	if !b.normalized {
+		codeHdr = 4
+	}
+	codeStride := codeHdr + words*8
 	rerankStride := rdim // power of two, already 8-aligned
 
 	codesPart := make([]byte, 0, n*codeStride)
 	for i := 0; i < n; i++ {
-		codesPart = codec.AppendUint32(codesPart, math.Float32bits(codes[i].scalar))
-		codesPart = codec.AppendUint32(codesPart, math.Float32bits(codes[i].norm))
+		codesPart = codec.AppendUint16(codesPart, codec.Float16bits(codes[i].scalar))
+		if !b.normalized {
+			codesPart = codec.AppendUint16(codesPart, codec.Float16bits(codes[i].norm))
+		}
 		for _, w := range codes[i].bits {
 			codesPart = codec.AppendUint64(codesPart, w)
 		}

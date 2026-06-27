@@ -20,9 +20,15 @@ type Region struct {
 	iq     int8Quant
 	words  int
 	stride int
+	// bitsOff is where a code row's sign words start, after the float16 scalar and the
+	// optional float16 norm. hasStoredNorm is false when the region dropped the norm
+	// field because the vectors are normalized, in which case norm reads back as the
+	// constant one the build assumed.
+	bitsOff       int
+	hasStoredNorm bool
 	// codes is a view over the codes part of the mapping: count rows of stride bytes,
-	// each row a float32 scalar, a float32 norm, then words 64-bit sign blocks. The
-	// fields are read on demand through scalar, norm, and rowBits so the codes are
+	// each row a float16 scalar, an optional float16 norm, then words 64-bit sign blocks.
+	// The fields are read on demand through scalar, norm, and rowBits so the codes are
 	// never lifted onto the heap.
 	codes []byte
 	// rerank is a view over the int8 part of the mapping reinterpreted as int8, rdim
@@ -70,18 +76,28 @@ func Open(b []byte) (*Region, error) {
 	n := int(h.count)
 	words := int(h.rdim) / 64
 	stride := int(h.codeStride)
-	if stride != 8+words*8 || (n > 0 && len(b[off:codesEnd]) != n*stride) {
+	// A normalized region stores only the float16 scalar (2 bytes) before the sign words;
+	// otherwise it also stores the float16 norm (4 bytes total). Validate the stride
+	// against whichever layout the normalized flag implies.
+	hasStoredNorm := h.flags&flagNormalized == 0
+	bitsOff := 2
+	if hasStoredNorm {
+		bitsOff = 4
+	}
+	if stride != bitsOff+words*8 || (n > 0 && len(b[off:codesEnd]) != n*stride) {
 		return nil, ErrCorrupt
 	}
 
 	r := &Region{
-		h:         h,
-		rot:       newRotator(int(h.dimKept), h.rotationSeed),
-		iq:        newInt8Quant(h.i8scale),
-		words:     words,
-		stride:    stride,
-		codes:     b[off:codesEnd],
-		hasRerank: h.flags&flagHasRerank != 0,
+		h:             h,
+		rot:           newRotator(int(h.dimKept), h.rotationSeed),
+		iq:            newInt8Quant(h.i8scale),
+		words:         words,
+		stride:        stride,
+		bitsOff:       bitsOff,
+		hasStoredNorm: hasStoredNorm,
+		codes:         b[off:codesEnd],
+		hasRerank:     h.flags&flagHasRerank != 0,
 	}
 	if r.rot.rdim != int(h.rdim) {
 		return nil, ErrCorrupt
@@ -98,18 +114,23 @@ func Open(b []byte) (*Region, error) {
 }
 
 // scalar and norm read a document's two per-vector code scalars straight from the
-// mapped codes part. rowBits returns a view over the document's packed sign blocks.
-// All three read on demand so the no-rerank scoring path never copies the codes.
+// mapped codes part, decoding the float16 each is stored as. rowBits returns a view
+// over the document's packed sign blocks. All three read on demand so the no-rerank
+// scoring path never copies the codes. When the region dropped the norm field (the
+// normalized case), norm returns the constant one the build assumed.
 func (r *Region) scalar(node int32) float32 {
-	return math.Float32frombits(codec.Uint32(r.codes[int(node)*r.stride:]))
+	return codec.Float16frombits(codec.Uint16(r.codes[int(node)*r.stride:]))
 }
 
 func (r *Region) norm(node int32) float32 {
-	return math.Float32frombits(codec.Uint32(r.codes[int(node)*r.stride+4:]))
+	if !r.hasStoredNorm {
+		return 1
+	}
+	return codec.Float16frombits(codec.Uint16(r.codes[int(node)*r.stride+2:]))
 }
 
 func (r *Region) rowBits(node int32) []byte {
-	off := int(node)*r.stride + 8
+	off := int(node)*r.stride + r.bitsOff
 	return r.codes[off : off+r.words*8]
 }
 
