@@ -34,10 +34,27 @@ type Model struct {
 	allOnes     []uint64
 	numTrees    int
 	numFeatures int
+
+	// schemaVersion and schemaHash carry the feature-matrix schema the model was
+	// trained against, propagated from the ensemble by Compile. Zero means the model
+	// was built without a stamp, the free Compile path that names no schema.
+	schemaVersion uint16
+	schemaHash    uint64
 }
 
 // NumTrees returns the ensemble size.
 func (m *Model) NumTrees() int { return m.numTrees }
+
+// NumFeatures returns the feature-vector width the model was trained on.
+func (m *Model) NumFeatures() int { return m.numFeatures }
+
+// SchemaVersion returns the feature-matrix schema version the model was trained
+// against, or zero if the model carries no stamp.
+func (m *Model) SchemaVersion() uint16 { return m.schemaVersion }
+
+// SchemaHash returns the fingerprint of the feature-matrix schema the model was
+// trained against, or zero if the model carries no stamp.
+func (m *Model) SchemaHash() uint64 { return m.schemaHash }
 
 // Compile restructures a pointer-form ensemble into the feature-major QuickScorer
 // layout. It numbers each tree's leaves left to right, builds each internal node's

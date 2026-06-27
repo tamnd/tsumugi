@@ -2,10 +2,12 @@ package search
 
 import (
 	"context"
+	"fmt"
 	"runtime"
 	"sort"
 	"sync"
 
+	"github.com/tamnd/tsumugi/feature"
 	"github.com/tamnd/tsumugi/lexical"
 	"github.com/tamnd/tsumugi/rank"
 )
@@ -56,6 +58,28 @@ func NewBrokerWith(shards []*Shard, cascade *rank.Cascade, routing *RoutingIndex
 		cascade:        cascade,
 		maxConcurrency: runtime.GOMAXPROCS(0),
 	}
+}
+
+// CheckModel verifies the cascade's L2 model was trained against the feature schema
+// this build scores against, the broker-construction half of the schema guard whose
+// shard-open half lives in newShard. A stamped model whose schema does not match is
+// refused; an unstamped model, hash zero, is allowed but unverified, the legacy or
+// hand-built path that carries no guarantee. Because every shard self-verified its
+// own feature region against the same canonical schema at open, a model that matches
+// the canonical schema matches the whole fleet, so this one comparison is enough.
+func (b *Broker) CheckModel() error {
+	if b.cascade == nil || b.cascade.L2 == nil {
+		return nil
+	}
+	m := b.cascade.L2
+	if m.SchemaHash() == 0 {
+		return nil
+	}
+	if m.SchemaVersion() != feature.SchemaVersion || m.SchemaHash() != feature.DefaultSchemaHash() {
+		return fmt.Errorf("%w: model trained against schema v%d hash %016x, this build expects v%d hash %016x",
+			ErrSchemaMismatch, m.SchemaVersion(), m.SchemaHash(), feature.SchemaVersion, feature.DefaultSchemaHash())
+	}
+	return nil
 }
 
 // Stats returns the fleet-wide collection statistics.

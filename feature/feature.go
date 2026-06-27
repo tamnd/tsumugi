@@ -13,11 +13,23 @@
 // container as RegionFeature.
 package feature
 
-import "github.com/tamnd/tsumugi/codec"
+import (
+	"github.com/cespare/xxhash/v2"
+
+	"github.com/tamnd/tsumugi/codec"
+)
 
 const regionMagic = "FEA1"
 
 const regionVersion = 1
+
+// SchemaVersion is the version of the canonical feature schema this build writes
+// and reads. It is the number the build stamps into every feature region and the
+// model artifact records, distinct from regionVersion, which is the FEA1 byte
+// format. A change to DefaultSchema that reorders, adds, or retypes a column bumps
+// this so a shard or model built against the old layout is refused at load rather
+// than read with its columns silently misaligned.
+const SchemaVersion uint16 = 1
 
 // FeatureID is the stable identity of a signal, constant across schema versions
 // so a model trained against one schema can find its columns in a later one. A
@@ -104,6 +116,35 @@ func DefaultSchema() []Column {
 		{FeatHostErrorRate, 1, QuantLinear},
 	}
 }
+
+// SchemaHash is a stable 64-bit fingerprint of a column layout: the column count
+// followed by each column's running byte offset, feature id, width, and quant. Two
+// schemas hash equal exactly when they place the same signals in the same order with
+// the same widths and quantization, so a model trained against one schema and a
+// shard built against another are caught even when both carry the same version
+// number. The running offset is folded in so a width change that shifts later
+// columns is caught even if no id, width, or quant byte differs at a given index.
+func SchemaHash(cols []Column) uint64 {
+	var h xxhash.Digest
+	var hdr [2]byte
+	codec.PutUint16(hdr[:], uint16(len(cols)))
+	_, _ = h.Write(hdr[:])
+	var off uint16
+	for _, c := range cols {
+		var b [5]byte
+		codec.PutUint16(b[0:], off)
+		b[2] = byte(c.ID)
+		b[3] = c.Width
+		b[4] = byte(c.Quant)
+		_, _ = h.Write(b[:])
+		off += uint16(c.Width)
+	}
+	return h.Sum64()
+}
+
+// DefaultSchemaHash is the SchemaHash of DefaultSchema, the fingerprint the build
+// stamps and the loader checks against.
+func DefaultSchemaHash() uint64 { return SchemaHash(DefaultSchema()) }
 
 // colLayout is a column plus where it sits in a row and the dequant params the
 // build computed for it.

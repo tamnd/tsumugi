@@ -90,6 +90,23 @@ func (r *Region) Stride() int { return r.stride }
 // SchemaVersion returns the feature schema version the region was built against.
 func (r *Region) SchemaVersion() uint16 { return r.schemaVersion }
 
+// Columns returns the region's column layout in row order: which signal each column
+// holds, its width, and its quantization. It drops the byte offset and dequant
+// params, which are derived, so the result is comparable across regions and against
+// DefaultSchema.
+func (r *Region) Columns() []Column {
+	cols := make([]Column, len(r.cols))
+	for i, c := range r.cols {
+		cols[i] = c.Column
+	}
+	return cols
+}
+
+// SchemaHash is the SchemaHash of the region's own column layout, the fingerprint a
+// loader compares against DefaultSchemaHash to refuse a shard whose feature matrix
+// does not match the schema this build scores against.
+func (r *Region) SchemaHash() uint64 { return SchemaHash(r.Columns()) }
+
 // Row returns the raw stride bytes for a document. It aliases the region and must
 // not be mutated.
 func (r *Region) Row(docID uint32) ([]byte, bool) {

@@ -187,7 +187,7 @@ func readSource(path string, limit int) ([]convert.Document, int, error) {
 // graph region carries the link graph recovered from the page bodies.
 func writeShard(path string, docs []convert.Document, sig graphSignals, base uint32) (int64, error) {
 	lb := lexical.NewBuilder(lexical.DefaultParams())
-	fb := feature.NewBuilder(feature.DefaultSchema(), 1)
+	fb := feature.NewBuilder(feature.DefaultSchema(), feature.SchemaVersion)
 	cols := docColumns()
 	fwdCols := make([]forward.Column, len(cols))
 	for i, c := range cols {

@@ -46,13 +46,45 @@ func DefaultParams() Params {
 type Ensemble struct {
 	trees       []*treeNode
 	numFeatures int
+
+	// schemaVersion and schemaHash record the feature-matrix schema the model was
+	// trained against, so a serving node can refuse a model whose columns do not
+	// line up with the shards it would score. Zero means unstamped: a hand-built or
+	// legacy model that carries no schema guarantee, which the loader allows but does
+	// not verify.
+	schemaVersion uint16
+	schemaHash    uint64
 }
 
 // NumTrees returns the ensemble size.
 func (e *Ensemble) NumTrees() int { return len(e.trees) }
 
-// Compile turns the trained ensemble into the served QuickScorer model.
-func (e *Ensemble) Compile() *Model { return Compile(e.trees, e.numFeatures) }
+// SchemaVersion returns the feature-matrix schema version the ensemble was trained
+// against, or zero if it was never stamped.
+func (e *Ensemble) SchemaVersion() uint16 { return e.schemaVersion }
+
+// SchemaHash returns the fingerprint of the feature-matrix schema the ensemble was
+// trained against, or zero if it was never stamped.
+func (e *Ensemble) SchemaHash() uint64 { return e.schemaHash }
+
+// SetSchema stamps the ensemble with the feature-matrix schema it was trained
+// against, the version and fingerprint a serving node checks before it ranks. A
+// producer building a model for a collection calls this with the collection's
+// feature schema so the artifact records what it expects to read.
+func (e *Ensemble) SetSchema(version uint16, hash uint64) {
+	e.schemaVersion = version
+	e.schemaHash = hash
+}
+
+// Compile turns the trained ensemble into the served QuickScorer model, carrying the
+// schema stamp through so the served model knows the feature schema it was trained
+// against.
+func (e *Ensemble) Compile() *Model {
+	m := Compile(e.trees, e.numFeatures)
+	m.schemaVersion = e.schemaVersion
+	m.schemaHash = e.schemaHash
+	return m
+}
 
 // Train fits a LambdaMART ensemble by gradient boosting against the NDCG-weighted
 // pairwise objective. Each round it ranks every query by the current scores,
