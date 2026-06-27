@@ -277,6 +277,73 @@ func TestEstimatorUnbiased(t *testing.T) {
 	t.Logf("estimator relative bias = %.4f, correlation = %.3f", relBias, corr)
 }
 
+// TestAsymmetricCosineSharperThanSymmetric pins the gain from scoring the rerank
+// asymmetrically. Cosine now dots the full-precision query against the dequantized
+// int8 document, so only the document carries quantization error; the old form
+// quantized the query too. The test compares both against the true full-precision
+// cosine over many query/document pairs and requires the asymmetric form's mean
+// absolute error to be the smaller, the recovered sharpness the spec asks for.
+func TestAsymmetricCosineSharperThanSymmetric(t *testing.T) {
+	const dim, n = 96, 800
+	corpus := clusteredCorpus(n, dim, 20, 4)
+	b := NewBuilder(dim)
+	for _, v := range corpus {
+		b.Add(v)
+	}
+	r, err := Open(mustBuild(t, b))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	rdim := int(r.h.rdim)
+	rng := rand.New(rand.NewSource(21))
+	var asymErr, symErr float64
+	const trials = 500
+	for trial := 0; trial < trials; trial++ {
+		docID := rng.Intn(n)
+		// A query near a corpus vector with added noise, the realistic rerank input.
+		query := make([]float32, dim)
+		for j := range query {
+			query[j] = corpus[docID][j] + 0.15*float32(rng.NormFloat64())
+		}
+		query = normalize(query)
+
+		// True cosine in full precision against the original document vector.
+		var dot, qn, dn float64
+		for j := range query {
+			dot += float64(query[j]) * float64(corpus[docID][j])
+			qn += float64(query[j]) * float64(query[j])
+			dn += float64(corpus[docID][j]) * float64(corpus[docID][j])
+		}
+		trueCos := dot / (math.Sqrt(qn) * math.Sqrt(dn))
+
+		// Asymmetric cosine: the value the reader now returns.
+		asym, ok := r.Cosine(query, uint32(docID))
+		if !ok {
+			t.Fatalf("trial %d: cosine unavailable", trial)
+		}
+
+		// Symmetric cosine: the old form, query quantized to int8 too.
+		qRot := r.rot.rotate(query)
+		qi8 := r.iq.encodeQuery(qRot)
+		row := r.rerank[docID*rdim : (docID+1)*rdim]
+		sqn, sdn := normI8(qi8), normI8(row)
+		var sym float64
+		if sqn != 0 && sdn != 0 {
+			sym = float64(dotI8(qi8, row)) / (sqn * sdn)
+		}
+
+		asymErr += math.Abs(asym - trueCos)
+		symErr += math.Abs(sym - trueCos)
+	}
+	asymErr /= trials
+	symErr /= trials
+	if asymErr >= symErr {
+		t.Fatalf("asymmetric mean abs error %.5f not better than symmetric %.5f", asymErr, symErr)
+	}
+	t.Logf("mean abs cosine error: asymmetric %.5f, symmetric %.5f (%.1f%% lower)",
+		asymErr, symErr, 100*(symErr-asymErr)/symErr)
+}
+
 // TestFuseRRF checks fusion lifts a document both planes rank well and is order
 // independent.
 func TestFuseRRF(t *testing.T) {
