@@ -145,6 +145,17 @@ func (r *Reader) Stat(key string) (float64, bool) {
 	return v, ok
 }
 
+// AnalyzerHash returns the recorded analyzer_hash and whether it was present. A shard
+// built before the hash was recorded returns false, the unknown case a broker treats
+// as a skipped check rather than a mismatch.
+func (r *Reader) AnalyzerHash() (uint64, bool) {
+	v, ok := r.Footer.Stats[StatAnalyzerHash]
+	if !ok {
+		return 0, false
+	}
+	return AnalyzerHashFromStat(v), true
+}
+
 // Close releases the mapping.
 func (r *Reader) Close() error {
 	if r.dec != nil {

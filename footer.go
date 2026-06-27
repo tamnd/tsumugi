@@ -54,7 +54,24 @@ const (
 	StatNodeMin    = "node_min"
 	StatNodeMax    = "node_max"
 	StatVectorDim  = "vector_dim"
+	// StatAnalyzerHash records the hash of the analyzer the shard was built with, the
+	// consistency guard a broker checks before it queries the shard. It is a full
+	// 64-bit value carried through the float64 stats map by AnalyzerHashStat, which
+	// preserves the bit pattern rather than the numeric value a plain stat would lose
+	// above 2^53.
+	StatAnalyzerHash = "analyzer_hash"
 )
+
+// AnalyzerHashStat encodes a 64-bit analyzer hash as the float64 with the identical
+// bit pattern, the lossless way to carry a full uint64 through the float64 stats map.
+// The footer round-trips float64 bits exactly (it serializes math.Float64bits), so the
+// hash survives a write and read cycle unchanged where a numeric stat would round off
+// any value above 2^53.
+func AnalyzerHashStat(h uint64) float64 { return math.Float64frombits(h) }
+
+// AnalyzerHashFromStat is the inverse of AnalyzerHashStat, recovering the 64-bit hash
+// from its stored float64 bit pattern.
+func AnalyzerHashFromStat(v float64) uint64 { return math.Float64bits(v) }
 
 // Footer is the directory written last: the schema, a descriptor for every
 // region, and the shard statistics. A complete footer means a complete file.

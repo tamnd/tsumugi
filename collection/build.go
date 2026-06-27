@@ -256,6 +256,10 @@ func writeShard(path string, docs []convert.Document, sig graphSignals, base uin
 	w.SetNodeBase(uint64(base))
 	w.SetStat(tsumugi.StatTokenCount, tokens)
 	w.SetStat(tsumugi.StatEdgeCount, float64(g.EdgeCount()))
+	// Record the analyzer the build tokenized with so a broker can verify in one
+	// comparison that it is about to query the shard with the same analyzer. The build
+	// runs the package-level lexical.Analyze, so the recorded hash is DefaultAnalyzer's.
+	w.SetAnalyzerHash(lexical.DefaultAnalyzer.Hash())
 	if err := w.AddRegion(tsumugi.RegionLexical, tsumugi.CodecZstd, 0, 0, lb.Build()); err != nil {
 		return 0, err
 	}

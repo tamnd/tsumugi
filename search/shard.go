@@ -118,6 +118,12 @@ func (s *Shard) DocCount() uint32 { return s.docCount }
 // NodeBase is the global id of the shard's first document.
 func (s *Shard) NodeBase() uint32 { return s.nodeBase }
 
+// AnalyzerHash returns the analyzer_hash the shard was built with and whether it was
+// recorded. A broker compares it against its query-side analyzer to refuse a shard built
+// with an incompatible analysis chain, the consistency guard a query and a document must
+// share an analyzer to match.
+func (s *Shard) AnalyzerHash() (uint64, bool) { return s.r.AnalyzerHash() }
+
 // Close releases the shard's file mapping.
 func (s *Shard) Close() error { return s.r.Close() }
 
