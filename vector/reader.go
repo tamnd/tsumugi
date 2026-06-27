@@ -87,6 +87,11 @@ func Open(b []byte) (*Region, error) {
 // Count returns the number of indexed vectors.
 func (r *Region) Count() int { return int(r.h.count) }
 
+// Dim returns the kept input dimension a query vector must carry, the dimension the
+// region rotates and quantizes from. A dense query encoder at the broker has to produce
+// a vector of exactly this width for Cosine and Search to read it.
+func (r *Region) Dim() int { return int(r.h.dimKept) }
+
 // HasRerank reports whether the region carries the int8 rerank copy, the sharp
 // vector the dense_cosine feature reads. A region built without it can serve the
 // one-bit recall but cannot answer a faithful cosine, so the feature extractor

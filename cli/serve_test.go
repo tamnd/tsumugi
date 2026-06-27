@@ -99,7 +99,7 @@ func TestServeSearch(t *testing.T) {
 	modelPath := filepath.Join(dir, "model.bin")
 	writeModel(t, modelPath)
 
-	broker, err := openCollection(dir, modelPath)
+	broker, pl, err := openCollection(dir, modelPath)
 	if err != nil {
 		t.Fatalf("openCollection: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestServeSearch(t *testing.T) {
 		t.Fatalf("shards = %d, want 2", broker.NumShards())
 	}
 
-	srv := &httpServer{broker: broker, timeout: 0}
+	srv := &httpServer{broker: broker, pipeline: pl, timeout: 0}
 	ts := httptest.NewServer(http.HandlerFunc(srv.search))
 	defer ts.Close()
 
@@ -156,7 +156,7 @@ func TestServeRefusesMismatchedShard(t *testing.T) {
 	modelPath := filepath.Join(dir, "model.bin")
 	writeModel(t, modelPath)
 
-	_, err := openCollection(dir, modelPath)
+	_, _, err := openCollection(dir, modelPath)
 	if !errors.Is(err, collection.ErrAnalyzerMismatch) {
 		t.Fatalf("openCollection error = %v, want ErrAnalyzerMismatch", err)
 	}
@@ -170,7 +170,7 @@ func TestServeAcceptsMatchedShard(t *testing.T) {
 	modelPath := filepath.Join(dir, "model.bin")
 	writeModel(t, modelPath)
 
-	broker, err := openCollection(dir, modelPath)
+	broker, _, err := openCollection(dir, modelPath)
 	if err != nil {
 		t.Fatalf("openCollection: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestServeRefusesMismatchedManifest(t *testing.T) {
 	modelPath := filepath.Join(dir, "model.bin")
 	writeModel(t, modelPath)
 
-	_, err := openCollection(dir, modelPath)
+	_, _, err := openCollection(dir, modelPath)
 	if !errors.Is(err, collection.ErrAnalyzerMismatch) {
 		t.Fatalf("openCollection error = %v, want ErrAnalyzerMismatch", err)
 	}

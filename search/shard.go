@@ -124,6 +124,17 @@ func (s *Shard) NodeBase() uint32 { return s.nodeBase }
 // share an analyzer to match.
 func (s *Shard) AnalyzerHash() (uint64, bool) { return s.r.AnalyzerHash() }
 
+// VectorDim returns the dense-plane input dimension this shard's vector region expects
+// and whether the shard carries one. A broker building a dense query encoder reads it to
+// produce a query vector of the width the region rotates and quantizes from; a shard with
+// no vector region reports false and the broker leaves the dense plane off.
+func (s *Shard) VectorDim() (int, bool) {
+	if s.vec == nil {
+		return 0, false
+	}
+	return s.vec.Dim(), true
+}
+
 // Close releases the shard's file mapping.
 func (s *Shard) Close() error { return s.r.Close() }
 
