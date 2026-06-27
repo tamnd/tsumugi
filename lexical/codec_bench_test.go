@@ -31,50 +31,64 @@ var codecQueries = []string{
 	"one two three four five",
 }
 
-// TestDocCodecSearchParity builds the same crawl corpus with the varint and the
-// StreamVByte codec and requires every query to return identical results, so the
-// selector is proven to change only the packing, never the answer.
+// codecVariants is every selectable gap codec, so the parity, size, and speed
+// measurements cover each one and a new codec is measured the moment it is added.
+var codecVariants = []struct {
+	name string
+	id   uint16
+}{
+	{"varint", lexical.CodecVarint},
+	{"streamvbyte", lexical.CodecStreamVByte},
+	{"pfor", lexical.CodecPFor},
+}
+
+// TestDocCodecSearchParity builds the same crawl corpus with every codec and requires
+// each to return the same results the varint baseline does, so a codec is proven to
+// change only the packing, never the answer.
 func TestDocCodecSearchParity(t *testing.T) {
 	docs := ccrawlSpimiDocs(t, 4000)
 	if len(docs) == 0 {
 		t.Skip("no ccrawl documents")
 	}
-	varintRegion, err := lexical.Open(buildWithCodec(docs, lexical.CodecVarint))
+	base, err := lexical.Open(buildWithCodec(docs, lexical.CodecVarint))
 	if err != nil {
 		t.Fatalf("open varint region: %v", err)
 	}
-	svRegion, err := lexical.Open(buildWithCodec(docs, lexical.CodecStreamVByte))
-	if err != nil {
-		t.Fatalf("open streamvbyte region: %v", err)
-	}
-	for _, q := range codecQueries {
-		want, err := varintRegion.Search(q, 20)
+	for _, c := range codecVariants {
+		region, err := lexical.Open(buildWithCodec(docs, c.id))
 		if err != nil {
-			t.Fatalf("varint search %q: %v", q, err)
+			t.Fatalf("open %s region: %v", c.name, err)
 		}
-		got, err := svRegion.Search(q, 20)
-		if err != nil {
-			t.Fatalf("streamvbyte search %q: %v", q, err)
-		}
-		if !reflect.DeepEqual(got, want) {
-			t.Fatalf("query %q: codecs disagree\n varint=%v\n svbyte=%v", q, want, got)
+		for _, q := range codecQueries {
+			want, err := base.Search(q, 20)
+			if err != nil {
+				t.Fatalf("varint search %q: %v", q, err)
+			}
+			got, err := region.Search(q, 20)
+			if err != nil {
+				t.Fatalf("%s search %q: %v", c.name, q, err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("query %q: %s disagrees with varint\n varint=%v\n %s=%v", q, c.name, want, c.name, got)
+			}
 		}
 	}
 }
 
 // TestDocCodecSize reports the region size each codec produces on the real crawl
-// shard. It is the density half of the M14b numbers; the gap stream is the only part
-// that differs between the two builds, so the size delta is the gap-stream delta.
+// shard. It is the density half of the codec numbers; the gap stream is the only part
+// that differs between builds, so the size delta is the gap-stream delta.
 func TestDocCodecSize(t *testing.T) {
 	docs := ccrawlSpimiDocs(t, 8000)
 	if len(docs) == 0 {
 		t.Skip("no ccrawl documents")
 	}
-	varintBytes := len(buildWithCodec(docs, lexical.CodecVarint))
-	svBytes := len(buildWithCodec(docs, lexical.CodecStreamVByte))
-	delta := float64(svBytes-varintBytes) / float64(varintBytes) * 100
-	t.Logf("region size over %d docs: varint %d bytes, streamvbyte %d bytes (%+.2f%%)",
-		len(docs), varintBytes, svBytes, delta)
+	base := len(buildWithCodec(docs, lexical.CodecVarint))
+	for _, c := range codecVariants {
+		n := len(buildWithCodec(docs, c.id))
+		delta := float64(n-base) / float64(base) * 100
+		t.Logf("region size over %d docs: %-12s %d bytes (%+.2f%% vs varint)", len(docs), c.name, n, delta)
+	}
 }
 
 // BenchmarkDocCodecSearch times the query path under each codec on the real crawl
@@ -85,13 +99,7 @@ func BenchmarkDocCodecSearch(b *testing.B) {
 	if len(docs) == 0 {
 		b.Skip("no ccrawl documents")
 	}
-	for _, c := range []struct {
-		name string
-		id   uint16
-	}{
-		{"varint", lexical.CodecVarint},
-		{"streamvbyte", lexical.CodecStreamVByte},
-	} {
+	for _, c := range codecVariants {
 		region, err := lexical.Open(buildWithCodec(docs, c.id))
 		if err != nil {
 			b.Fatalf("open %s region: %v", c.name, err)
@@ -117,13 +125,7 @@ func BenchmarkDocCodecExhaustive(b *testing.B) {
 	if len(docs) == 0 {
 		b.Skip("no ccrawl documents")
 	}
-	for _, c := range []struct {
-		name string
-		id   uint16
-	}{
-		{"varint", lexical.CodecVarint},
-		{"streamvbyte", lexical.CodecStreamVByte},
-	} {
+	for _, c := range codecVariants {
 		region, err := lexical.Open(buildWithCodec(docs, c.id))
 		if err != nil {
 			b.Fatalf("open %s region: %v", c.name, err)

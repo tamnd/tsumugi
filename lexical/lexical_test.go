@@ -163,6 +163,7 @@ var blockCodecs = []struct {
 }{
 	{"varint", varintCodec{}},
 	{"streamvbyte", streamVByteCodec{}},
+	{"pfor", pforCodec{}},
 }
 
 // TestBlockCodecRoundTrip drives encodeBlock and decodeBlock across the awkward

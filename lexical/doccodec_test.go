@@ -86,10 +86,69 @@ func TestStreamVByteRejectsTrailingBytes(t *testing.T) {
 	}
 }
 
+// TestDocCodecDensityByGapScale measures bytes per gap for each codec on full
+// 128-gap blocks across a range of gap magnitudes, the measurement that explains why
+// varint is the default on a small shard yet PFor is worth carrying for a large one.
+// Varint spends one byte for any gap under 128, so it is unbeatable while gaps stay
+// small; once gaps grow past a byte (the regime a multi-million-doc shard's common
+// terms live in) PFor's bit packing pulls ahead. The large-gap case is asserted so
+// the crossover is a locked-in fact, not just a logged number.
+func TestDocCodecDensityByGapScale(t *testing.T) {
+	// block builds a full block of gaps clustered around magnitude m, deterministic so
+	// the measurement is reproducible.
+	block := func(m uint32) []uint32 {
+		gaps := make([]uint32, blockSize)
+		for i := range gaps {
+			gaps[i] = m + uint32(i%7) // a little spread so a width choice is non-trivial
+			if gaps[i] == 0 {
+				gaps[i] = 1
+			}
+		}
+		return gaps
+	}
+	for _, m := range []uint32{1, 8, 64, 200, 5000, 200000} {
+		gaps := block(m)
+		row := make(map[string]float64)
+		for _, c := range blockCodecs {
+			n := len(c.dc.encode(nil, gaps))
+			row[c.name] = float64(n) / float64(len(gaps))
+		}
+		t.Logf("gap~%-7d bytes/gap: varint %.3f  streamvbyte %.3f  pfor %.3f",
+			m, row["varint"], row["streamvbyte"], row["pfor"])
+		if m >= 5000 && row["pfor"] >= row["varint"] {
+			t.Fatalf("gap~%d: pfor %.3f should beat varint %.3f at large gaps", m, row["pfor"], row["varint"])
+		}
+	}
+}
+
+// TestPForRejectsTruncation checks the PFor decode guards: a stream cut inside its
+// exception list or its packed-bits region is reported corrupt rather than read out
+// of bounds, and never panics. The gaps span several widths so the chosen width
+// leaves both a packed region and exceptions to truncate into.
+func TestPForRejectsTruncation(t *testing.T) {
+	full := pforCodec{}.encode(nil, []uint32{1, 1, 2, 1, 1 << 20, 1, 3, 1 << 28})
+	for n := 1; n < len(full); n++ {
+		if _, err := (pforCodec{}).decode(full[:n]); err == nil {
+			t.Fatalf("truncation to %d bytes accepted, want corrupt", n)
+		}
+	}
+}
+
+// TestPForRejectsTrailingBytes checks that extra bytes after a complete PFor stream
+// are rejected, so a miscounted block length cannot decode a short list and leave the
+// rest as garbage.
+func TestPForRejectsTrailingBytes(t *testing.T) {
+	enc := pforCodec{}.encode(nil, []uint32{1, 2, 3, 4})
+	enc = append(enc, 0xff)
+	if _, err := (pforCodec{}).decode(enc); err == nil {
+		t.Fatal("trailing byte accepted, want corrupt")
+	}
+}
+
 // TestCodecByID maps each selector to a codec whose id round-trips, and refuses an
 // unknown selector so a region from a newer format is rejected cleanly.
 func TestCodecByID(t *testing.T) {
-	for _, id := range []uint16{docCodecVarint, docCodecStreamVByte} {
+	for _, id := range []uint16{docCodecVarint, docCodecStreamVByte, docCodecPFor} {
 		dc, err := codecByID(id)
 		if err != nil {
 			t.Fatalf("codecByID(%d): %v", id, err)
