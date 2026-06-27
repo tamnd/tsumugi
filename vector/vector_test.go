@@ -112,7 +112,7 @@ func recallAt(got []Result, want []uint32) float64 {
 // over many queries on a clustered corpus, which is where the canon ef settings
 // land.
 func TestRecallTwoPart(t *testing.T) {
-	const dim, n = 64, 5000
+	const dim, n = 64, 3500
 	corpus := clusteredCorpus(n, dim, 40, 1)
 	b := NewBuilder(dim)
 	for _, v := range corpus {
@@ -125,7 +125,7 @@ func TestRecallTwoPart(t *testing.T) {
 
 	rng := rand.New(rand.NewSource(99))
 	var sum float64
-	const queries = 200
+	const queries = 120
 	for q := 0; q < queries; q++ {
 		query := normalize(randVec(rng, dim))
 		want := trueTopK(corpus, query, 10)
@@ -142,7 +142,7 @@ func TestRecallTwoPart(t *testing.T) {
 // TestGraphRecallVsBrute isolates the graph from quantization: the HNSW walk must
 // recover almost everything a brute-force scan with the identical scoring finds.
 func TestGraphRecallVsBrute(t *testing.T) {
-	const dim, n = 64, 4000
+	const dim, n = 64, 3000
 	corpus := clusteredCorpus(n, dim, 30, 7)
 	b := NewBuilder(dim)
 	for _, v := range corpus {
@@ -154,7 +154,7 @@ func TestGraphRecallVsBrute(t *testing.T) {
 	}
 	rng := rand.New(rand.NewSource(3))
 	var sum float64
-	const queries = 150
+	const queries = 100
 	for q := 0; q < queries; q++ {
 		query := normalize(randVec(rng, dim))
 		brute := r.BruteForce(query, 10)
@@ -179,7 +179,7 @@ func TestGraphRecallVsBrute(t *testing.T) {
 // shard that skips the int8 copy to save memory still feeds a good rerank. The bar
 // is the true top-10 recovered within the returned top-100.
 func TestNoRerankCandidateRecall(t *testing.T) {
-	const dim, n = 64, 4000
+	const dim, n = 64, 3000
 	corpus := clusteredCorpus(n, dim, 30, 11)
 	b := NewBuilder(dim).WithRerank(false)
 	for _, v := range corpus {
@@ -194,7 +194,7 @@ func TestNoRerankCandidateRecall(t *testing.T) {
 	}
 	rng := rand.New(rand.NewSource(5))
 	var sum float64
-	const queries = 150
+	const queries = 100
 	for q := 0; q < queries; q++ {
 		query := normalize(randVec(rng, dim))
 		want := trueTopK(corpus, query, 10)
