@@ -18,7 +18,8 @@ type cursor struct {
 	list         []byte
 	blockOffsets []int
 	blockLast    []uint32
-	blockMax     []int32
+	blockMax     []int32 // per-block upper bound, already scaled by this term's idf
+	scaledMax    int32   // list-wide upper bound, already scaled by this term's idf
 
 	blkIdx      int
 	blkPostings []posting
@@ -44,14 +45,19 @@ func (r *Region) openCursor(info termInfo) (*cursor, error) {
 		off = h.nextOffset
 	}
 
+	// The stored bounds are idf-free; scale them by this term's idf once, here, so the
+	// hot traversal compares already-scaled integers. The idf is shard-local on the
+	// single-shard path and collection-wide when the broker pushed one down, but the
+	// cursor does not care which: it scales whatever idf the termInfo carries.
 	bm := r.blockMax[e.blockMaxOff:]
 	c.blockMax = make([]int32, e.blockCount)
 	for i := uint32(0); i < e.blockCount; i++ {
 		if (int(i)+1)*4 > len(bm) {
 			return nil, errCorrupt
 		}
-		c.blockMax[i] = int32(codec.Uint32(bm[int(i)*4:]))
+		c.blockMax[i] = scaleBound(info.idf, int32(codec.Uint32(bm[int(i)*4:])))
 	}
+	c.scaledMax = scaleBound(info.idf, e.maxContrib)
 
 	if e.blockCount == 0 {
 		c.cur = sentinel
@@ -134,7 +140,7 @@ func (c *cursor) skipTo(target uint32) {
 // listMax is the list-wide upper bound on this term's contribution to any
 // document, the bound the WAND pivot selection needs because it must hold for a
 // pivot document the cursor has not yet reached.
-func (c *cursor) listMax() int32 { return c.info.entry.maxContrib }
+func (c *cursor) listMax() int32 { return c.scaledMax }
 
 // blockIndexCovering returns the index of the first block whose last docID is at
 // or beyond target, scanning forward from the cursor's current block. A target

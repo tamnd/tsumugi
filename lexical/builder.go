@@ -122,7 +122,6 @@ func (b *Builder) Build() []byte {
 		sort.Slice(ps, func(i, j int) bool { return ps[i].docID < ps[j].docID })
 
 		df := uint32(len(ps))
-		termIDF := idf(n, df)
 
 		entry := termEntry{
 			termID:      uint32(ti),
@@ -140,12 +139,17 @@ func (b *Builder) Build() []byte {
 				end = len(ps)
 			}
 			block := ps[start:end]
-			// block-max: the largest contribution any posting in the block makes,
-			// rounded up so it is a true upper bound.
+			// block-max: the largest idf-free term-frequency contribution any posting
+			// in the block makes, rounded up so it is a true upper bound. It is stored
+			// without idf so the query path can scale it by either the shard-local idf
+			// or the collection-wide idf the broker pushes down; the cursor applies the
+			// chosen idf at open. Computing the contribution with an idf of 1 leaves
+			// exactly the field-weighted, length-normalized, saturation-capped term
+			// component.
 			var bmax int32
 			for i := range block {
 				fl := b.fieldLenOf(block[i].docID)
-				c := quantizeCeil(contribution(termIDF, &block[i].fieldTF, &fl, &st, &b.params))
+				c := quantizeCeil(contribution(1, &block[i].fieldTF, &fl, &st, &b.params))
 				if c > bmax {
 					bmax = c
 				}
@@ -175,7 +179,7 @@ func (b *Builder) Build() []byte {
 
 	// Lay the parts out after the header and fill in the sub-offsets.
 	h := regionHeader{
-		flags:       0,
+		flags:       flagIDFFreeBlockMax,
 		termCount:   uint32(len(sorted)),
 		docCount:    n,
 		avgFieldLen: st.avgFieldLen,

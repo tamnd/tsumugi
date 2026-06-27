@@ -36,11 +36,33 @@ type stats struct {
 	avgFieldLen [numFields]float64
 }
 
-// idf is the inverse document frequency for a term with document frequency df in
-// a shard of n documents. It is the Robertson-Sparck-Jones idf BM25 uses, always
-// positive because of the +1 inside the log.
-func idf(n uint32, df uint32) float64 {
+// IDF is the Robertson-Sparck-Jones inverse document frequency for a term with
+// document frequency df in a collection of n documents, always positive because of
+// the +1 inside the log. It is exported so the broker can compute the collection-wide
+// idf from the fleet's total document count and the term's df summed across shards,
+// then push that one value down to every shard. Scoring a term against the same n and
+// df everywhere is what makes the merged top-k the result a single index over the
+// whole collection would give, rather than one biased by how the term happens to be
+// distributed across shards.
+func IDF(n, df uint64) float64 {
 	return math.Log(1 + (float64(n)-float64(df)+0.5)/(float64(df)+0.5))
+}
+
+// idf is the shard-local idf, the value the build bakes nothing of and the
+// single-shard path computes from the region's own document count.
+func idf(n uint32, df uint32) float64 {
+	return IDF(uint64(n), uint64(df))
+}
+
+// scaleBound applies a term's idf to an idf-free integer bound, rounding up so the
+// result stays a true upper bound on any document's integer score. The block-max and
+// list-max bounds are stored idf-free since M13, so the same posting lists can be
+// scored against a shard-local idf or a pushed-down collection-wide idf; the cursor
+// scales the stored bound by whichever idf the query carries. Rounding up is what
+// keeps the scaled bound at or above the rounded per-document score, so a skip
+// decision never drops a document the exhaustive scan would have kept.
+func scaleBound(termIDF float64, bound int32) int32 {
+	return int32(math.Ceil(termIDF * float64(bound)))
 }
 
 // contribution is bm25f(t, d): the field-weighted, length-normalized,

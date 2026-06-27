@@ -12,6 +12,15 @@ const regionMagic = "LEX1"
 
 const regionVersion = 1
 
+// flagIDFFreeBlockMax marks a region whose block-max and list-max bounds are stored
+// idf-free, the M13 format. The query path scales these bounds by the idf it is given,
+// shard-local or collection-wide, so the same posting lists serve both the single-shard
+// path and the broker's distributed exact-idf scoring. A region without the flag predates
+// the change and bakes a shard-local idf into the bounds, so scoring it with a pushed-down
+// idf would double-count; Open refuses such a region and asks for a rebuild rather than
+// returning silently wrong scores.
+const flagIDFFreeBlockMax = 1 << 0
+
 // norm record width: four uint32 field lengths per document, fixed-width so the
 // scorer reaches a document's lengths in O(1).
 const normRecord = numFields * 4
@@ -134,6 +143,9 @@ func Open(b []byte) (*Region, error) {
 	if err != nil {
 		return nil, err
 	}
+	if h.flags&flagIDFFreeBlockMax == 0 {
+		return nil, errLegacyBlockMax
+	}
 	slice := func(off, length uint64) ([]byte, bool) {
 		if off+length > uint64(len(b)) {
 			return nil, false
@@ -207,13 +219,21 @@ type termInfo struct {
 	idf   float64
 }
 
-// lookup resolves an analyzed term to its dictionary entry and idf, using the
-// bloom filter to reject absent terms before touching the dictionary.
-func (r *Region) lookup(term string) (termInfo, bool) {
+// lookupEntry resolves an analyzed term to its dictionary entry, using the bloom
+// filter to reject absent terms before touching the dictionary. It returns only the
+// entry, not an idf, so a caller can choose the idf: the shard-local one or a
+// collection-wide one pushed down by the broker.
+func (r *Region) lookupEntry(term string) (termEntry, bool) {
 	if !r.bloom.mayContain(term) {
-		return termInfo{}, false
+		return termEntry{}, false
 	}
-	e, ok := r.dict.lookup(term)
+	return r.dict.lookup(term)
+}
+
+// lookup resolves an analyzed term to its dictionary entry and shard-local idf, the
+// single-shard scoring path.
+func (r *Region) lookup(term string) (termInfo, bool) {
+	e, ok := r.lookupEntry(term)
 	if !ok {
 		return termInfo{}, false
 	}
