@@ -66,38 +66,65 @@ func (b *Builder) Build() []byte {
 	}
 	sort.Strings(names)
 
-	var idx, nameBlob, post []byte
-	for _, name := range names {
+	i := 0
+	next := func() (string, []posting, bool) {
+		if i >= len(names) {
+			return "", nil, false
+		}
+		name := names[i]
+		i++
 		ps := b.terms[name]
-		sort.Slice(ps, func(i, j int) bool {
-			if ps[i].docID != ps[j].docID {
-				return ps[i].docID < ps[j].docID
+		sort.Slice(ps, func(a, c int) bool {
+			if ps[a].docID != ps[c].docID {
+				return ps[a].docID < ps[c].docID
 			}
-			return ps[i].weight > ps[j].weight
+			return ps[a].weight > ps[c].weight
 		})
 		// One impact per (term, docID). Postings are sorted by docID then weight
 		// descending, so the first of each docID run is the strongest; drop the
 		// rest. Duplicates would double-count a doc past its own block-max bound
 		// and break the pruned == exhaustive guarantee.
-		ps = dedupByDoc(ps)
+		return name, dedupByDoc(ps), true
+	}
 
+	return assembleRegion(b.docCount, b.blockSize, q, next)
+}
+
+// termSource yields terms in ascending order, each with its postings already deduped
+// to one per docID and sorted by docID, the form encodeTermBlocks expects. Both the
+// in-memory Builder and the SPIMI external-merge build drive assembleRegion through
+// this interface, so the two emit byte-identical regions.
+type termSource func() (name string, ps []posting, ok bool)
+
+// assembleRegion frames an IMP1 region from a sorted term stream, the dense docID
+// space, the block width, and the quantizer the global weight range fixed. It is the
+// single encoder path the in-memory and external-merge builds share.
+func assembleRegion(docCount, blockSize uint32, q quantizer, next termSource) []byte {
+	var idx, nameBlob, post []byte
+	var termCount uint32
+	for {
+		name, ps, ok := next()
+		if !ok {
+			break
+		}
 		nameOff := uint32(len(nameBlob))
 		nameBlob = append(nameBlob, name...)
 		postOff := uint32(len(post))
 
-		blockCount := encodeTermBlocks(&post, ps, q, b.blockSize)
+		blockCount := encodeTermBlocks(&post, ps, q, blockSize)
 
 		idx = codec.AppendUint32(idx, nameOff)
 		idx = codec.AppendUint16(idx, uint16(len(name)))
 		idx = codec.AppendUint32(idx, postOff)
 		idx = codec.AppendUint32(idx, blockCount)
+		termCount++
 	}
 
 	h := header{
 		version:   regionVersion,
-		blockSize: b.blockSize,
-		termCount: uint32(len(names)),
-		docCount:  b.docCount,
+		blockSize: blockSize,
+		termCount: termCount,
+		docCount:  docCount,
 		lnMin:     q.lnMin,
 		lnMax:     q.lnMax,
 		idxLen:    uint64(len(idx)),
