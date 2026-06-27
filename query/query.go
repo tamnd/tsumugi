@@ -528,6 +528,34 @@ func (pq *ParsedQuery) LexicalTerms() []string {
 	return out
 }
 
+// RetrievalTerms is the term set the broker actually retrieves on: the lexical terms
+// followed by every term's curated expansion alternatives, deduplicated in first-seen
+// order. Folding the alternatives in is what makes expansion broaden recall under the
+// soft-OR semantics, where an alternative is simply another term that contributes to the
+// score, so a document matching only "colour" still answers a query for "color". The base
+// terms come first so a query with no expansion returns exactly LexicalTerms.
+func (pq *ParsedQuery) RetrievalTerms() []string {
+	out := pq.LexicalTerms()
+	seen := make(map[string]bool, len(out))
+	for _, t := range out {
+		seen[t] = true
+	}
+	addAlts := func(terms []QueryTerm) {
+		for _, t := range terms {
+			for _, a := range t.Alts {
+				if a == "" || seen[a] {
+					continue
+				}
+				seen[a] = true
+				out = append(out, a)
+			}
+		}
+	}
+	addAlts(pq.Terms)
+	addAlts(pq.Required)
+	return out
+}
+
 // Empty reports whether the query carries nothing to retrieve on: no lexical terms and
 // no phrases. The broker short-circuits an empty query to an empty result rather than
 // routing it, the spec's empty-query behavior.

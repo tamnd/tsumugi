@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/tamnd/tsumugi/collection"
 	"github.com/tamnd/tsumugi/lexical"
+	"github.com/tamnd/tsumugi/query"
 	"github.com/tamnd/tsumugi/rank"
 	"github.com/tamnd/tsumugi/search"
 )
@@ -47,13 +48,13 @@ func newServeCmd() *cobra.Command {
 			if modelP == "" {
 				return fmt.Errorf("a ranking model is required: pass --model")
 			}
-			broker, err := openCollection(dir, modelP)
+			broker, pl, err := openCollection(dir, modelP)
 			if err != nil {
 				return err
 			}
 			defer func() { _ = broker.Close() }()
 
-			srv := &httpServer{broker: broker, timeout: timeout}
+			srv := &httpServer{broker: broker, pipeline: pl, timeout: timeout}
 			mux := http.NewServeMux()
 			mux.HandleFunc("/search", srv.search)
 			mux.HandleFunc("/healthz", srv.health)
@@ -70,43 +71,57 @@ func newServeCmd() *cobra.Command {
 	return cmd
 }
 
-// openCollection opens every shard in a directory, loads the model, and wires a
-// broker over them. Each shard and the broker share the same compiled model so a
-// document scores identically wherever it is reranked.
-func openCollection(dir, modelPath string) (*search.Broker, error) {
+// openCollection opens every shard in a directory, loads the model, wires a broker
+// over them, and builds the query-understanding pipeline the broker runs each query
+// through. Each shard and the broker share the same compiled model so a document scores
+// identically wherever it is reranked, and the pipeline is built from the same open
+// shards so the corrector's dictionary and the dense plane's dimension match the fleet
+// the broker serves.
+func openCollection(dir, modelPath string) (*search.Broker, *pipeline, error) {
 	f, err := os.Open(modelPath)
 	if err != nil {
-		return nil, fmt.Errorf("open model: %w", err)
+		return nil, nil, fmt.Errorf("open model: %w", err)
 	}
 	ens, err := rank.LoadEnsemble(f)
 	_ = f.Close()
 	if err != nil {
-		return nil, fmt.Errorf("load model: %w", err)
+		return nil, nil, fmt.Errorf("load model: %w", err)
 	}
 	model := ens.Compile()
 
-	// Prefer the persisted collection artifact: it carries the manifest, the fleet-wide
-	// statistics, and the routing index, so the broker starts without rescanning every
-	// shard's vocabulary, which is what lets serve start in time at fleet scale. A
-	// collection built before the artifact existed has none, so fall back to the scan.
+	shards, broker, err := openShards(dir, model)
+	if err != nil {
+		return nil, nil, err
+	}
+	return broker, buildPipeline(shards), nil
+}
+
+// openShards opens the directory's shards and wires a broker over them, returning the
+// shard slice alongside the broker so the caller can build the query pipeline from the
+// same open shards. It prefers the persisted collection artifact, which carries the
+// manifest, the fleet-wide statistics, and the routing index, so the broker starts
+// without rescanning every shard's vocabulary, which is what lets serve start in time at
+// fleet scale; a collection built before the artifact existed has none, so it falls back
+// to the glob scan.
+func openShards(dir string, model *rank.Model) ([]*search.Shard, *search.Broker, error) {
 	if ix, err := collection.LoadIndex(dir); err == nil {
 		// The manifest records the collection-wide analyzer hash in one place, so the
 		// broker verifies it once here rather than opening every shard's footer.
 		if h := ix.AnalyzerHash; h != 0 && h != queryAnalyzerHash() {
-			return nil, fmt.Errorf("%w: collection is %#016x, broker analyzer is %#016x",
+			return nil, nil, fmt.Errorf("%w: collection is %#016x, broker analyzer is %#016x",
 				collection.ErrAnalyzerMismatch, h, queryAnalyzerHash())
 		}
-		return brokerFromIndex(dir, model, ix)
+		return shardsFromIndex(dir, model, ix)
 	} else if !os.IsNotExist(err) {
-		return nil, fmt.Errorf("load index: %w", err)
+		return nil, nil, fmt.Errorf("load index: %w", err)
 	}
 
 	paths, err := filepath.Glob(filepath.Join(dir, "*.tsumugi"))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(paths) == 0 {
-		return nil, fmt.Errorf("no .tsumugi shards in %s", dir)
+		return nil, nil, fmt.Errorf("no .tsumugi shards in %s", dir)
 	}
 	shards := make([]*search.Shard, 0, len(paths))
 	closeAll := func() {
@@ -118,7 +133,7 @@ func openCollection(dir, modelPath string) (*search.Broker, error) {
 		s, err := search.OpenShard(p, newCascade(model))
 		if err != nil {
 			closeAll()
-			return nil, fmt.Errorf("open shard %s: %w", p, err)
+			return nil, nil, fmt.Errorf("open shard %s: %w", p, err)
 		}
 		// No manifest in this directory, so verify each shard's own recorded analyzer
 		// against the broker's. A shard built before the hash was recorded reports
@@ -126,20 +141,20 @@ func openCollection(dir, modelPath string) (*search.Broker, error) {
 		if h, ok := s.AnalyzerHash(); ok && h != queryAnalyzerHash() {
 			_ = s.Close()
 			closeAll()
-			return nil, fmt.Errorf("%w: shard %s is %#016x, broker analyzer is %#016x",
+			return nil, nil, fmt.Errorf("%w: shard %s is %#016x, broker analyzer is %#016x",
 				collection.ErrAnalyzerMismatch, p, h, queryAnalyzerHash())
 		}
 		shards = append(shards, s)
 	}
-	return search.NewBroker(shards, newCascade(model)), nil
+	return shards, search.NewBroker(shards, newCascade(model)), nil
 }
 
-// brokerFromIndex opens the shards the artifact names, in the artifact's order, and
+// shardsFromIndex opens the shards the artifact names, in the artifact's order, and
 // wires a broker over them with the persisted routing index and statistics. Opening in
 // the manifest's order is what keeps the routing index's shard ids aligned with the
 // shard slice, so a routed shard id always points at the shard the artifact recorded it
 // for.
-func brokerFromIndex(dir string, model *rank.Model, ix *collection.Index) (*search.Broker, error) {
+func shardsFromIndex(dir string, model *rank.Model, ix *collection.Index) ([]*search.Shard, *search.Broker, error) {
 	shards := make([]*search.Shard, 0, len(ix.Shards))
 	for _, info := range ix.Shards {
 		p := filepath.Join(dir, filepath.Base(info.Path))
@@ -148,7 +163,7 @@ func brokerFromIndex(dir string, model *rank.Model, ix *collection.Index) (*sear
 			for _, opened := range shards {
 				_ = opened.Close()
 			}
-			return nil, fmt.Errorf("open shard %s: %w", p, err)
+			return nil, nil, fmt.Errorf("open shard %s: %w", p, err)
 		}
 		shards = append(shards, s)
 	}
@@ -158,23 +173,34 @@ func brokerFromIndex(dir string, model *rank.Model, ix *collection.Index) (*sear
 		TokenCount: ix.Stats.TokenCount,
 		AvgDocLen:  ix.Stats.AvgDocLen,
 	}
-	return search.NewBrokerWith(shards, newCascade(model), routing, stats), nil
+	return shards, search.NewBrokerWith(shards, newCascade(model), routing, stats), nil
 }
 
 func newCascade(model *rank.Model) *rank.Cascade {
 	return rank.NewCascade(&rank.Linear{RetrievalWeight: 1}, model)
 }
 
-// httpServer answers search requests over a broker with a per-request deadline.
+// httpServer answers search requests over a broker with a per-request deadline. It runs
+// each raw query through the query-understanding pipeline once, at the broker, before
+// fanning the parsed query out to the shards, the analyze-once rule the pipeline owns.
 type httpServer struct {
-	broker  *search.Broker
-	timeout time.Duration
+	broker   *search.Broker
+	pipeline *pipeline
+	timeout  time.Duration
 }
 
 type searchResponse struct {
 	Hits   []hitJSON `json:"hits"`
 	Shards int       `json:"shards"`
 	TookMs float64   `json:"took_ms"`
+
+	// Lang is the language the detector routed analysis on, empty for the default
+	// chain. Corrected is true when spell correction auto-substituted a term, and
+	// Suggestion carries the did-you-mean rendering when one was offered rather than
+	// applied, so a caller can show "showing results for" or "did you mean".
+	Lang       string `json:"lang,omitempty"`
+	Corrected  bool   `json:"corrected,omitempty"`
+	Suggestion string `json:"suggestion,omitempty"`
 }
 
 type hitJSON struct {
@@ -183,15 +209,30 @@ type hitJSON struct {
 }
 
 func (s *httpServer) search(w http.ResponseWriter, r *http.Request) {
-	q := search.Query{
-		Text: r.URL.Query().Get("q"),
-		K:    10,
-	}
-	if k := r.URL.Query().Get("k"); k != "" {
-		if v, err := strconv.Atoi(k); err == nil && v > 0 {
-			q.K = v
+	k := 10
+	if v := r.URL.Query().Get("k"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			k = n
 		}
 	}
+	// Understand the query once here, at the broker: detect its language, analyze it
+	// with that language's chain, correct and expand and dense-encode it, then ship the
+	// single parsed result to the shards, so a shard never re-runs the analysis chain.
+	pq := s.pipeline.parse(r.URL.Query().Get("q"))
+	resp := searchResponse{
+		Shards:     s.broker.NumShards(),
+		Lang:       pq.Lang,
+		Corrected:  pq.Corrected,
+		Suggestion: pq.Suggestion,
+	}
+	if pq.Empty() {
+		resp.Hits = []hitJSON{}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	q := toQuery(pq, k)
 	ctx := r.Context()
 	if s.timeout > 0 {
 		var cancel context.CancelFunc
@@ -200,16 +241,26 @@ func (s *httpServer) search(w http.ResponseWriter, r *http.Request) {
 	}
 	start := time.Now()
 	hits := s.broker.Search(ctx, q)
-	resp := searchResponse{
-		Hits:   make([]hitJSON, len(hits)),
-		Shards: s.broker.NumShards(),
-		TookMs: float64(time.Since(start).Microseconds()) / 1000,
-	}
+	resp.Hits = make([]hitJSON, len(hits))
+	resp.TookMs = float64(time.Since(start).Microseconds()) / 1000
 	for i, h := range hits {
 		resp.Hits[i] = hitJSON{DocID: h.DocID, Score: h.Score}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// toQuery translates an understood query into the broker's retrieval query: the lexical
+// plane retrieves on the expansion-folded retrieval terms, and the dense plane takes the
+// query's dense vector decoded from its wire form, nil when the dense plane is off so the
+// shards skip it. The analysis already ran at the broker, so the shards take the
+// pre-analyzed terms and never re-run the chain.
+func toQuery(pq *query.ParsedQuery, k int) search.Query {
+	return search.Query{
+		Terms:  pq.RetrievalTerms(),
+		Vector: query.DecodeDenseVec(pq.DenseVec),
+		K:      k,
+	}
 }
 
 func (s *httpServer) health(w http.ResponseWriter, _ *http.Request) {
