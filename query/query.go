@@ -160,6 +160,66 @@ func (pq *ParsedQuery) ApplyCorrection(c Corrector) {
 	}
 }
 
+// Expander returns the curated expansion alternatives for one analyzed query term, the
+// acronym and synonym table the broker holds. Like Corrector it is an interface
+// returning primitives so the query package depends on neither the expand package nor a
+// shared type; expand.Table satisfies it structurally. It returns nil for a term with
+// no expansion, the common case.
+type Expander interface {
+	Expand(term string) []string
+}
+
+// ApplyExpansion fills each free and required term's Alts with the curated alternatives
+// the table holds, the light query-side expansion doc 10 keeps after correction. The
+// original term is always kept; the alternatives are optional OR forms the traversal
+// matches alongside it, so "nyc" carries "new york city" as an alternative and the
+// scoring decides which document matches better. Excluded terms are not expanded,
+// because broadening a must-not would drop documents the user did not ask to exclude.
+// The cache key is recomputed so the expanded query caches distinctly from the bare one,
+// the spec's rule that the key is computed after expansion. A nil expander is a no-op.
+func (pq *ParsedQuery) ApplyExpansion(e Expander) {
+	if e == nil {
+		return
+	}
+	changed := false
+	expand := func(terms []QueryTerm) {
+		for i := range terms {
+			alts := e.Expand(terms[i].Term)
+			if len(alts) == 0 {
+				continue
+			}
+			terms[i].Alts = mergeAlts(terms[i].Alts, alts, terms[i].Term)
+			if len(terms[i].Alts) > 0 {
+				changed = true
+			}
+		}
+	}
+	expand(pq.Terms)
+	expand(pq.Required)
+	if changed {
+		pq.NormKey = pq.normKey()
+	}
+}
+
+// mergeAlts appends the new alternatives to a term's existing alts, dropping any that
+// equal the term itself or a form already present, so expansion is idempotent and never
+// lists the original among its own alternatives. The result keeps first-seen order.
+func mergeAlts(existing, add []string, term string) []string {
+	seen := map[string]bool{term: true}
+	out := existing
+	for _, a := range existing {
+		seen[a] = true
+	}
+	for _, a := range add {
+		if a == "" || seen[a] {
+			continue
+		}
+		seen[a] = true
+		out = append(out, a)
+	}
+	return out
+}
+
 // piece is one raw fragment the operator scan produces, before the analysis chain runs
 // over its text. The kind records the operator the scan recognized; the text is still
 // raw, because operators are recognized on the raw string but the term content inside
@@ -395,15 +455,22 @@ func (pq *ParsedQuery) normKey() string {
 }
 
 // termStrings projects the term strings out of a query-term slice. A field-scoped term
-// carries its field into the key so title:rust and a plain rust do not collide.
+// carries its field into the key so title:rust and a plain rust do not collide, and an
+// expanded term carries its alternatives so a query expanded against the table caches
+// distinctly from the bare query, the spec's rule that the key is computed after
+// expansion. The alternatives are emitted in their stored order, which Build already
+// sorted, so the key stays stable.
 func termStrings(ts []QueryTerm) []string {
 	out := make([]string, len(ts))
 	for i, t := range ts {
+		s := t.Term
 		if t.Field != AnyField {
-			out[i] = fieldName(t.Field) + ":" + t.Term
-		} else {
-			out[i] = t.Term
+			s = fieldName(t.Field) + ":" + t.Term
 		}
+		if len(t.Alts) > 0 {
+			s += "=(" + strings.Join(t.Alts, "|") + ")"
+		}
+		out[i] = s
 	}
 	return out
 }
