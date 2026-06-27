@@ -200,6 +200,17 @@ func (s *Shard) LexDocFreqs(terms []string) map[string]uint32 {
 	return s.lex.DocFreqsTerms(terms)
 }
 
+// ForEachTerm calls fn for every term in this shard's lexical dictionary with its
+// local document frequency. The broker builds the collection-wide spell-correction
+// dictionary by merging this enumeration across the fleet's shards. A shard with no
+// lexical region contributes nothing.
+func (s *Shard) ForEachTerm(fn func(term string, docFreq uint32)) {
+	if s.lex == nil {
+		return
+	}
+	s.lex.ForEachTerm(fn)
+}
+
 // Search runs the full cascade over this one shard and returns the model-ranked
 // top-k as global hits. It is the standalone single-shard search path and the M8
 // cascade wired end to end: retrieve on every plane, fuse and cut and rerank, and

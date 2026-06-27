@@ -137,6 +137,12 @@ func (r *Region) SearchExhaustive(query string, k int) ([]Candidate, error) {
 // Term reconstructs a term string from its termID, for tooling and explanation.
 func (r *Region) Term(termID uint32) (string, bool) { return r.dict.term(termID) }
 
+// ForEachTerm calls fn for every term in the region's dictionary with its local
+// document frequency, in sorted order. The spell corrector builds its collection-wide
+// correction dictionary by merging this enumeration across the fleet's shards, summing
+// each term's per-shard df into the fleet-wide df the rank tie-break uses.
+func (r *Region) ForEachTerm(fn func(term string, docFreq uint32)) { r.dict.forEach(fn) }
+
 // blockMaxInvariant decodes every block of every term and checks that the stored
 // block-max is at least the true maximum contribution in that block. It is the
 // safety invariant the pruning rests on, exposed for the test that asserts it
