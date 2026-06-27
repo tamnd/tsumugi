@@ -30,6 +30,11 @@ type Analyzer struct {
 	Stemmer string
 	// Stopwords is the drop set; empty keeps every token, the spec's default.
 	Stopwords map[string]struct{}
+	// Segment turns on CJK word segmentation. The letter-run tokenizer emits a whole
+	// space-free CJK sentence as one term, so the languages that write without word
+	// spaces turn this on to split each run into dictionary words with a bigram
+	// fallback. It is a no-op on text that carries no Han or kana.
+	Segment bool
 }
 
 // DefaultAnalyzer is the analyzer the package-level Analyze uses and the one the
@@ -48,12 +53,10 @@ func (a *Analyzer) Analyze(text string) []string {
 	}
 	var out []string
 	var b strings.Builder
-	flush := func() {
-		if b.Len() == 0 {
-			return
-		}
-		tok := b.String()
-		b.Reset()
+	// emit applies the per-token policy steps, fold then stem then stopword drop, and
+	// appends what survives. Both the plain path and the segmented path funnel through
+	// it so a CJK term and a Latin term get the same downstream treatment.
+	emit := func(tok string) {
 		if a.FoldAccents {
 			tok = FoldAccents(tok)
 		}
@@ -67,6 +70,24 @@ func (a *Analyzer) Analyze(text string) []string {
 			}
 		}
 		out = append(out, tok)
+	}
+	flush := func() {
+		if b.Len() == 0 {
+			return
+		}
+		tok := b.String()
+		b.Reset()
+		// With segmentation on, a run is split into its CJK words and any non-CJK
+		// pieces before the policy steps; without it the run is one token, the
+		// original chain. Segmentation runs first because the dictionary and bigram
+		// boundaries are defined on the raw runes, not on stemmed forms.
+		if a.Segment {
+			for _, piece := range sharedCJK.split(tok) {
+				emit(piece)
+			}
+			return
+		}
+		emit(tok)
 	}
 	for _, r := range text {
 		if IsTokenRune(r) {
@@ -94,6 +115,14 @@ func (a *Analyzer) Hash() uint64 {
 	b.WriteString(strconv.FormatBool(a.FoldAccents))
 	b.WriteString(";stem=")
 	b.WriteString(a.Stemmer)
+	b.WriteString(";seg=")
+	b.WriteString(strconv.FormatBool(a.Segment))
+	if a.Segment {
+		// Fold the dictionary's identity in too, so a change to the segmentation
+		// dictionary forces the same rebuild signal a change to any other policy does.
+		b.WriteString(":")
+		b.WriteString(strconv.FormatUint(sharedCJK.hash(), 16))
+	}
 	b.WriteString(";stop=")
 	if len(a.Stopwords) > 0 {
 		words := make([]string, 0, len(a.Stopwords))
