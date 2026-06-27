@@ -35,10 +35,10 @@ const IndexName = "index.tsm"
 // indexMagic marks the artifact, distinct from a shard's TSM1.
 const indexMagic = "TSMI"
 
-// indexVersion 2 adds the collection-wide analyzer hash to the body. A reader refuses an
-// older version, so a stale artifact triggers a rebuild or the shard-scan fallback rather
-// than a misread.
-const indexVersion = 2
+// indexVersion 3 adds the per-field fleet average lengths to the body, on top of the
+// version 2 collection-wide analyzer hash. A reader refuses an older version, so a stale
+// artifact triggers a rebuild or the shard-scan fallback rather than a misread.
+const indexVersion = 3
 
 // Stats are the fleet-wide collection statistics, summed across every shard. A single
 // shard describes only its slice of the collection, so any scoring that normalizes by
@@ -48,6 +48,14 @@ type Stats struct {
 	DocCount   uint64
 	TokenCount float64
 	AvgDocLen  float64
+
+	// AvgFieldLen is the fleet average length in tokens of the title, body, and url
+	// fields, in the online extractor's field order. The broker's per-field BM25F
+	// normalizes each field by its own fleet average rather than the conflated average
+	// document length, so a candidate's field-weighted score is identical regardless of
+	// the shard it came from. Persisting them here lets a serve load the per-field
+	// denominators from one file rather than rescanning every shard's footer.
+	AvgFieldLen [3]float64
 }
 
 // Index is a loaded collection artifact: the manifest of shards, the fleet-wide
@@ -103,6 +111,7 @@ func WriteIndex(dir string, epoch uint64) error {
 		numShd:     len(infos),
 	}
 	hashSeen := false
+	var titleTok, bodyTok, urlTok float64
 	for si, info := range infos {
 		r, err := tsumugi.Open(info.Path)
 		if err != nil {
@@ -111,6 +120,20 @@ func WriteIndex(dir string, epoch uint64) error {
 		ix.Stats.DocCount += uint64(r.DocCount())
 		if v, ok := r.Stat(tsumugi.StatTokenCount); ok {
 			ix.Stats.TokenCount += v
+		}
+		// Sum the per-field token counts so the manifest carries the fleet average length
+		// of each field. The body falls back to token_count for a shard built before the
+		// per-field sums; title and url fall back to zero, the no-normalization case.
+		if v, ok := r.Stat(tsumugi.StatBodyTokenCount); ok {
+			bodyTok += v
+		} else if v, ok := r.Stat(tsumugi.StatTokenCount); ok {
+			bodyTok += v
+		}
+		if v, ok := r.Stat(tsumugi.StatTitleTokenCount); ok {
+			titleTok += v
+		}
+		if v, ok := r.Stat(tsumugi.StatURLTokenCount); ok {
+			urlTok += v
 		}
 		// Record the collection-wide analyzer hash, refusing a collection whose shards
 		// disagree: a mixed-analyzer collection cannot be queried consistently, so the
@@ -132,7 +155,11 @@ func WriteIndex(dir string, epoch uint64) error {
 		_ = r.Close()
 	}
 	if ix.Stats.DocCount > 0 {
-		ix.Stats.AvgDocLen = ix.Stats.TokenCount / float64(ix.Stats.DocCount)
+		n := float64(ix.Stats.DocCount)
+		ix.Stats.AvgDocLen = ix.Stats.TokenCount / n
+		ix.Stats.AvgFieldLen[0] = titleTok / n
+		ix.Stats.AvgFieldLen[1] = bodyTok / n
+		ix.Stats.AvgFieldLen[2] = urlTok / n
 	}
 
 	buf := ix.encode()
@@ -279,6 +306,9 @@ func (ix *Index) encodeBody() []byte {
 	b = codec.AppendUint64(b, ix.Stats.DocCount)
 	b = codec.AppendUint64(b, math.Float64bits(ix.Stats.TokenCount))
 	b = codec.AppendUint64(b, math.Float64bits(ix.Stats.AvgDocLen))
+	b = codec.AppendUint64(b, math.Float64bits(ix.Stats.AvgFieldLen[0]))
+	b = codec.AppendUint64(b, math.Float64bits(ix.Stats.AvgFieldLen[1]))
+	b = codec.AppendUint64(b, math.Float64bits(ix.Stats.AvgFieldLen[2]))
 	b = codec.AppendUint64(b, ix.AnalyzerHash)
 
 	b = codec.AppendUint32(b, uint32(len(ix.Shards)))
@@ -350,6 +380,9 @@ func decodeIndex(b []byte) (*Index, error) {
 	ix.Stats.DocCount = p.u64()
 	ix.Stats.TokenCount = math.Float64frombits(p.u64())
 	ix.Stats.AvgDocLen = math.Float64frombits(p.u64())
+	ix.Stats.AvgFieldLen[0] = math.Float64frombits(p.u64())
+	ix.Stats.AvgFieldLen[1] = math.Float64frombits(p.u64())
+	ix.Stats.AvgFieldLen[2] = math.Float64frombits(p.u64())
 	ix.AnalyzerHash = p.u64()
 
 	nShard := int(p.u32())

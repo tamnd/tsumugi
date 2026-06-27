@@ -174,9 +174,10 @@ func shardsFromIndex(dir string, model *rank.Model, ix *collection.Index) ([]*se
 	}
 	routing := search.NewRoutingIndex(ix.RoutingMap(), ix.AlwaysRouted(), len(shards))
 	stats := search.GlobalStats{
-		DocCount:   ix.Stats.DocCount,
-		TokenCount: ix.Stats.TokenCount,
-		AvgDocLen:  ix.Stats.AvgDocLen,
+		DocCount:    ix.Stats.DocCount,
+		TokenCount:  ix.Stats.TokenCount,
+		AvgDocLen:   ix.Stats.AvgDocLen,
+		AvgFieldLen: ix.Stats.AvgFieldLen,
 	}
 	broker := search.NewBrokerWith(shards, newCascade(model), routing, stats)
 	if err := broker.CheckModel(); err != nil {

@@ -57,9 +57,10 @@ func brokers(t testing.TB, dir string) (indexBacked, scan *search.Broker, close 
 
 	routing := search.NewRoutingIndex(ix.RoutingMap(), ix.AlwaysRouted(), len(shA))
 	stats := search.GlobalStats{
-		DocCount:   ix.Stats.DocCount,
-		TokenCount: ix.Stats.TokenCount,
-		AvgDocLen:  ix.Stats.AvgDocLen,
+		DocCount:    ix.Stats.DocCount,
+		TokenCount:  ix.Stats.TokenCount,
+		AvgDocLen:   ix.Stats.AvgDocLen,
+		AvgFieldLen: ix.Stats.AvgFieldLen,
 	}
 	indexBacked = search.NewBrokerWith(shA, equivCascade(), routing, stats)
 	scan = search.NewBroker(shB, equivCascade())

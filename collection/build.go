@@ -210,7 +210,7 @@ func writeShard(path string, docs []convert.Document, sig graphSignals, base uin
 		}
 	}
 
-	var tokens float64
+	var tokens, titleTokens, bodyTokens, urlTokens float64
 	for i, d := range docs {
 		a := analyze.Document(d)
 		id := uint32(i)
@@ -219,7 +219,16 @@ func writeShard(path string, docs []convert.Document, sig graphSignals, base uin
 			lexical.FieldBody:  d.Body,
 			lexical.FieldURL:   d.URL,
 		})
-		tokens += float64(len(lexical.Analyze(d.Body)) + len(lexical.Analyze(a.Title)))
+		// Per-field token counts feed the fleet average field lengths the broker BM25F
+		// normalizes each field by. token_count stays title+body so avg_doc_len is
+		// unchanged; the per-field sums are recorded alongside it.
+		bt := len(lexical.Analyze(d.Body))
+		tt := len(lexical.Analyze(a.Title))
+		ut := len(lexical.Analyze(d.URL))
+		bodyTokens += float64(bt)
+		titleTokens += float64(tt)
+		urlTokens += float64(ut)
+		tokens += float64(bt + tt)
 		for fid, v := range a.Features {
 			fb.Set(id, fid, v)
 		}
@@ -255,6 +264,9 @@ func writeShard(path string, docs []convert.Document, sig graphSignals, base uin
 	w.SetDocCount(uint32(len(docs)))
 	w.SetNodeBase(uint64(base))
 	w.SetStat(tsumugi.StatTokenCount, tokens)
+	w.SetStat(tsumugi.StatTitleTokenCount, titleTokens)
+	w.SetStat(tsumugi.StatBodyTokenCount, bodyTokens)
+	w.SetStat(tsumugi.StatURLTokenCount, urlTokens)
 	w.SetStat(tsumugi.StatEdgeCount, float64(g.EdgeCount()))
 	// Record the analyzer the build tokenized with so a broker can verify in one
 	// comparison that it is about to query the shard with the same analyzer. The build

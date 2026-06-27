@@ -115,12 +115,12 @@ const maxBodyScanRunes = 10000
 
 // newOnlineExtractor analyzes the query once and binds the regions the online
 // features read. idfOf is the per-term idf the broker pushed down, or nil to fall
-// back to a neutral idf; avgBody is the fleet average body length BM25 normalizes
-// the body field by, with the title and url fields left unnormalized until the
-// fleet statistics carry their averages. A query with no text yields an extractor
-// whose text features are all zero, which is the right answer for a pure-vector
-// query: it has no terms to cover or locate.
-func newOnlineExtractor(q Query, fwd *forward.Region, vec *vector.Region, idfOf map[string]float64, avgBody float64) *onlineExtractor {
+// back to a neutral idf; avgField is the fleet average length of the title, body, and
+// url fields the per-field BM25 normalizes each field by, a zero entry leaving that
+// field unnormalized. A query with no text yields an extractor whose text features
+// are all zero, which is the right answer for a pure-vector query: it has no terms to
+// cover or locate.
+func newOnlineExtractor(q Query, fwd *forward.Region, vec *vector.Region, idfOf map[string]float64, avgField [3]float64) *onlineExtractor {
 	ordered := q.lexTerms()
 	seen := make(map[string]bool, len(ordered))
 	var terms []string
@@ -140,7 +140,7 @@ func newOnlineExtractor(q Query, fwd *forward.Region, vec *vector.Region, idfOf 
 		params:   lexical.DefaultParams(),
 		queryLen: float64(len(terms)),
 	}
-	e.avgField[fBody] = avgBody
+	e.avgField = avgField
 	e.minTermLen, e.maxTermLen = 1<<31-1, 0
 	for i, t := range terms {
 		e.qindex[t] = i
