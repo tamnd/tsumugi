@@ -11,6 +11,8 @@
 package query
 
 import (
+	"encoding/binary"
+	"math"
 	"sort"
 	"strings"
 )
@@ -205,6 +207,83 @@ func (pq *ParsedQuery) ApplyExpansion(e Expander) {
 	if changed {
 		pq.NormKey = pq.normKey()
 	}
+}
+
+// DenseEncoder turns the query's analyzed terms into the dense-plane query vector, the
+// full-precision embedding the shards' ANN index recalls against. Like Corrector and
+// Expander it is an interface returning primitives so the query package depends on
+// neither the dense package nor a shared type; dense.StaticEncoder satisfies it
+// structurally. It returns a vector of the index's kept dimension, or a nil or zero
+// vector for a query whose terms carry no dense signal.
+type DenseEncoder interface {
+	Encode(terms []string) []float32
+}
+
+// ApplyDense runs the dense encoder over the query's terms and packs the result into
+// DenseVec, the broker step that fills the dense plane's input when the dense plane is
+// on. It encodes the free and required terms together, the bag of words the static
+// encoder mean-pools, and stores the full-precision float32 vector as its little-endian
+// byte form: the shard's vector reader takes a float32 query and rotates and quantizes it
+// internally, so the wire form is the lossless float32 vector rather than a pre-quantized
+// one. An all-zero vector is the dense plane's no-signal value and is left unstored so the
+// cache key still reads the query as dense-off, and a nil encoder is a no-op. The cache
+// key is recomputed so a dense query caches distinctly from the same string without the
+// dense plane.
+func (pq *ParsedQuery) ApplyDense(enc DenseEncoder) {
+	if enc == nil {
+		return
+	}
+	terms := make([]string, 0, len(pq.Terms)+len(pq.Required))
+	for _, t := range pq.Terms {
+		terms = append(terms, t.Term)
+	}
+	for _, t := range pq.Required {
+		terms = append(terms, t.Term)
+	}
+	vec := enc.Encode(terms)
+	if !anyNonzero(vec) {
+		return
+	}
+	pq.DenseVec = EncodeDenseVec(vec)
+	pq.NormKey = pq.normKey()
+}
+
+// anyNonzero reports whether a vector carries any signal, the test that distinguishes a
+// real dense query from the encoder's zero-vector no-signal return.
+func anyNonzero(vec []float32) bool {
+	for _, x := range vec {
+		if x != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// EncodeDenseVec packs a full-precision dense vector into its little-endian float32 byte
+// form, the wire shape ParsedQuery.DenseVec carries to the shards. It is lossless: each
+// float32 becomes four bytes, so the shard decodes exactly the vector the encoder
+// produced before the reader rotates and quantizes it.
+func EncodeDenseVec(vec []float32) []byte {
+	out := make([]byte, len(vec)*4)
+	for i, x := range vec {
+		binary.LittleEndian.PutUint32(out[i*4:], math.Float32bits(x))
+	}
+	return out
+}
+
+// DecodeDenseVec unpacks the little-endian float32 byte form back into a vector, the
+// inverse of EncodeDenseVec the shard side uses to recover the query vector from
+// ParsedQuery.DenseVec. A byte slice whose length is not a multiple of four is malformed
+// and decodes to nil rather than a truncated vector.
+func DecodeDenseVec(b []byte) []float32 {
+	if len(b) == 0 || len(b)%4 != 0 {
+		return nil
+	}
+	out := make([]float32, len(b)/4)
+	for i := range out {
+		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(b[i*4:]))
+	}
+	return out
 }
 
 // mergeAlts appends the new alternatives to a term's existing alts, dropping any that
