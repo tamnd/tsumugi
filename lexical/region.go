@@ -10,7 +10,10 @@ import (
 // dumping a raw region knows what it is looking at.
 const regionMagic = "LEX1"
 
-const regionVersion = 1
+// regionVersion is 2 since the docid_codec selector was added to the header. A
+// version 1 region has no codec field and a different header layout, so it cannot
+// be read; the engine refuses it and asks for a rebuild rather than misparsing.
+const regionVersion = 2
 
 // flagIDFFreeBlockMax marks a region whose block-max and list-max bounds are stored
 // idf-free, the M13 format. The query path scales these bounds by the idf it is given,
@@ -40,11 +43,13 @@ type Region struct {
 	terms  uint32
 	st     stats
 	params Params
+	codec  docCodec // gap-stream codec the header named, used to decode blocks
 }
 
 // header sub-offsets, all relative to the region start.
 type regionHeader struct {
 	flags       uint16
+	docidCodec  uint16
 	termCount   uint32
 	docCount    uint32
 	bloomOff    uint64
@@ -66,6 +71,7 @@ func (h *regionHeader) encode() []byte {
 	b = append(b, regionMagic...)
 	b = codec.AppendUint32(b, uint32(regionVersion))
 	b = codec.AppendUint32(b, uint32(h.flags))
+	b = codec.AppendUint32(b, uint32(h.docidCodec))
 	b = codec.AppendUint32(b, h.termCount)
 	b = codec.AppendUint32(b, h.docCount)
 	for _, p := range []uint64{h.bloomOff, h.bloomLen, h.dictOff, h.dictLen,
@@ -89,8 +95,9 @@ func (h *regionHeader) encode() []byte {
 }
 
 // headerLen is the fixed encoded header length: 4 magic + 4 ver + 4 flags +
-// 4 term + 4 doc + 10*8 offsets + 4*8 avg + 8 k1 + 4*8 w + 4*8 b + 4 crc + 4 rsv.
-const headerLen = 4 + 4 + 4 + 4 + 4 + 10*8 + numFields*8 + 8 + numFields*8 + numFields*8 + 4 + 4
+// 4 docidCodec + 4 term + 4 doc + 10*8 offsets + 4*8 avg + 8 k1 + 4*8 w + 4*8 b +
+// 4 crc + 4 rsv.
+const headerLen = 4 + 4 + 4 + 4 + 4 + 4 + 10*8 + numFields*8 + 8 + numFields*8 + numFields*8 + 4 + 4
 
 func decodeHeader(b []byte) (regionHeader, error) {
 	var h regionHeader
@@ -109,6 +116,8 @@ func decodeHeader(b []byte) (regionHeader, error) {
 	}
 	off += 4
 	h.flags = uint16(codec.Uint32(b[off:]))
+	off += 4
+	h.docidCodec = uint16(codec.Uint32(b[off:]))
 	off += 4
 	h.termCount = codec.Uint32(b[off:])
 	off += 4
@@ -145,6 +154,10 @@ func Open(b []byte) (*Region, error) {
 	}
 	if h.flags&flagIDFFreeBlockMax == 0 {
 		return nil, errLegacyBlockMax
+	}
+	gapCodec, err := codecByID(h.docidCodec)
+	if err != nil {
+		return nil, err
 	}
 	slice := func(off, length uint64) ([]byte, bool) {
 		if off+length > uint64(len(b)) {
@@ -187,6 +200,7 @@ func Open(b []byte) (*Region, error) {
 		postings: pl,
 		norms:    nm,
 		params:   h.params,
+		codec:    gapCodec,
 	}
 	r.terms = h.termCount
 	r.st.docCount = h.docCount

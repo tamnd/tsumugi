@@ -42,6 +42,7 @@ type SpimiBuilder struct {
 	runs     []string
 	spillSeq int
 	err      error
+	codec    docCodec
 }
 
 // defaultSpimiBudget is the in-memory record-buffer budget before a spill, used when
@@ -72,7 +73,18 @@ func NewSpimiBuilder(params Params, dir string, maxBytes int) *SpimiBuilder {
 		dir:      dir,
 		maxBytes: maxBytes,
 		norms:    map[uint32]*[numFields]uint32{},
+		codec:    varintCodec{},
 	}
+}
+
+// WithDocCodec selects the docID gap codec before any documents are added, matching
+// Builder.WithDocCodec so the two builders produce byte-identical regions under the
+// same codec. An unknown id keeps the default.
+func (s *SpimiBuilder) WithDocCodec(id uint16) *SpimiBuilder {
+	if dc, err := codecByID(id); err == nil {
+		s.codec = dc
+	}
+	return s
 }
 
 // AddDoc inverts one document into the record buffer, spilling a run when the buffer
@@ -189,7 +201,7 @@ func (s *SpimiBuilder) Build() ([]byte, error) {
 	}
 	defer m.close()
 
-	out := assembleRegion(n, norms, st, s.params, fieldLenFrom(s.norms), m.nextTerm)
+	out := assembleRegion(n, norms, st, s.params, fieldLenFrom(s.norms), s.codec, m.nextTerm)
 	if m.err != nil {
 		return nil, m.err
 	}

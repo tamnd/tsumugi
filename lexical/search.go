@@ -126,7 +126,7 @@ func (r *Region) blockMaxInvariant() (bool, error) {
 			if err != nil {
 				return false, err
 			}
-			ps, err := decodeBlock(h, prevLast)
+			ps, err := decodeBlock(h, prevLast, r.codec)
 			if err != nil {
 				return false, err
 			}

@@ -18,17 +18,21 @@ type posting struct {
 // docID in the block (the skip pointer) and the byte lengths of the two streams,
 // so a reader can step to the next block from the header alone without decoding
 // either stream. DocIDs are delta-coded against prevLast, the last docID of the
-// previous block, so the first gap of a block is small too. The payload of a
+// previous block, so the first gap of a block is small too. The gap stream's
+// integer codec is dc, chosen by the build and named in the region header; the
+// block header is codec-agnostic because it stores the gap stream's byte length,
+// so block skipping works without knowing which codec wrote it. The payload of a
 // posting is a field mask plus one frequency varint per set field.
-func encodeBlock(out []byte, ps []posting, prevLast uint32) []byte {
+func encodeBlock(out []byte, ps []posting, prevLast uint32, dc docCodec) []byte {
 	last := ps[len(ps)-1].docID
 
-	var docs []byte
+	gaps := make([]uint32, len(ps))
 	prev := prevLast
-	for _, p := range ps {
-		docs = codec.AppendUvarint(docs, uint64(p.docID-prev))
+	for i, p := range ps {
+		gaps[i] = p.docID - prev
 		prev = p.docID
 	}
+	docs := dc.encode(nil, gaps)
 
 	var pay []byte
 	for i := range ps {
@@ -93,24 +97,21 @@ func readBlockHeader(b []byte, off int) (blockHeader, error) {
 }
 
 // decodeBlock decodes a block into postings, given the last docID of the
-// previous block so the first gap resolves to an absolute docID.
-func decodeBlock(h blockHeader, prevLast uint32) ([]posting, error) {
-	// First pass over the docID stream recovers the docIDs and the count.
-	var docIDs []uint32
-	prev := prevLast
-	for off := 0; off < len(h.docs); {
-		gap, n := codec.Uvarint(h.docs[off:])
-		if n <= 0 {
-			return nil, errCorrupt
-		}
-		off += n
-		prev += uint32(gap)
-		docIDs = append(docIDs, prev)
+// previous block so the first gap resolves to an absolute docID and the codec dc
+// the region header named so the gap stream is read the way it was written.
+func decodeBlock(h blockHeader, prevLast uint32, dc docCodec) ([]posting, error) {
+	// The codec recovers the gap stream and with it the posting count, which the
+	// payload pass below needs.
+	gaps, err := dc.decode(h.docs)
+	if err != nil {
+		return nil, err
 	}
-	ps := make([]posting, len(docIDs))
+	ps := make([]posting, len(gaps))
+	prev := prevLast
 	off := 0
-	for i := range docIDs {
-		ps[i].docID = docIDs[i]
+	for i := range gaps {
+		prev += gaps[i]
+		ps[i].docID = prev
 		if off >= len(h.payload) {
 			return nil, errCorrupt
 		}
