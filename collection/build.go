@@ -11,6 +11,7 @@ import (
 	"github.com/tamnd/tsumugi/convert"
 	"github.com/tamnd/tsumugi/feature"
 	"github.com/tamnd/tsumugi/forward"
+	"github.com/tamnd/tsumugi/graph"
 	"github.com/tamnd/tsumugi/lexical"
 )
 
@@ -150,11 +151,12 @@ func readSource(path string, limit int) ([]convert.Document, int, error) {
 	return docs, len(hosts), nil
 }
 
-// writeShard builds the lexical, feature, and forward regions for one slice of
-// documents and writes them into a single shard file at the given global base. It
+// writeShard builds the lexical, feature, forward, and graph regions for one slice
+// of documents and writes them into a single shard file at the given global base. It
 // returns the file size. The lexical index gets the title, body, and url fields; the
 // feature matrix gets the derived content and url signals; the forward store keeps the
-// url, title, and body so the shard holds the text it was built from.
+// url, title, and body so the shard holds the text it was built from; the graph region
+// carries the link graph recovered from the page bodies.
 func writeShard(path string, docs []convert.Document, base uint32) (int64, error) {
 	lb := lexical.NewBuilder(lexical.DefaultParams())
 	fb := feature.NewBuilder(feature.DefaultSchema(), 1)
@@ -167,6 +169,18 @@ func writeShard(path string, docs []convert.Document, base uint32) (int64, error
 		}
 	}
 	fwd := forward.NewBuilder(fwdCols)
+	gb := graph.NewBuilder(len(docs))
+
+	// Map each document's canonical URL to its local node id so an extracted link
+	// whose target lives in this shard resolves to an intra-shard edge. A target
+	// that resolves outside the shard is dropped here; the cross-shard edges are the
+	// next milestone's concern, where a collection-wide node id carries them.
+	urlToID := make(map[string]int, len(docs))
+	for i, d := range docs {
+		if cu, ok := analyze.CanonicalURL(d.URL); ok {
+			urlToID[cu] = i
+		}
+	}
 
 	var tokens float64
 	for i, d := range docs {
@@ -184,6 +198,17 @@ func writeShard(path string, docs []convert.Document, base uint32) (int64, error
 		fwd.Set(id, "url", []byte(d.URL))
 		fwd.Set(id, "title", []byte(a.Title))
 		fwd.Set(id, "body", []byte(d.Body))
+		for _, tgt := range analyze.Links(d) {
+			if j, ok := urlToID[tgt]; ok {
+				gb.AddEdge(i, j)
+			}
+		}
+	}
+
+	gregion := gb.Build()
+	g, err := graph.Open(gregion)
+	if err != nil {
+		return 0, err
 	}
 
 	w, err := tsumugi.Create(path)
@@ -193,6 +218,7 @@ func writeShard(path string, docs []convert.Document, base uint32) (int64, error
 	w.SetDocCount(uint32(len(docs)))
 	w.SetNodeBase(uint64(base))
 	w.SetStat(tsumugi.StatTokenCount, tokens)
+	w.SetStat(tsumugi.StatEdgeCount, float64(g.EdgeCount()))
 	if err := w.AddRegion(tsumugi.RegionLexical, tsumugi.CodecZstd, 0, 0, lb.Build()); err != nil {
 		return 0, err
 	}
@@ -200,6 +226,9 @@ func writeShard(path string, docs []convert.Document, base uint32) (int64, error
 		return 0, err
 	}
 	if err := w.AddRegion(tsumugi.RegionForward, tsumugi.CodecZstd, 0, 0, fwd.Build()); err != nil {
+		return 0, err
+	}
+	if err := w.AddRegion(tsumugi.RegionGraph, tsumugi.CodecZstd, 0, 0, gregion); err != nil {
 		return 0, err
 	}
 	if err := w.Close(); err != nil {
