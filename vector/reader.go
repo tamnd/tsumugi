@@ -3,22 +3,45 @@ package vector
 import (
 	"math"
 	"sort"
+	"unsafe"
 
 	"github.com/tamnd/tsumugi/codec"
 )
 
-// Region is a parsed, read-only dense retrieval region.
+// Region is a parsed, read-only dense retrieval region. It holds zero-copy views
+// over the mapped region bytes rather than its own copies, so a few-million-vector
+// shard stays paged in the OS page cache the kernel can reclaim, not resident on
+// the Go heap. The codes and the int8 rerank copy are the bulk of the region and
+// both are views over the mmap; the only resident allocation is the small upper-layer
+// link directory openLinks builds.
 type Region struct {
-	h         header
-	rot       *rotator
-	iq        int8Quant
-	words     int
-	scalars   []float32
-	norms     []float32
-	bits      []uint64 // flat, words per node
-	rerank    []int8   // flat, rdim per node, nil if no rerank
+	h      header
+	rot    *rotator
+	iq     int8Quant
+	words  int
+	stride int
+	// codes is a view over the codes part of the mapping: count rows of stride bytes,
+	// each row a float32 scalar, a float32 norm, then words 64-bit sign blocks. The
+	// fields are read on demand through scalar, norm, and rowBits so the codes are
+	// never lifted onto the heap.
+	codes []byte
+	// rerank is a view over the int8 part of the mapping reinterpreted as int8, rdim
+	// per node, nil when the region carries no rerank copy. The reinterpret is a length
+	// and pointer view, not a copy, so the sharp int8 vectors stay OS-paged for the
+	// small candidate set the spec pages them in for.
+	rerank    []int8
 	links     *linksReader
 	hasRerank bool
+}
+
+// bytesToInt8 reinterprets a byte view as an int8 view without copying. int8 has no
+// alignment requirement beyond a byte, so this is safe over any region offset, unlike
+// a uint64 reinterpret which the 92-byte header would leave misaligned.
+func bytesToInt8(b []byte) []int8 {
+	if len(b) == 0 {
+		return nil
+	}
+	return unsafe.Slice((*int8)(unsafe.Pointer(&b[0])), len(b))
 }
 
 // Result is one retrieved document with its dense score, higher meaning nearer.
@@ -28,7 +51,10 @@ type Result struct {
 }
 
 // Open parses a VEC1 region, regenerates the rotation from the stored seed, and
-// makes the codes and int8 copy resident for the walk and rerank.
+// takes zero-copy views over the codes and int8 rerank parts so they stay paged in
+// the OS page cache rather than copied onto the Go heap. b must alias the shard's
+// memory mapping and stay valid for the lifetime of the returned Region, which the
+// caller guarantees by keeping the shard's reader open.
 func Open(b []byte) (*Region, error) {
 	h, err := decodeHeader(b)
 	if err != nil {
@@ -43,7 +69,8 @@ func Open(b []byte) (*Region, error) {
 	}
 	n := int(h.count)
 	words := int(h.rdim) / 64
-	if int(h.codeStride) != 8+words*8 || (n > 0 && len(b[off:codesEnd]) != n*int(h.codeStride)) {
+	stride := int(h.codeStride)
+	if stride != 8+words*8 || (n > 0 && len(b[off:codesEnd]) != n*stride) {
 		return nil, ErrCorrupt
 	}
 
@@ -52,29 +79,15 @@ func Open(b []byte) (*Region, error) {
 		rot:       newRotator(int(h.dimKept), h.rotationSeed),
 		iq:        newInt8Quant(h.i8scale),
 		words:     words,
-		scalars:   make([]float32, n),
-		norms:     make([]float32, n),
-		bits:      make([]uint64, n*words),
+		stride:    stride,
+		codes:     b[off:codesEnd],
 		hasRerank: h.flags&flagHasRerank != 0,
 	}
 	if r.rot.rdim != int(h.rdim) {
 		return nil, ErrCorrupt
 	}
-	cp := b[off:codesEnd]
-	for i := 0; i < n; i++ {
-		row := cp[i*int(h.codeStride):]
-		r.scalars[i] = math.Float32frombits(codec.Uint32(row))
-		r.norms[i] = math.Float32frombits(codec.Uint32(row[4:]))
-		for w := 0; w < words; w++ {
-			r.bits[i*words+w] = codec.Uint64(row[8+w*8:])
-		}
-	}
 	if r.hasRerank {
-		rr := b[codesEnd:rerankEnd]
-		r.rerank = make([]int8, len(rr))
-		for i, c := range rr {
-			r.rerank[i] = int8(c)
-		}
+		r.rerank = bytesToInt8(b[codesEnd:rerankEnd])
 	}
 	lr, err := openLinks(b[rerankEnd:linksEnd], n, int(h.m0))
 	if err != nil {
@@ -82,6 +95,22 @@ func Open(b []byte) (*Region, error) {
 	}
 	r.links = lr
 	return r, nil
+}
+
+// scalar and norm read a document's two per-vector code scalars straight from the
+// mapped codes part. rowBits returns a view over the document's packed sign blocks.
+// All three read on demand so the no-rerank scoring path never copies the codes.
+func (r *Region) scalar(node int32) float32 {
+	return math.Float32frombits(codec.Uint32(r.codes[int(node)*r.stride:]))
+}
+
+func (r *Region) norm(node int32) float32 {
+	return math.Float32frombits(codec.Uint32(r.codes[int(node)*r.stride+4:]))
+}
+
+func (r *Region) rowBits(node int32) []byte {
+	off := int(node)*r.stride + 8
+	return r.codes[off : off+r.words*8]
 }
 
 // Count returns the number of indexed vectors.
@@ -135,14 +164,6 @@ func normI8(v []int8) float64 {
 	return math.Sqrt(s)
 }
 
-func (r *Region) codeBits(node int32) []uint64 {
-	return r.bits[int(node)*r.words : (int(node)+1)*r.words]
-}
-
-func (r *Region) oneBitCode(node int32) oneBitCode {
-	return oneBitCode{scalar: r.scalars[node], norm: r.norms[node], bits: r.codeBits(node)}
-}
-
 // Search runs the HNSW walk to gather candidates, reranks the candidate set,
 // and returns the top-k by dense score. efSearch widens the layer-0 beam for
 // recall; rerankDepth bounds how many candidates get the sharp int8 refine. Pass
@@ -179,7 +200,9 @@ func (r *Region) navDist(qRot []float32, qc queryCode) func(int32) float64 {
 			return -float64(dotI8(qi8, row))
 		}
 	}
-	return func(node int32) float64 { return -r.oneBitCode(node).estimate(qc) }
+	return func(node int32) float64 {
+		return -estimateBytes(r.rowBits(node), r.scalar(node), r.norm(node), qc)
+	}
 }
 
 // walk is the HNSW descent: greedy through the upper layers, then a beam on
@@ -258,7 +281,7 @@ func (r *Region) rerankAndTop(qRot []float32, qc queryCode, cands []cand, k, rer
 		}
 	} else {
 		for i, c := range cands {
-			scored[i] = Result{DocID: uint32(c.id), Score: r.oneBitCode(c.id).estimate(qc)}
+			scored[i] = Result{DocID: uint32(c.id), Score: estimateBytes(r.rowBits(c.id), r.scalar(c.id), r.norm(c.id), qc)}
 		}
 	}
 	sort.Slice(scored, func(i, j int) bool {
@@ -293,7 +316,7 @@ func (r *Region) BruteForce(query []float32, k int) []Result {
 		}
 	} else {
 		for i := 0; i < n; i++ {
-			scored[i] = Result{DocID: uint32(i), Score: r.oneBitCode(int32(i)).estimate(qc)}
+			scored[i] = Result{DocID: uint32(i), Score: estimateBytes(r.rowBits(int32(i)), r.scalar(int32(i)), r.norm(int32(i)), qc)}
 		}
 	}
 	sort.Slice(scored, func(i, j int) bool {

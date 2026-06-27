@@ -1,6 +1,10 @@
 package vector
 
-import "math"
+import (
+	"math"
+
+	"github.com/tamnd/tsumugi/codec"
+)
 
 // oneBitCode is a document's RaBitQ one-bit code: the rotated sign bits packed
 // into uint64 words, plus the two per-vector scalars the asymmetric estimator
@@ -72,6 +76,37 @@ func (c oneBitCode) estimate(q queryCode) float64 {
 		return 0
 	}
 	return float64(c.norm) * dot / float64(c.scalar)
+}
+
+// estimateBytes is estimate read straight from a document's one-bit code in the
+// mapped region, so the no-rerank scoring path never lifts the code onto the heap.
+// rowBits is the words*8-byte sign block of little-endian uint64 words, scalar and
+// norm the two per-vector code scalars. It computes the same asymmetric estimate as
+// oneBitCode.estimate, one word at a time, so the two agree bit for bit.
+func estimateBytes(rowBits []byte, scalar, norm float32, q queryCode) float64 {
+	signed := q.signed
+	rdim := len(signed)
+	invSqrt := 1 / math.Sqrt(float64(rdim))
+	var dot float64
+	for base := 0; base < rdim; base += 64 {
+		word := codec.Uint64(rowBits[(base>>6)*8:])
+		end := base + 64
+		if end > rdim {
+			end = rdim
+		}
+		for i := base; i < end; i++ {
+			if word&(1<<uint(i&63)) != 0 {
+				dot += float64(signed[i])
+			} else {
+				dot -= float64(signed[i])
+			}
+		}
+	}
+	dot *= invSqrt
+	if scalar == 0 {
+		return 0
+	}
+	return float64(norm) * dot / float64(scalar)
 }
 
 // int8Quant maps a rotated vector to int8 codes against a shard-global scale. For
