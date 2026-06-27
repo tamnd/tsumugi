@@ -4,7 +4,27 @@ import (
 	"github.com/tamnd/tsumugi/analyze"
 	"github.com/tamnd/tsumugi/convert"
 	"github.com/tamnd/tsumugi/graph"
+	"github.com/tamnd/tsumugi/mph"
 )
+
+// buildDir builds the collection-wide canonical-URL to node-id directory over the
+// documents. The node id of a document is its position in docs, the global id the
+// build assigns in host+url order, and a canonical URL that several documents share
+// keeps the first occurrence's id. The directory is the minimal perfect hash plus a
+// membership fingerprint, the spec's few-bits-a-key replacement for a plain map, and
+// it resolves a link target to its node id only when the target is a document the
+// collection actually holds.
+func buildDir(docs []convert.Document) *mph.Dir {
+	urls := make([][]byte, 0, len(docs))
+	ids := make([]uint32, 0, len(docs))
+	for i, d := range docs {
+		if cu, ok := analyze.CanonicalURL(d.URL); ok {
+			urls = append(urls, []byte(cu))
+			ids = append(ids, uint32(i))
+		}
+	}
+	return mph.BuildDir(urls, ids, mph.DefaultGamma)
+}
 
 // globalRanks computes collection-wide PageRank over the whole link graph and
 // returns one rank per document, indexed by the document's position in docs.
@@ -36,19 +56,7 @@ func globalRanks(docs []convert.Document) []float64 {
 		return nil
 	}
 
-	// The canonical URL to global node id directory. The build orders documents by
-	// host then url, so when several raw URLs share a canonical form the first
-	// occurrence wins and every link to that page resolves to one node. True
-	// cross-crawl dedup against the doc_id is the canonical-identity milestone; here
-	// the directory only needs to make a link target name a single node.
-	urlToID := make(map[string]int, n)
-	for i, d := range docs {
-		if cu, ok := analyze.CanonicalURL(d.URL); ok {
-			if _, dup := urlToID[cu]; !dup {
-				urlToID[cu] = i
-			}
-		}
-	}
+	dir := buildDir(docs)
 
 	gb := graph.NewBuilder(n)
 	for i, d := range docs {
@@ -57,8 +65,8 @@ func globalRanks(docs []convert.Document) []float64 {
 			// when two raw URLs in the collection share a canonical form and one
 			// links to the other: they are the same page, so the edge is a self
 			// loop and carries no rank.
-			if j, ok := urlToID[tgt]; ok && j != i {
-				gb.AddEdge(i, j)
+			if j, ok := dir.Lookup([]byte(tgt)); ok && int(j) != i {
+				gb.AddEdge(i, int(j))
 			}
 		}
 	}
@@ -78,18 +86,11 @@ func globalRanks(docs []convert.Document) []float64 {
 // intra-shard one. It repeats globalRanks' resolution without the power iteration
 // so a test can record the yield without depending on rank values.
 func globalEdgeCount(docs []convert.Document) int {
-	urlToID := make(map[string]int, len(docs))
-	for i, d := range docs {
-		if cu, ok := analyze.CanonicalURL(d.URL); ok {
-			if _, dup := urlToID[cu]; !dup {
-				urlToID[cu] = i
-			}
-		}
-	}
+	dir := buildDir(docs)
 	var edges int
 	for i, d := range docs {
 		for _, tgt := range analyze.Links(d) {
-			if j, ok := urlToID[tgt]; ok && j != i {
+			if j, ok := dir.Lookup([]byte(tgt)); ok && int(j) != i {
 				edges++
 			}
 		}
