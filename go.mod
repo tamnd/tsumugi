@@ -10,6 +10,7 @@ require (
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/net v0.56.0
 	golang.org/x/sys v0.46.0
+	golang.org/x/text v0.38.0
 )
 
 require (
@@ -42,6 +43,5 @@ require (
 	github.com/twpayne/go-geom v1.6.1 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	golang.org/x/sync v0.21.0 // indirect
-	golang.org/x/text v0.38.0 // indirect
 	google.golang.org/protobuf v1.34.2 // indirect
 )

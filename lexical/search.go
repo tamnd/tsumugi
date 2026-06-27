@@ -7,15 +7,24 @@ import "github.com/tamnd/tsumugi/codec"
 const DefaultK = 1000
 
 // queryTerms analyzes a query string into the distinct terms present in this region,
-// each with its dictionary entry and idf. The idf is the shard-local one unless idfOf
+// each with its dictionary entry and idf. It is the convenience path for a caller that
+// hands a raw string; the broker, which analyzes once and ships the term set to every
+// shard, calls termInfos directly with the pre-analyzed terms so a shard never
+// re-runs the analysis chain.
+func (r *Region) queryTerms(query string, idfOf map[string]float64) []termInfo {
+	return r.termInfos(Analyze(query), idfOf)
+}
+
+// termInfos turns an already-analyzed term set into the per-term dictionary entries
+// and idf this region scores with. The idf is the shard-local one unless idfOf
 // supplies one for the term, the path the broker uses to score every shard against the
 // same collection-wide idf. A term absent from the shard (rejected by the bloom filter
-// or missing from the dictionary) is dropped. Duplicate query terms collapse to one,
-// which keeps a term from being double-counted in the score.
-func (r *Region) queryTerms(query string, idfOf map[string]float64) []termInfo {
+// or missing from the dictionary) is dropped. Duplicate terms collapse to one, which
+// keeps a term from being double-counted in the score.
+func (r *Region) termInfos(terms []string, idfOf map[string]float64) []termInfo {
 	seen := map[string]bool{}
 	var infos []termInfo
-	for _, t := range Analyze(query) {
+	for _, t := range terms {
 		if seen[t] {
 			continue
 		}
@@ -54,7 +63,26 @@ func (r *Region) SearchWithIDF(query string, k int, idfOf map[string]float64) ([
 }
 
 func (r *Region) search(query string, k int, idfOf map[string]float64) ([]Candidate, error) {
-	infos := r.queryTerms(query, idfOf)
+	return r.searchInfos(r.queryTerms(query, idfOf), k)
+}
+
+// SearchTerms is Search over an already-analyzed term set, the path the broker takes
+// after analyzing the query once at the front. It skips the analysis chain entirely,
+// so a shard scores the terms the broker computed rather than re-deriving them, which
+// is the spec's analyze-once-at-broker rule: the chain runs one time per query, not
+// once per shard the fan-out visits.
+func (r *Region) SearchTerms(terms []string, k int) ([]Candidate, error) {
+	return r.searchInfos(r.termInfos(terms, nil), k)
+}
+
+// SearchTermsWithIDF is SearchTerms with the per-term idf supplied from outside, the
+// broker's pushed-down collection-wide idf, so every shard scores a term against the
+// same df and N over the term set the broker already analyzed.
+func (r *Region) SearchTermsWithIDF(terms []string, k int, idfOf map[string]float64) ([]Candidate, error) {
+	return r.searchInfos(r.termInfos(terms, idfOf), k)
+}
+
+func (r *Region) searchInfos(infos []termInfo, k int) ([]Candidate, error) {
 	if len(infos) == 0 {
 		return nil, nil
 	}
@@ -75,9 +103,15 @@ func (r *Region) search(query string, k int, idfOf map[string]float64) ([]Candid
 // of the broker's distributed exact-idf scoring: the broker sums these across the routed
 // shards to learn the collection-wide df for each term without decoding any postings.
 func (r *Region) DocFreqs(query string) map[string]uint32 {
+	return r.DocFreqsTerms(Analyze(query))
+}
+
+// DocFreqsTerms is DocFreqs over an already-analyzed term set, the analyze-once path
+// the broker uses to gather collection-wide df without re-running the chain per shard.
+func (r *Region) DocFreqsTerms(terms []string) map[string]uint32 {
 	seen := map[string]bool{}
 	out := map[string]uint32{}
-	for _, t := range Analyze(query) {
+	for _, t := range terms {
 		if seen[t] {
 			continue
 		}

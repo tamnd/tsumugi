@@ -8,7 +8,6 @@
 package lexical
 
 import (
-	"strings"
 	"unicode"
 	"unicode/utf8"
 )
@@ -26,30 +25,10 @@ const (
 	numFields         = 4
 )
 
-// Analyze turns text into the normalized tokens the dictionary stores. The build
-// and the query run the identical chain so a query term matches a dictionary
-// term byte for byte. The chain is deliberately cheap: lowercase, then split on
-// runs of letters and digits, dropping everything else. Unicode folding and
-// stemming are left for later; what matters for M1 is that both sides agree.
-func Analyze(text string) []string {
-	var out []string
-	var b strings.Builder
-	flush := func() {
-		if b.Len() > 0 {
-			out = append(out, b.String())
-			b.Reset()
-		}
-	}
-	for _, r := range text {
-		if IsTokenRune(r) {
-			b.WriteRune(FoldRune(r))
-		} else {
-			flush()
-		}
-	}
-	flush()
-	return out
-}
+// The analysis chain itself, the package-level Analyze, the configurable Analyzer,
+// and the analyzer_hash, live in analyzer.go. This file holds the two rune-level
+// primitives the chain and the online L2 scanner share, so every reader of the index
+// splits and folds identically.
 
 // IsTokenRune reports whether r belongs to a token: a letter or a digit. Token
 // boundaries are the runs of everything else. The ASCII range is decided inline so

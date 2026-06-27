@@ -94,14 +94,15 @@ func TestGlobalIDFGatherMatchesCombinedCCrawl(t *testing.T) {
 	}
 	checked := 0
 	for _, q := range queries {
-		combinedDF := combined.LexDocFreqs(q)
+		qterms := lexical.Analyze(q)
+		combinedDF := combined.LexDocFreqs(qterms)
 		if len(combinedDF) == 0 {
 			continue
 		}
 		// Gather df over exactly the shards routing selects, the broker's phase one.
 		gathered := map[string]uint32{}
 		for _, si := range routing.Route(search.Query{Text: q}) {
-			for term, df := range shards[si].LexDocFreqs(q) {
+			for term, df := range shards[si].LexDocFreqs(qterms) {
 				gathered[term] += df
 			}
 		}
@@ -150,13 +151,14 @@ func BenchmarkGlobalIDFGather(b *testing.B) {
 	}()
 	routing := search.NewRoutingIndex(ix.RoutingMap(), ix.AlwaysRouted(), len(shards))
 	const q = "best price information"
+	qterms := lexical.Analyze(q)
 	targets := routing.Route(search.Query{Text: q})
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		gathered := map[string]uint32{}
 		for _, si := range targets {
-			for term, df := range shards[si].LexDocFreqs(q) {
+			for term, df := range shards[si].LexDocFreqs(qterms) {
 				gathered[term] += df
 			}
 		}
