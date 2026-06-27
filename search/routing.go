@@ -1,7 +1,5 @@
 package search
 
-import "github.com/tamnd/tsumugi/lexical"
-
 // RoutingIndex maps each lexical term to the shards that hold a posting for it, so
 // the broker can skip the shards that cannot contribute to a query's lexical plane.
 // It is the routing index of the serving design: a query touches only the shards
@@ -56,10 +54,14 @@ func BuildRoutingIndex(shards []*Shard) *RoutingIndex {
 // to the union of the shards holding any of its terms; a query with no lexical terms
 // routes to every shard, since only the lexical vocabulary is indexed for routing.
 func (ri *RoutingIndex) Route(q Query) []int {
-	if q.Text == "" {
-		return ri.all()
-	}
-	terms := lexical.Analyze(q.Text)
+	return ri.RouteTerms(q.lexTerms())
+}
+
+// RouteTerms returns the shard indices an already-analyzed term set should fan out to,
+// the analyze-once path: a lexical query routes to the union of the shards holding any
+// of its terms, an empty set routes everywhere. It is the routing the broker calls
+// after analyzing the query once at the front.
+func (ri *RoutingIndex) RouteTerms(terms []string) []int {
 	if len(terms) == 0 {
 		return ri.all()
 	}

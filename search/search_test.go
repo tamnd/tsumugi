@@ -259,3 +259,78 @@ func TestRoutingPrunesShards(t *testing.T) {
 		t.Fatalf("route missing = %v, want none", got)
 	}
 }
+
+// TestAnalyzeOnceEquivalence is the M16b analyze-once gate: a query whose terms the
+// broker pre-analyzed and shipped in Query.Terms produces the same fleet-wide top-k,
+// bit for bit, as the same query carried as raw Text the shards each analyze. The
+// pre-analyzed path is the one the broker takes in production so the analysis chain runs
+// one time per query rather than once per shard; this proves taking it changes nothing
+// the caller can observe. The Terms set is exactly what lexical.Analyze produces from
+// the text, the same equality the broker relies on when it fills Terms itself.
+func TestAnalyzeOnceEquivalence(t *testing.T) {
+	const n, parts = 160, 4
+	docs := makeCorpus(n)
+	dir := t.TempDir()
+	model := trainModel(t)
+
+	size := n / parts
+	shards := make([]*Shard, parts)
+	for p := 0; p < parts; p++ {
+		path := filepath.Join(dir, fmt.Sprintf("shard%d.tsumugi", p))
+		lo := p * size
+		buildShardFile(t, path, docs, lo, lo+size, uint32(lo), false)
+		sh, err := OpenShard(path, newTestCascade(model))
+		if err != nil {
+			t.Fatalf("open shard %d: %v", p, err)
+		}
+		shards[p] = sh
+	}
+	b := NewBroker(shards, newTestCascade(model))
+	defer func() { _ = b.Close() }()
+
+	const text = "common document"
+	fromText := b.Search(context.Background(), Query{Text: text, K: 20})
+	fromTerms := b.Search(context.Background(), Query{Text: text, Terms: lexical.Analyze(text), K: 20})
+
+	if len(fromText) != len(fromTerms) {
+		t.Fatalf("text path returned %d hits, pre-analyzed %d", len(fromText), len(fromTerms))
+	}
+	for i := range fromText {
+		if fromText[i].DocID != fromTerms[i].DocID {
+			t.Fatalf("rank %d: text doc %d, pre-analyzed doc %d", i, fromText[i].DocID, fromTerms[i].DocID)
+		}
+		if math.Float64bits(fromText[i].Score) != math.Float64bits(fromTerms[i].Score) {
+			t.Fatalf("rank %d doc %d: text score %v, pre-analyzed %v", i, fromText[i].DocID, fromText[i].Score, fromTerms[i].Score)
+		}
+	}
+}
+
+// TestAnalyzeOnceSingleShard pins the same equivalence on the standalone single-shard
+// path, where the pre-analyzed Terms set must produce the same ranking as the raw text
+// the shard analyzes itself.
+func TestAnalyzeOnceSingleShard(t *testing.T) {
+	docs := makeCorpus(120)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "one.tsumugi")
+	buildShardFile(t, path, docs, 0, 120, 0, true)
+
+	model := trainModel(t)
+	s, err := OpenShard(path, newTestCascade(model))
+	if err != nil {
+		t.Fatalf("open shard: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	const text = "common document"
+	fromText := s.Search(Query{Text: text, Vector: docs[3].vec, K: 10})
+	fromTerms := s.Search(Query{Text: text, Terms: lexical.Analyze(text), Vector: docs[3].vec, K: 10})
+
+	if len(fromText) != len(fromTerms) {
+		t.Fatalf("text path %d hits, pre-analyzed %d", len(fromText), len(fromTerms))
+	}
+	for i := range fromText {
+		if fromText[i].DocID != fromTerms[i].DocID || math.Float64bits(fromText[i].Score) != math.Float64bits(fromTerms[i].Score) {
+			t.Fatalf("rank %d differs: text %v, pre-analyzed %v", i, fromText[i], fromTerms[i])
+		}
+	}
+}

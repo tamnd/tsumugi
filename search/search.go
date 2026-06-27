@@ -17,6 +17,8 @@
 // recall-complete candidate set the broker reproduces the monolith's top-k exactly.
 package search
 
+import "github.com/tamnd/tsumugi/lexical"
+
 // Query is one search request across the planes a shard carries. Text drives the
 // lexical plane, Sparse the learned-sparse plane as a term-to-weight map, Vector the
 // dense plane, and K is the number of results wanted. A plane is skipped when its
@@ -28,11 +30,32 @@ type Query struct {
 	Vector []float32
 	K      int
 
+	// Terms, when set, is the analyzed lexical term set the broker computed once at the
+	// front, in query order. A shard with Terms set scores those terms directly instead
+	// of re-running the analysis chain over Text, the spec's analyze-once-at-broker rule:
+	// the chain runs one time per query, not once per shard the fan-out visits. It is nil
+	// on the raw-string path, where each shard analyzes Text itself, and the two paths
+	// produce identical results when Terms is the analysis of Text.
+	Terms []string
+
 	// TermIDF, when set, overrides the lexical idf of each query term with a value
 	// computed from outside the shard, the collection-wide idf the broker pushes down
 	// so every shard scores a term against the same df and N. It is nil on the
 	// single-shard path, where the shard's local idf is already the collection idf.
 	TermIDF map[string]float64
+}
+
+// lexTerms returns the analyzed lexical term set for the query: the broker's
+// pre-analyzed Terms when set, otherwise the analysis of Text, so a caller that did
+// not pre-analyze still gets the right terms. It is the one place the two paths join.
+func (q Query) lexTerms() []string {
+	if q.Terms != nil {
+		return q.Terms
+	}
+	if q.Text == "" {
+		return nil
+	}
+	return lexical.Analyze(q.Text)
 }
 
 // Hit is one ranked result: the global document id and its final model score. The

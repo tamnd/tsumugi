@@ -148,7 +148,7 @@ func (s *Shard) retrieve(q Query) (lex, dense []scored, feats map[uint32][]float
 	if k < s.l0 {
 		k = s.l0
 	}
-	if s.lex != nil && q.Text != "" {
+	if s.lex != nil && len(q.lexTerms()) > 0 {
 		cands, err := s.lexSearch(q, k)
 		if err == nil {
 			for _, c := range cands {
@@ -178,23 +178,26 @@ func (s *Shard) retrieve(q Query) (lex, dense []scored, feats map[uint32][]float
 	return lex, dense, feats
 }
 
-// lexSearch runs the lexical plane, scoring with the broker's pushed-down
-// collection-wide idf when the query carries one and the shard's local idf otherwise.
+// lexSearch runs the lexical plane over the query's analyzed term set, scoring with
+// the broker's pushed-down collection-wide idf when the query carries one and the
+// shard's local idf otherwise. The term set is the broker's pre-analyzed Terms when
+// present, so the shard does not re-run the analysis chain on the fan-out path.
 func (s *Shard) lexSearch(q Query, k int) ([]lexical.Candidate, error) {
+	terms := q.lexTerms()
 	if q.TermIDF != nil {
-		return s.lex.SearchWithIDF(q.Text, k, q.TermIDF)
+		return s.lex.SearchTermsWithIDF(terms, k, q.TermIDF)
 	}
-	return s.lex.Search(q.Text, k)
+	return s.lex.SearchTerms(terms, k)
 }
 
 // LexDocFreqs returns the local document frequency of each query term this shard's
 // lexical region holds, the first phase of the broker's distributed exact-idf scoring.
 // A shard with no lexical region contributes nothing.
-func (s *Shard) LexDocFreqs(text string) map[string]uint32 {
+func (s *Shard) LexDocFreqs(terms []string) map[string]uint32 {
 	if s.lex == nil {
 		return nil
 	}
-	return s.lex.DocFreqs(text)
+	return s.lex.DocFreqsTerms(terms)
 }
 
 // Search runs the full cascade over this one shard and returns the model-ranked
@@ -226,8 +229,8 @@ func (s *Shard) Search(q Query) []Hit {
 // override; a nil map falls back to the shard-local idf when the lexical region can
 // supply it. avgBody is the average body length BM25 normalizes by.
 func (s *Shard) newOnline(q Query, idfOf map[string]float64, avgBody float64) *onlineExtractor {
-	if idfOf == nil && q.Text != "" && s.lex != nil {
-		idfOf = s.localIDF(q.Text)
+	if idfOf == nil && s.lex != nil {
+		idfOf = s.localIDF(q.lexTerms())
 	}
 	return newOnlineExtractor(q, s.fwd, s.vec, idfOf, avgBody)
 }
@@ -247,11 +250,11 @@ func (s *Shard) l2Row(base []float64, ext *onlineExtractor, localID uint32) []fl
 // localIDF computes the shard-local idf of each query term from this shard's own
 // document count and the term's local document frequency, the idf the single-shard
 // path scores with when no collection-wide idf is pushed down.
-func (s *Shard) localIDF(text string) map[string]float64 {
-	if s.lex == nil {
+func (s *Shard) localIDF(terms []string) map[string]float64 {
+	if s.lex == nil || len(terms) == 0 {
 		return nil
 	}
-	df := s.lex.DocFreqs(text)
+	df := s.lex.DocFreqsTerms(terms)
 	if len(df) == 0 {
 		return nil
 	}

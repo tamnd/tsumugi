@@ -1,0 +1,377 @@
+// Package query is the query-understanding front of tsumugi: it turns a raw query
+// string into the ParsedQuery the retrieval planes consume. Everything that happens
+// to a query between the search box and the Block-Max Pruning walk lives here, the
+// short cheap pipeline doc 10 specifies: parse the operators, run the shared analysis
+// chain, and assemble the parsed query with its normalized cache key.
+//
+// The work is done once, at the broker, and the result is shipped to the shards, so a
+// shard never re-analyzes the query string. That is the spec's analyze-once rule: the
+// analysis chain runs one time per query, not once per shard the fan-out visits, so
+// its cost is paid one time even when a query touches fifty shards.
+package query
+
+import (
+	"sort"
+	"strings"
+)
+
+// Analyzer is the analysis chain the parser runs over each piece's text. The build
+// and the query share one analyzer so a query term matches a dictionary term byte for
+// byte; lexical.Analyzer satisfies this interface. Keeping it an interface lets the
+// parser be tested without the index and keeps the package free of a build dependency.
+type Analyzer interface {
+	Analyze(text string) []string
+}
+
+// Semantics is the global match mode: soft-OR scoring by default, or hard-AND opt-in.
+type Semantics uint8
+
+const (
+	// SoftOR scores documents that match any term, the default web-search semantics.
+	SoftOR Semantics = iota
+	// HardAND requires every free term, the opt-in strict mode.
+	HardAND
+)
+
+// AnyField is the Field value for a term with no field scope: it may occur in any field.
+const AnyField int8 = -1
+
+// fieldIDs maps the field operators a user can type to the field ids the index uses,
+// the same ids lexical.Field assigns (title 0, body 1, url 2, anchor 3). A field:
+// prefix naming anything not here is treated as free text, the forgiving-parser rule.
+var fieldIDs = map[string]int8{
+	"title":  0,
+	"body":   1,
+	"url":    2,
+	"anchor": 3,
+}
+
+// QueryTerm is one analyzed, dictionary-comparable token with the retrieval metadata
+// doc 04's traversal multiplies and matches against: a query-side weight, a field
+// scope (AnyField for unscoped), and optional expansion alternatives.
+type QueryTerm struct {
+	Term   string
+	Weight float32
+	Field  int8
+	Alts   []string
+}
+
+// Phrase is a quoted span: an ordered sequence of analyzed terms that must appear
+// adjacent and in order, with Slop zero for a strict phrase and greater than zero for
+// a proximity window.
+type Phrase struct {
+	Terms []string
+	Slop  int
+}
+
+// FilterKind is the stored field a filter narrows against.
+type FilterKind uint8
+
+const (
+	// FilterHost narrows to documents on a host or domain, the site: operator.
+	FilterHost FilterKind = iota
+)
+
+// Filter narrows the candidate set against a stored field without contributing score.
+type Filter struct {
+	Kind  FilterKind
+	Value string
+}
+
+// ParsedQuery is the output of query understanding and the single thing handed to L0
+// retrieval. Every field is the product of a step in the pipeline: Terms from analysis,
+// Required and Excluded and Phrases and Filters from parsing, Lang from detection,
+// Mode from the query or the default, and NormKey from normalization for the cache.
+// DenseVec is the optional dense-plane input, nil when the dense plane is off.
+type ParsedQuery struct {
+	Terms    []QueryTerm
+	Required []QueryTerm
+	Excluded []QueryTerm
+	Phrases  []Phrase
+	Filters  []Filter
+
+	DenseVec []byte
+
+	Lang    string
+	Mode    Semantics
+	NormKey string
+}
+
+// piece is one raw fragment the operator scan produces, before the analysis chain runs
+// over its text. The kind records the operator the scan recognized; the text is still
+// raw, because operators are recognized on the raw string but the term content inside
+// them must still go through the analysis chain.
+type piece struct {
+	kind  pieceKind
+	field int8
+	text  string
+}
+
+type pieceKind uint8
+
+const (
+	pieceFree pieceKind = iota
+	pieceRequired
+	pieceExcluded
+	pieceFieldScoped
+	pieceFilterHost
+	piecePhrase
+)
+
+// scan walks the raw string left to right and splits it into operator pieces, the
+// parse step doc 10 pins. It recognizes a quoted span as a phrase, a +token as
+// required, a -token as excluded, site:value as a host filter, and field:value as a
+// field scope, and everything else as free text. The scan is deliberately forgiving:
+// an unclosed quote treats the rest as a phrase, an unknown field falls back to free
+// text, and a lone + or - with no term attached is dropped, because a search box
+// should answer a slightly-wrong query rather than error on it.
+func scan(raw string) []piece {
+	var pieces []piece
+	i := 0
+	n := len(raw)
+	for i < n {
+		// Skip the whitespace between tokens.
+		for i < n && isSpace(raw[i]) {
+			i++
+		}
+		if i >= n {
+			break
+		}
+		if raw[i] == '"' {
+			// A quote opens a phrase; read to the closing quote, or to the end if the
+			// quote is never closed, the forgiving unclosed-quote rule.
+			i++
+			start := i
+			for i < n && raw[i] != '"' {
+				i++
+			}
+			span := raw[start:i]
+			if i < n {
+				i++ // consume the closing quote
+			}
+			if strings.TrimSpace(span) != "" {
+				pieces = append(pieces, piece{kind: piecePhrase, field: AnyField, text: span})
+			}
+			continue
+		}
+		// An ordinary token runs to the next whitespace.
+		start := i
+		for i < n && !isSpace(raw[i]) {
+			i++
+		}
+		pieces = append(pieces, classify(raw[start:i]))
+	}
+	return pieces
+}
+
+// classify turns one whitespace-delimited token into its piece, recognizing the +/-
+// prefixes and the site:/field: operators and falling back to free text otherwise.
+func classify(tok string) piece {
+	switch tok[0] {
+	case '+':
+		rest := tok[1:]
+		if rest == "" {
+			return piece{kind: pieceFree, field: AnyField, text: ""} // a lone +, dropped downstream
+		}
+		return scopedOr(rest, pieceRequired)
+	case '-':
+		rest := tok[1:]
+		if rest == "" {
+			return piece{kind: pieceFree, field: AnyField, text: ""}
+		}
+		return scopedOr(rest, pieceExcluded)
+	}
+	return scopedOr(tok, pieceFree)
+}
+
+// scopedOr recognizes the colon operators in a token. site:value becomes a host
+// filter, a known field:value becomes a field scope that keeps the base +/- intent and
+// carries the field id, so a plain field:x scores in that field, a +field:x is a
+// field-scoped must, and a -field:x a field-scoped exclusion; anything else (no colon,
+// or an unknown field) is the base kind over the whole token, the forgiving fallback.
+func scopedOr(tok string, base pieceKind) piece {
+	colon := strings.IndexByte(tok, ':')
+	if colon <= 0 || colon == len(tok)-1 {
+		return piece{kind: base, field: AnyField, text: tok}
+	}
+	key := strings.ToLower(tok[:colon])
+	val := tok[colon+1:]
+	if key == "site" {
+		return piece{kind: pieceFilterHost, field: AnyField, text: val}
+	}
+	if fid, ok := fieldIDs[key]; ok {
+		// A free field scope gets its own kind so it lands in Terms with the field set; a
+		// required or excluded field scope stays required or excluded and carries the field.
+		k := base
+		if base == pieceFree {
+			k = pieceFieldScoped
+		}
+		return piece{kind: k, field: fid, text: val}
+	}
+	// An unknown field is not an operator; treat the whole token as free text.
+	return piece{kind: base, field: AnyField, text: tok}
+}
+
+// Parse parses a raw query string and runs the analysis chain over the text inside
+// each operator, producing the ParsedQuery the retrieval planes consume. Parsing
+// before analysis is what preserves the operator structure: analyzing first would
+// split a quoted phrase into free terms and lose it, and would not know which terms
+// were required. The mode is the caller's default semantics, soft-OR for web search.
+func Parse(raw string, a Analyzer, mode Semantics) *ParsedQuery {
+	pq := &ParsedQuery{Mode: mode}
+	for _, p := range scan(raw) {
+		switch p.kind {
+		case pieceFree:
+			for _, t := range a.Analyze(p.text) {
+				pq.Terms = append(pq.Terms, QueryTerm{Term: t, Weight: 1, Field: p.field})
+			}
+		case pieceRequired:
+			for _, t := range a.Analyze(p.text) {
+				pq.Required = append(pq.Required, QueryTerm{Term: t, Weight: 1, Field: p.field})
+			}
+		case pieceExcluded:
+			for _, t := range a.Analyze(p.text) {
+				pq.Excluded = append(pq.Excluded, QueryTerm{Term: t, Weight: 1, Field: p.field})
+			}
+		case pieceFieldScoped:
+			for _, t := range a.Analyze(p.text) {
+				pq.Terms = append(pq.Terms, QueryTerm{Term: t, Weight: 1, Field: p.field})
+			}
+		case pieceFilterHost:
+			if v := canonHost(p.text); v != "" {
+				pq.Filters = append(pq.Filters, Filter{Kind: FilterHost, Value: v})
+			}
+		case piecePhrase:
+			terms := a.Analyze(p.text)
+			if len(terms) > 0 {
+				pq.Phrases = append(pq.Phrases, Phrase{Terms: terms, Slop: 0})
+			}
+		}
+	}
+	pq.NormKey = pq.normKey()
+	return pq
+}
+
+// LexicalTerms returns the plain term strings the lexical plane retrieves on: the
+// soft-OR free terms followed by the required terms, deduplicated in first-seen order.
+// Excluded terms are not retrieved on; they filter the candidate set. This is the term
+// set the broker analyzes once and ships to the shards.
+func (pq *ParsedQuery) LexicalTerms() []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(qt QueryTerm) {
+		if qt.Term == "" || seen[qt.Term] {
+			return
+		}
+		seen[qt.Term] = true
+		out = append(out, qt.Term)
+	}
+	for _, t := range pq.Terms {
+		add(t)
+	}
+	for _, t := range pq.Required {
+		add(t)
+	}
+	return out
+}
+
+// Empty reports whether the query carries nothing to retrieve on: no lexical terms and
+// no phrases. The broker short-circuits an empty query to an empty result rather than
+// routing it, the spec's empty-query behavior.
+func (pq *ParsedQuery) Empty() bool {
+	return len(pq.Terms) == 0 && len(pq.Required) == 0 && len(pq.Phrases) == 0
+}
+
+// normKey builds the canonical, order-stable cache key doc 10 pins: it captures
+// everything that changes the result and nothing that does not, so two raw queries
+// differing only in casing, spacing, or unordered term order collide on one entry and
+// two different queries never do. The free term set is sorted because soft-OR is
+// order-independent; phrases keep their order because a phrase is ordered; filters and
+// excluded terms are sorted; the mode is included because it changes the result.
+func (pq *ParsedQuery) normKey() string {
+	var b strings.Builder
+	terms := termStrings(pq.Terms)
+	sort.Strings(terms)
+	b.WriteString("t:")
+	b.WriteString(strings.Join(terms, ","))
+	req := termStrings(pq.Required)
+	sort.Strings(req)
+	b.WriteString(";+:")
+	b.WriteString(strings.Join(req, ","))
+	exc := termStrings(pq.Excluded)
+	sort.Strings(exc)
+	b.WriteString(";-:")
+	b.WriteString(strings.Join(exc, ","))
+	b.WriteString(";ph:")
+	for i, ph := range pq.Phrases {
+		if i > 0 {
+			b.WriteByte('|')
+		}
+		b.WriteString(strings.Join(ph.Terms, " "))
+	}
+	filters := make([]string, len(pq.Filters))
+	for i, f := range pq.Filters {
+		filters[i] = filterKey(f)
+	}
+	sort.Strings(filters)
+	b.WriteString(";f:")
+	b.WriteString(strings.Join(filters, ","))
+	b.WriteString(";m:")
+	if pq.Mode == HardAND {
+		b.WriteString("and")
+	} else {
+		b.WriteString("or")
+	}
+	b.WriteString(";d:")
+	if pq.DenseVec != nil {
+		b.WriteString("1")
+	} else {
+		b.WriteString("0")
+	}
+	return b.String()
+}
+
+// termStrings projects the term strings out of a query-term slice. A field-scoped term
+// carries its field into the key so title:rust and a plain rust do not collide.
+func termStrings(ts []QueryTerm) []string {
+	out := make([]string, len(ts))
+	for i, t := range ts {
+		if t.Field != AnyField {
+			out[i] = fieldName(t.Field) + ":" + t.Term
+		} else {
+			out[i] = t.Term
+		}
+	}
+	return out
+}
+
+func filterKey(f Filter) string {
+	if f.Kind == FilterHost {
+		return "site:" + f.Value
+	}
+	return f.Value
+}
+
+func fieldName(id int8) string {
+	for name, fid := range fieldIDs {
+		if fid == id {
+			return name
+		}
+	}
+	return "?"
+}
+
+// canonHost lowercases a host filter value and strips a leading scheme or www. so
+// site:Example.com and site:www.example.com narrow to the same host.
+func canonHost(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	v = strings.TrimPrefix(v, "http://")
+	v = strings.TrimPrefix(v, "https://")
+	v = strings.TrimPrefix(v, "www.")
+	v = strings.TrimSuffix(v, "/")
+	return v
+}
+
+func isSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}

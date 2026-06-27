@@ -92,14 +92,21 @@ type shardResult struct {
 // semaphore; the context cancels it on deadline so a slow shard cannot hold the
 // whole query past its budget.
 func (b *Broker) Search(ctx context.Context, q Query) []Hit {
-	targets := b.routing.Route(q)
+	// Analyze the query once at the broker and ship the term set to every shard, so the
+	// analysis chain runs one time per query rather than once per shard the fan-out
+	// visits. The shards score q.Terms directly; routing and the idf gather read the
+	// same set. A query that already carries Terms (a pre-parsed ParsedQuery) keeps them.
+	if q.Terms == nil {
+		q.Terms = q.lexTerms()
+	}
+	targets := b.routing.RouteTerms(q.Terms)
 	// Phase one of distributed exact idf: gather each query term's df across the routed
 	// shards and turn it into one collection-wide idf the fan-out scores every shard
 	// against. Without this each shard would use its local idf, and the merge would
 	// favor whichever shard happens to hold a globally rare term densely. A query that
 	// already carries idf overrides, or has no lexical text, skips the gather.
-	if q.Text != "" && q.TermIDF == nil {
-		q.TermIDF = b.globalIDF(ctx, q.Text, targets)
+	if len(q.Terms) > 0 && q.TermIDF == nil {
+		q.TermIDF = b.globalIDF(ctx, q.Terms, targets)
 	}
 	results := b.fanOut(ctx, q, targets)
 
@@ -199,7 +206,7 @@ func (b *Broker) fanOut(ctx context.Context, q Query, targets []int) []*shardRes
 // it precedes; it runs concurrently under the broker's concurrency bound and a cancelled
 // context returns whatever has been gathered, which only loosens an idf, never corrupts a
 // score. An empty result lets the fan-out fall back to shard-local idf.
-func (b *Broker) globalIDF(ctx context.Context, text string, targets []int) map[string]float64 {
+func (b *Broker) globalIDF(ctx context.Context, terms []string, targets []int) map[string]float64 {
 	df := make(map[string]uint32)
 	var mu sync.Mutex
 	sem := make(chan struct{}, b.maxConcurrency)
@@ -215,7 +222,7 @@ func (b *Broker) globalIDF(ctx context.Context, text string, targets []int) map[
 		go func(si int) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			local := b.shards[si].LexDocFreqs(text)
+			local := b.shards[si].LexDocFreqs(terms)
 			if len(local) == 0 {
 				return
 			}

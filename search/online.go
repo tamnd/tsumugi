@@ -121,7 +121,7 @@ const maxBodyScanRunes = 10000
 // whose text features are all zero, which is the right answer for a pure-vector
 // query: it has no terms to cover or locate.
 func newOnlineExtractor(q Query, fwd *forward.Region, vec *vector.Region, idfOf map[string]float64, avgBody float64) *onlineExtractor {
-	ordered := lexical.Analyze(q.Text)
+	ordered := q.lexTerms()
 	seen := make(map[string]bool, len(ordered))
 	var terms []string
 	for _, t := range ordered {
