@@ -44,7 +44,7 @@ func TestRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 
 	if r.Header.DocCount != 42 {
 		t.Errorf("DocCount = %d, want 42", r.Header.DocCount)
@@ -105,7 +105,7 @@ func TestOpenBytesMatchesOpen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenBytes: %v", err)
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 	if r.Header.DocCount != 42 {
 		t.Errorf("DocCount = %d", r.Header.DocCount)
 	}

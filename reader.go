@@ -32,7 +32,7 @@ func Open(path string) (*Reader, error) {
 	}
 	r := &Reader{data: mm.data, mm: mm, validated: map[RegionKind]bool{}}
 	if err := r.parse(); err != nil {
-		mm.Close()
+		_ = mm.Close()
 		return nil, err
 	}
 	return r, nil

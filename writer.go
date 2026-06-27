@@ -145,7 +145,7 @@ func (w *Writer) Close() error {
 	}
 	w.closed = true
 	if w.enc != nil {
-		w.enc.Close()
+		_ = w.enc.Close()
 	}
 
 	footer := Footer{Schema: w.schema, Regions: w.regions, Stats: w.stats}

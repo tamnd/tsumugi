@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"fmt"
 	"sort"
 	"text/tabwriter"
@@ -19,47 +20,53 @@ func newInspectCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			defer r.Close()
-			return printInspect(cmd, r, args[0])
+			defer func() { _ = r.Close() }()
+			out := formatInspect(r, args[0])
+			_, err = cmd.OutOrStdout().Write(out)
+			return err
 		},
 	}
 }
 
-func printInspect(cmd *cobra.Command, r *tsumugi.Reader, path string) error {
+// formatInspect renders a shard report into a buffer so the command does one
+// checked write to stdout.
+func formatInspect(r *tsumugi.Reader, path string) []byte {
 	h := r.Header
-	out := cmd.OutOrStdout()
-	fmt.Fprintf(out, "file:     %s\n", path)
-	fmt.Fprintf(out, "version:  %d.%d\n", h.VersionMajor, h.VersionMinor)
-	fmt.Fprintf(out, "docs:     %d\n", h.DocCount)
-	fmt.Fprintf(out, "flags:    %s\n", flagString(h.Flags))
+	var b bytes.Buffer
+	fmt.Fprintf(&b, "file:     %s\n", path)
+	fmt.Fprintf(&b, "version:  %d.%d\n", h.VersionMajor, h.VersionMinor)
+	fmt.Fprintf(&b, "docs:     %d\n", h.DocCount)
+	fmt.Fprintf(&b, "flags:    %s\n", flagString(h.Flags))
 	if h.NodeBase != 0 {
-		fmt.Fprintf(out, "node_base:%d\n", h.NodeBase)
+		fmt.Fprintf(&b, "node_base:%d\n", h.NodeBase)
 	}
 
-	fmt.Fprintln(out, "regions:")
-	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "  kind\tcodec\ton-disk\traw\tratio")
+	fmt.Fprintln(&b, "regions:")
+	// tabwriter writes into the bytes.Buffer and so never fails; ignore the
+	// io.Writer errors it surfaces.
+	tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
+	_, _ = fmt.Fprintln(tw, "  kind\tcodec\ton-disk\traw\tratio")
 	for _, d := range r.Footer.Regions {
 		ratio := 1.0
 		if d.RawLength > 0 {
 			ratio = float64(d.Length) / float64(d.RawLength)
 		}
-		fmt.Fprintf(tw, "  %s\t%s\t%d\t%d\t%.2fx\n", d.Kind, d.Codec, d.Length, d.RawLength, ratio)
+		_, _ = fmt.Fprintf(tw, "  %s\t%s\t%d\t%d\t%.2fx\n", d.Kind, d.Codec, d.Length, d.RawLength, ratio)
 	}
-	tw.Flush()
+	_ = tw.Flush()
 
 	if len(r.Footer.Stats) > 0 {
-		fmt.Fprintln(out, "stats:")
+		fmt.Fprintln(&b, "stats:")
 		keys := make([]string, 0, len(r.Footer.Stats))
 		for k := range r.Footer.Stats {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			fmt.Fprintf(out, "  %-14s %g\n", k, r.Footer.Stats[k])
+			fmt.Fprintf(&b, "  %-14s %g\n", k, r.Footer.Stats[k])
 		}
 	}
-	return nil
+	return b.Bytes()
 }
 
 func flagString(flags uint64) string {

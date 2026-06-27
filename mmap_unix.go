@@ -23,17 +23,17 @@ func mmapOpen(path string) (*mmap, error) {
 	}
 	fi, err := f.Stat()
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, err
 	}
 	size := fi.Size()
 	if size == 0 {
-		f.Close()
+		_ = f.Close()
 		return nil, ErrShortFile
 	}
 	data, err := unix.Mmap(int(f.Fd()), 0, int(size), unix.PROT_READ, unix.MAP_SHARED)
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, err
 	}
 	// Hint sequential-ish random access; ignore the error, it is advisory.
