@@ -57,6 +57,17 @@ func AppendUint32(b []byte, x uint32) []byte {
 	return binary.LittleEndian.AppendUint32(b, x)
 }
 
+// AppendUint16 appends x in little-endian to b.
+func AppendUint16(b []byte, x uint16) []byte {
+	return binary.LittleEndian.AppendUint16(b, x)
+}
+
+// PutUint16 writes x in little-endian into the front of b.
+func PutUint16(b []byte, x uint16) { binary.LittleEndian.PutUint16(b, x) }
+
+// Uint16 reads a little-endian uint16 from the front of b.
+func Uint16(b []byte) uint16 { return binary.LittleEndian.Uint16(b) }
+
 // PutUint32 writes x in little-endian into the front of b.
 func PutUint32(b []byte, x uint32) { binary.LittleEndian.PutUint32(b, x) }
 
