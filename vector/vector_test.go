@@ -3,8 +3,11 @@ package vector
 import (
 	"math"
 	"math/rand"
+	"runtime"
 	"sort"
 	"testing"
+
+	"github.com/tamnd/tsumugi/codec"
 )
 
 // clusteredCorpus draws n unit vectors of the given dimension grouped into
@@ -303,4 +306,85 @@ func TestEmptyAndCorrupt(t *testing.T) {
 	if _, err := Open(good[:headerLen+8]); err == nil {
 		t.Fatal("truncated region accepted")
 	}
+}
+
+// TestEstimateBytesMatchesCode pins the no-rerank scoring path's byte reader against
+// the build-side estimator. estimateBytes reads a one-bit code straight from the
+// region bytes the mmap holds; oneBitCode.estimate reads the same code lifted onto
+// the heap. The two must return the identical value, so the zero-copy reader scores
+// exactly as the copying reader did and the mmap change is invisible to recall.
+func TestEstimateBytesMatchesCode(t *testing.T) {
+	const dim = 128
+	rng := rand.New(rand.NewSource(7))
+	rot := newRotator(dim, 12345)
+	for trial := 0; trial < 300; trial++ {
+		oRot := rot.rotate(randVec(rng, dim))
+		code := encodeOneBit(oRot)
+		q := encodeQuery(rot.rotate(randVec(rng, dim)))
+
+		rowBits := make([]byte, 0, len(code.bits)*8)
+		for _, word := range code.bits {
+			rowBits = codec.AppendUint64(rowBits, word)
+		}
+
+		want := code.estimate(q)
+		got := estimateBytes(rowBits, code.scalar, code.norm, q)
+		if math.Abs(want-got) > 1e-12 {
+			t.Fatalf("trial %d: estimateBytes = %v, want %v", trial, got, want)
+		}
+	}
+}
+
+// TestOpenIsZeroCopy is the M17 memory gate. The old reader copied every code,
+// scalar, norm, int8 row, and link byte onto the Go heap at Open, so a region of
+// size S grew the heap by roughly S. The mmap reader keeps views over the region
+// bytes instead, so Open must grow the heap by far less than the region size: only
+// the small Region struct and the upper-layer link directory, never a second copy
+// of the codes and the int8 rerank that are the bulk of the region. At 100k shards
+// this is the difference between the codes being resident and being OS-paged.
+func TestOpenIsZeroCopy(t *testing.T) {
+	const dim, n = 128, 4000
+	corpus := clusteredCorpus(n, dim, 40, 3)
+	// The zero-copy property is about the region's bytes, not the graph quality, so a
+	// cheap low-degree, low-ef build keeps the test fast under the race detector while
+	// the codes and int8 rerank are full size and a copy would still be plain to see.
+	b := NewBuilder(dim).WithHNSW(8, 16, 16)
+	for _, v := range corpus {
+		b.Add(v)
+	}
+	region := b.Build()
+	regionSize := len(region)
+
+	// Baseline heap with the region bytes already allocated (in production these are
+	// the mmap, not the heap), so the measurement isolates what Open itself adds.
+	var m0, m1 runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&m0)
+
+	r, err := Open(region)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	runtime.GC()
+	runtime.ReadMemStats(&m1)
+	grew := int64(m1.HeapAlloc) - int64(m0.HeapAlloc)
+
+	// The codes and int8 rerank are the bulk of the region; a copying reader would
+	// add roughly the whole region again. The view reader must stay well under that.
+	// A generous bound of an eighth of the region size proves no full second copy.
+	bound := int64(regionSize) / 8
+	if grew > bound {
+		t.Fatalf("Open grew heap by %d bytes over a %d-byte region (bound %d); the codes look copied, not viewed",
+			grew, regionSize, bound)
+	}
+	t.Logf("region %d bytes, Open grew heap by %d bytes (%.1f%% of region)",
+		regionSize, grew, 100*float64(grew)/float64(regionSize))
+
+	// The views must stay valid for the region's lifetime, so a search still works.
+	got := r.Search(corpus[0], 10, 128, 100)
+	if len(got) == 0 {
+		t.Fatal("search over the view reader returned nothing")
+	}
+	runtime.KeepAlive(region)
 }
