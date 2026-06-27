@@ -125,7 +125,7 @@ func ccrawlSpimiDocs(t testing.TB, limit int) []spimiDoc {
 	if err != nil {
 		t.Skipf("ccrawl export not available: %v", err)
 	}
-	defer src.Close()
+	defer func() { _ = src.Close() }()
 	var docs []spimiDoc
 	for len(docs) < limit {
 		d, ok, err := src.Next()
