@@ -306,3 +306,75 @@ func TestStreamPageRankMatchesCollectionInCore(t *testing.T) {
 	}
 	t.Logf("docs=%d streamPageRank maxDiff=%g sum=%g", len(docs), maxDiff, sum)
 }
+
+// TestCollectionOrderOnCCrawl is the real-data gate for the node reordering: the
+// order computed over the actual ccrawl link graph must be a bijection over every
+// document (none dropped or duplicated when the build relabels by it) and must
+// leave PageRank invariant, since rank is a property of the graph and not its
+// labeling. That invariance is what lets the build use the order as the dense
+// docID assignment without disturbing the signals baked against those ids. The
+// real graph is too flat (a breadth-first crawl resolves almost no edges) to
+// exercise the compression win, which the synthetic graph package gate covers;
+// this gates correctness on real data.
+func TestCollectionOrderOnCCrawl(t *testing.T) {
+	if _, err := os.Stat(ccrawlGraphParquet); err != nil {
+		t.Skipf("ccrawl parquet not present: %v", err)
+	}
+	src, err := convert.OpenSource(ccrawlGraphParquet)
+	if err != nil {
+		t.Fatalf("open source: %v", err)
+	}
+	var docs []convert.Document
+	for {
+		d, ok, err := src.Next()
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if !ok {
+			break
+		}
+		if d.Body == "" {
+			continue
+		}
+		docs = append(docs, d)
+	}
+	_ = src.Close()
+	if len(docs) == 0 {
+		t.Skip("no documents in parquet")
+	}
+
+	order := collectionOrder(docs)
+	if len(order) != len(docs) {
+		t.Fatalf("order length %d != docs %d", len(order), len(docs))
+	}
+	seen := make([]bool, len(docs))
+	for _, old := range order {
+		if old < 0 || old >= len(docs) || seen[old] {
+			t.Fatalf("order is not a permutation: bad or repeated index %d", old)
+		}
+		seen[old] = true
+	}
+
+	// PageRank over the original order, then over the documents permuted by the
+	// order, must carry each document's rank to its new id unchanged.
+	prBefore := globalRanks(docs)
+	reordered := make([]convert.Document, len(docs))
+	for newID, oldID := range order {
+		reordered[newID] = docs[oldID]
+	}
+	prAfter := globalRanks(reordered)
+	inv := make([]int, len(order)) // old id -> new id
+	for newID, oldID := range order {
+		inv[oldID] = newID
+	}
+	var maxDiff float64
+	for oldID := range docs {
+		if d := math.Abs(prBefore[oldID] - prAfter[inv[oldID]]); d > maxDiff {
+			maxDiff = d
+		}
+	}
+	if maxDiff > 1e-9 {
+		t.Fatalf("pagerank not invariant under the collection order: max diff %g", maxDiff)
+	}
+	t.Logf("docs=%d collection order is a bijection, pagerank invariant (maxDiff=%g)", len(docs), maxDiff)
+}

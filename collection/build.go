@@ -89,13 +89,26 @@ func build(opts Options, baseStart uint32, indexStart int) (Result, error) {
 		return Result{}, fmt.Errorf("collection: source %s yielded no documents", opts.Source)
 	}
 	// Order by host then url: a host's pages share a shard and sit adjacent, the
-	// locality the delta and dictionary compression exploit.
+	// locality the delta and dictionary compression exploit. This is the host-
+	// grouping first pass of the doc 06 node ordering.
 	sort.Slice(docs, func(i, j int) bool {
 		if docs[i].Host != docs[j].Host {
 			return docs[i].Host < docs[j].Host
 		}
 		return docs[i].URL < docs[j].URL
 	})
+
+	// Second pass: Recursive Graph Bisection refines the host-grouped order over
+	// the resolved link graph, so the dense docID a document gets is its position
+	// in the order that compresses the graph best. Permute the documents by it
+	// before cutting shards; the signals computed next are indexed by the permuted
+	// position, so they line up with the ids the shards are written under.
+	order := collectionOrder(docs)
+	reordered := make([]convert.Document, len(docs))
+	for newID, oldID := range order {
+		reordered[newID] = docs[oldID]
+	}
+	docs = reordered
 
 	// Compute the link signals over the whole collection before cutting shards.
 	// The web graph is almost entirely cross-shard, so this is the only place a

@@ -193,6 +193,42 @@ func topKIndices(vals []float64, k int) []int {
 	return idx[:k]
 }
 
+// collectionOrder computes the dense docID ordering doc 06 specifies over the
+// whole collection: host and domain grouping first, then Recursive Graph
+// Bisection over the resolved link graph. It returns order, where order[i] is the
+// index in docs that belongs at new dense id i.
+//
+// The build permutes docs by this order before cutting shards, so a document's
+// dense docID is its position in the order, the single ordering the graph
+// compression, the identity assignment, and the posting impact locality all
+// share. The documents reach this function already sorted by host then url, which
+// is the host-grouping first pass (a host's pages are contiguous), so the
+// grouping sort is a stable no-op here and Recursive Graph Bisection spends the
+// leftover freedom: it clusters pages that share out-neighbors, which is what
+// collapses the adjacency gaps the codec spends bits on.
+//
+// PageRank and every other signal is a property of the graph, not its labeling,
+// so permuting the documents and recomputing the signals over the permuted slice
+// leaves each document's signals unchanged; the reorder changes the ids, not the
+// numbers. On a breadth-first crawl the graph barely materializes, so the order
+// is close to the input host+url order; it earns its bits on a crawl with depth,
+// where a host's pages share out-neighbors and cluster.
+func collectionOrder(docs []convert.Document) []int {
+	n := len(docs)
+	order := make([]int, n)
+	for i := range order {
+		order[i] = i
+	}
+	if n <= 1 {
+		return order
+	}
+	dir := buildDir(docs)
+	g := buildGraph(docs, dir)
+	out := graph.OutLists(g)
+	hostOf, _ := groupings(docs)
+	return graph.Reorder(out, hostOf, graph.DefaultBPConfig())
+}
+
 // globalSignals computes every collection-wide link signal and returns one value
 // per document, indexed by the document's position in docs.
 //
