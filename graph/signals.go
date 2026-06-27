@@ -40,14 +40,29 @@ type csr struct {
 }
 
 func buildCSR(g *Region) *csr {
+	return buildCSRDir(g, g.InNeighbors, g.OutDegree)
+}
+
+// buildCSRRev materializes the reversed graph: a node's in-neighbors on the
+// reverse are its out-neighbors on the original, and its reverse out-degree is its
+// original in-degree. Inverse PageRank and Anti-TrustRank are the same forward
+// iteration run over this transpose-of-the-transpose.
+func buildCSRRev(g *Region) *csr {
+	return buildCSRDir(g, g.OutNeighbors, g.InDegree)
+}
+
+// buildCSRDir materializes one direction of the graph as compressed sparse rows:
+// inOf gives the in-neighbors a node sums rank from and degOf the out-degree the
+// sender divides its rank by.
+func buildCSRDir(g *Region, inOf func(int) []int, degOf func(int) int) *csr {
 	n := g.nodeCount
 	c := &csr{rowPtr: make([]int, n+1), outdeg: make([]float64, n)}
 	total := 0
 	rows := make([][]int, n)
 	for v := 0; v < n; v++ {
-		rows[v] = g.InNeighbors(v)
+		rows[v] = inOf(v)
 		total += len(rows[v])
-		d := g.OutDegree(v)
+		d := degOf(v)
 		c.outdeg[v] = float64(d)
 		if d == 0 {
 			c.dangling = append(c.dangling, v)
@@ -66,36 +81,25 @@ func buildCSR(g *Region) *csr {
 
 func (c *csr) inNeighbors(v int) []int32 { return c.cols[c.rowPtr[v]:c.rowPtr[v+1]] }
 
-// PageRank runs the random-surfer power iteration and returns the stationary
-// distribution, one rank a node summing to one. Dangling nodes, the ones with no
-// out-links, have their mass redistributed uniformly each step so the vector does
-// not leak; on a real crawl the dangling set is a large minority and skipping
-// this would bleed rank every iteration.
-func PageRank(g *Region, cfg PRConfig) []float64 {
-	n := g.nodeCount
-	if n == 0 {
-		return nil
-	}
-	c := buildCSR(g)
-
+// powerIter runs the random-surfer power iteration over c with personalization
+// vector p, which sums to one. Both the teleport and the dangling-mass
+// redistribution restart on p, so a uniform p gives PageRank and a p biased onto a
+// seed set gives the seed-biased variants. The result sums to one.
+func powerIter(c *csr, n int, p []float64, cfg PRConfig) []float64 {
 	r := make([]float64, n)
 	rn := make([]float64, n)
-	for i := range r {
-		r[i] = 1.0 / float64(n)
-	}
-	teleport := (1 - cfg.Alpha) / float64(n)
+	copy(r, p)
 	for it := 0; it < cfg.MaxIters; it++ {
 		var dm float64
 		for _, x := range c.dangling {
 			dm += r[x]
 		}
-		base := teleport + cfg.Alpha*dm/float64(n)
 		for v := 0; v < n; v++ {
 			var acc float64
 			for _, u := range c.inNeighbors(v) {
 				acc += r[u] / c.outdeg[u]
 			}
-			rn[v] = base + cfg.Alpha*acc
+			rn[v] = (1-cfg.Alpha)*p[v] + cfg.Alpha*(acc+dm*p[v])
 		}
 		var delta float64
 		for i := range r {
@@ -109,6 +113,58 @@ func PageRank(g *Region, cfg PRConfig) []float64 {
 	return r
 }
 
+// uniformVec is the teleport vector of plain PageRank: every node equally likely.
+func uniformVec(n int) []float64 {
+	p := make([]float64, n)
+	u := 1.0 / float64(n)
+	for i := range p {
+		p[i] = u
+	}
+	return p
+}
+
+// seedVec is the personalization vector biased onto seeds, each seed sharing the
+// mass equally and every other node zero. With no seeds it falls back to uniform,
+// so a seed-biased rank with an empty seed set degenerates to plain PageRank.
+func seedVec(n int, seeds []int) []float64 {
+	if len(seeds) == 0 {
+		return uniformVec(n)
+	}
+	p := make([]float64, n)
+	w := 1.0 / float64(len(seeds))
+	for _, s := range seeds {
+		if s >= 0 && s < n {
+			p[s] = w
+		}
+	}
+	return p
+}
+
+// PageRank runs the random-surfer power iteration and returns the stationary
+// distribution, one rank a node summing to one. Dangling nodes, the ones with no
+// out-links, have their mass redistributed uniformly each step so the vector does
+// not leak; on a real crawl the dangling set is a large minority and skipping
+// this would bleed rank every iteration.
+func PageRank(g *Region, cfg PRConfig) []float64 {
+	n := g.nodeCount
+	if n == 0 {
+		return nil
+	}
+	return powerIter(buildCSR(g), n, uniformVec(n), cfg)
+}
+
+// InversePageRank runs PageRank on the reversed graph, ranking a node by how well
+// it reaches the rest of the graph rather than how well the graph reaches it. The
+// best-connected hubs by out-reach are the trust-seed candidates the build filters
+// down, the automatic half of the seed set the spec's doc 07 describes.
+func InversePageRank(g *Region, cfg PRConfig) []float64 {
+	n := g.nodeCount
+	if n == 0 {
+		return nil
+	}
+	return powerIter(buildCSRRev(g), n, uniformVec(n), cfg)
+}
+
 // TrustRank is PageRank with the teleport biased onto a trusted seed set: trust
 // starts on the seeds and flows forward along links, on the premise that good
 // pages rarely link to spam. Same iteration, same dangling handling, only the
@@ -118,47 +174,20 @@ func TrustRank(g *Region, seeds []int, cfg PRConfig) []float64 {
 	if n == 0 {
 		return nil
 	}
-	p := make([]float64, n)
-	if len(seeds) == 0 {
-		for i := range p {
-			p[i] = 1.0 / float64(n)
-		}
-	} else {
-		w := 1.0 / float64(len(seeds))
-		for _, s := range seeds {
-			if s >= 0 && s < n {
-				p[s] = w
-			}
-		}
-	}
+	return powerIter(buildCSR(g), n, seedVec(n, seeds), cfg)
+}
 
-	c := buildCSR(g)
-
-	t := make([]float64, n)
-	tn := make([]float64, n)
-	copy(t, p)
-	for it := 0; it < cfg.MaxIters; it++ {
-		var dm float64
-		for _, x := range c.dangling {
-			dm += t[x]
-		}
-		for v := 0; v < n; v++ {
-			var acc float64
-			for _, u := range c.inNeighbors(v) {
-				acc += t[u] / c.outdeg[u]
-			}
-			tn[v] = (1-cfg.Alpha)*p[v] + cfg.Alpha*(acc+dm*p[v])
-		}
-		var delta float64
-		for i := range t {
-			delta += math.Abs(tn[i] - t[i])
-		}
-		t, tn = tn, t
-		if delta < cfg.Tol {
-			break
-		}
+// AntiTrustRank propagates distrust backward from a spam seed set: it is TrustRank
+// on the reversed graph, so distrust flows from a spam page to the pages that link
+// to it. A high score is a direct spam flag, and a non-trivial score on a
+// trust-seed candidate is reason to drop it from the trust seeds. With no spam
+// seeds it degenerates to uniform.
+func AntiTrustRank(g *Region, spamSeeds []int, cfg PRConfig) []float64 {
+	n := g.nodeCount
+	if n == 0 {
+		return nil
 	}
-	return t
+	return powerIter(buildCSRRev(g), n, seedVec(n, spamSeeds), cfg)
 }
 
 // SpamMass returns the relative spam mass per node, 1 - trust/pagerank after
