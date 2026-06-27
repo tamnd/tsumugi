@@ -2,6 +2,7 @@ package collection
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,6 +10,7 @@ import (
 	"github.com/tamnd/tsumugi"
 	"github.com/tamnd/tsumugi/convert"
 	"github.com/tamnd/tsumugi/feature"
+	"github.com/tamnd/tsumugi/graph"
 )
 
 // crossHostDocs builds the canonical cross-host fixture: a hub and an unlinked
@@ -240,4 +242,67 @@ func TestGraphSignalsOnCCrawl(t *testing.T) {
 		totLD += sig.linkingDomains[i]
 	}
 	t.Logf("docs=%d totalInDegree=%d totalLinkingDomains=%d", len(docs), totIn, totLD)
+}
+
+// TestStreamPageRankMatchesCollectionInCore is the real-data gate for the
+// out-of-core PageRank: on the actual ccrawl link graph the streaming pass, which
+// never materializes the adjacency and keeps only the float32 rank vectors and the
+// out-degree array resident, must compute the same ranks the in-core CSR pass bakes
+// into the static-rank column. It agrees with globalRanks to float32 precision and
+// the streamed ranks still normalize, so the scale-path PageRank is exact on the
+// corpus, not an approximation of the one serving ranks against. The real graph is
+// near uniform on a breadth-first crawl, so this gates the numeric agreement and the
+// distribution, not the ordering, which TestStreamPageRankOrdering covers on a graph
+// with separated ranks.
+func TestStreamPageRankMatchesCollectionInCore(t *testing.T) {
+	if _, err := os.Stat(ccrawlGraphParquet); err != nil {
+		t.Skipf("ccrawl parquet not present: %v", err)
+	}
+	src, err := convert.OpenSource(ccrawlGraphParquet)
+	if err != nil {
+		t.Fatalf("open source: %v", err)
+	}
+	var docs []convert.Document
+	for {
+		d, ok, err := src.Next()
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if !ok {
+			break
+		}
+		if d.Body == "" {
+			continue
+		}
+		docs = append(docs, d)
+	}
+	_ = src.Close()
+	if len(docs) == 0 {
+		t.Skip("no documents in parquet")
+	}
+
+	dir := buildDir(docs)
+	g := buildGraph(docs, dir)
+	cfg := graph.DefaultPRConfig()
+
+	want := graph.PageRank(g, cfg)
+	got := graph.StreamPageRank(g, graph.OutDegrees(g), cfg)
+	if len(got) != len(want) {
+		t.Fatalf("stream pagerank length %d != in-core %d", len(got), len(want))
+	}
+
+	var maxDiff, sum float64
+	for i := range want {
+		if d := math.Abs(want[i] - float64(got[i])); d > maxDiff {
+			maxDiff = d
+		}
+		sum += float64(got[i])
+	}
+	if maxDiff > 1e-5 {
+		t.Fatalf("stream vs in-core max abs diff %g on the real graph, want < 1e-5", maxDiff)
+	}
+	if sum < 0.99 || sum > 1.01 {
+		t.Fatalf("streamed ranks sum to %g on the real graph, want ~1", sum)
+	}
+	t.Logf("docs=%d streamPageRank maxDiff=%g sum=%g", len(docs), maxDiff, sum)
 }
