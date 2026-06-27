@@ -3,6 +3,7 @@ module github.com/tamnd/tsumugi
 go 1.26.4
 
 require (
+	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/charmbracelet/fang v1.0.0
 	github.com/klauspost/compress v1.18.6
 	github.com/spf13/cobra v1.10.2
