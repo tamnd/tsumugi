@@ -59,8 +59,10 @@ func TestForLanguageHashesDifferFromDefault(t *testing.T) {
 // registry: a document and a query in one language analyze identically.
 func TestForLanguageStableHash(t *testing.T) {
 	for _, lang := range Languages() {
-		if ForLanguage(lang).Hash() != ForLanguage(lang).Hash() {
-			t.Errorf("ForLanguage(%q) hash not stable", lang)
+		build := ForLanguage(lang).Hash()
+		query := ForLanguage(lang).Hash()
+		if build != query {
+			t.Errorf("ForLanguage(%q) hash not stable: build %x query %x", lang, build, query)
 		}
 	}
 }
