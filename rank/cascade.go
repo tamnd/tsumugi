@@ -84,13 +84,21 @@ func NewCascade(l1 *Linear, l2 *Model) *Cascade {
 // with the L2 model, and return the final top-k by the model's ordinal score. The
 // retrieval rank carried by the fusion is the retrieval-score feature the linear
 // cut reads, so a strong dual-plane document survives the cut.
-func (c *Cascade) Rank(lexical, dense []uint32, feat FeatureFunc, k int) []Candidate {
+//
+// l1feat is the cheap feature row the linear cut reads over the larger fused set,
+// the query-independent matrix columns; l2feat is the full feature vector the model
+// reranks the survivors with, the matrix columns followed by the online
+// query-dependent features. The split is the whole point of the cascade: the
+// expensive online extraction runs only over the L1Keep survivors l2feat is called
+// for, never the L0Max candidates l1feat scans. Passing the same func for both is
+// the matrix-only path, the behavior before online features existed.
+func (c *Cascade) Rank(lexical, dense []uint32, l1feat, l2feat FeatureFunc, k int) []Candidate {
 	fused := RRF(c.K, lexical, dense)
 	if len(fused) > c.L0Max {
 		fused = fused[:c.L0Max]
 	}
-	kept := c.L1.Cut(fused, feat, c.L1Keep)
-	return c.rerank(kept, feat, k)
+	kept := c.L1.Cut(fused, l1feat, c.L1Keep)
+	return c.rerank(kept, l2feat, k)
 }
 
 // rerank scores each survivor with the L2 model and returns the top-k by the

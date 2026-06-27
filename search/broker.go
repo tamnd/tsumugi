@@ -76,8 +76,11 @@ func (b *Broker) Close() error {
 }
 
 // shardResult is one shard's contribution to a fan-out: its ranked lists already
-// shifted into the global id space and the feature rows of its candidates.
+// shifted into the global id space, the feature rows of its candidates, and the
+// index of the shard that produced them so the global rerank can route a survivor's
+// online feature extraction back to the shard that holds its text.
 type shardResult struct {
+	shard int
 	lex   []scored
 	dense []scored
 	feats map[uint32][]float64
@@ -102,6 +105,7 @@ func (b *Broker) Search(ctx context.Context, q Query) []Hit {
 
 	var allLex, allDense []scored
 	feats := make(map[uint32][]float64)
+	owner := make(map[uint32]int) // global id -> index of the shard that holds it
 	for _, r := range results {
 		if r == nil {
 			continue
@@ -110,6 +114,7 @@ func (b *Broker) Search(ctx context.Context, q Query) []Hit {
 		allDense = append(allDense, r.dense...)
 		for id, fv := range r.feats {
 			feats[id] = fv
+			owner[id] = r.shard
 		}
 	}
 	// Merge the per-shard ranked lists into one global ranked list per plane by score
@@ -117,8 +122,27 @@ func (b *Broker) Search(ctx context.Context, q Query) []Hit {
 	sortByScore(allLex)
 	sortByScore(allDense)
 
-	feat := func(id uint32) []float64 { return feats[id] }
-	cands := b.cascade.Rank(localIDs(allLex), localIDs(allDense), feat, q.K)
+	// L1 reads the matrix row already gathered from each shard. L2 needs the online
+	// query-dependent features, which depend on the candidate's text and so must be
+	// extracted at the shard that holds it: the rerank routes each survivor back to
+	// its owning shard's per-query extractor, built once and reused across that
+	// shard's survivors. Online extraction runs only over the L1 survivors, the
+	// bounded set the spec's budget allots the per-candidate text work.
+	exts := make([]*onlineExtractor, len(b.shards))
+	l1feat := func(id uint32) []float64 { return feats[id] }
+	l2feat := func(id uint32) []float64 {
+		base := feats[id]
+		si, ok := owner[id]
+		if !ok {
+			return base
+		}
+		s := b.shards[si]
+		if exts[si] == nil {
+			exts[si] = s.newOnline(q, q.TermIDF, b.stats.AvgDocLen)
+		}
+		return s.l2Row(base, exts[si], id-s.nodeBase)
+	}
+	cands := b.cascade.Rank(localIDs(allLex), localIDs(allDense), l1feat, l2feat, q.K)
 	hits := make([]Hit, len(cands))
 	for i, c := range cands {
 		hits[i] = Hit{DocID: c.DocID, Score: c.Score}
@@ -159,7 +183,7 @@ func (b *Broker) fanOut(ctx context.Context, q Query, targets []int) []*shardRes
 			for id, fv := range feats {
 				gf[base+id] = fv
 			}
-			results[i] = &shardResult{lex: gl, dense: gd, feats: gf}
+			results[i] = &shardResult{shard: si, lex: gl, dense: gd, feats: gf}
 		}(i, si)
 	}
 	wg.Wait()
