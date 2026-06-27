@@ -13,7 +13,18 @@ import "github.com/tamnd/tsumugi/lexical"
 // term index says nothing about which shards carry relevant vectors.
 type RoutingIndex struct {
 	postings map[string][]int
+	always   []int // shards routed for every query, the ones with no enumerable vocabulary
 	numShard int
+}
+
+// NewRoutingIndex wraps an already-built term-to-shards map as a routing index, the
+// shape a persisted collection artifact loads into, so the broker can route from the
+// stored index without rescanning the shards. The shard indices in the postings must
+// line up with the order the shards are passed to the broker. The always list names
+// shards that must see every query because their vocabulary was not enumerable, the
+// impact-quantized shards, so routing never drops a candidate it cannot index.
+func NewRoutingIndex(postings map[string][]int, always []int, numShard int) *RoutingIndex {
+	return &RoutingIndex{postings: postings, always: always, numShard: numShard}
 }
 
 // BuildRoutingIndex scans every shard's term dictionary and records, per term, the
@@ -54,12 +65,18 @@ func (ri *RoutingIndex) Route(q Query) []int {
 	}
 	seen := make([]bool, ri.numShard)
 	var out []int
+	add := func(si int) {
+		if !seen[si] {
+			seen[si] = true
+			out = append(out, si)
+		}
+	}
+	for _, si := range ri.always {
+		add(si)
+	}
 	for _, t := range terms {
 		for _, si := range ri.postings[t] {
-			if !seen[si] {
-				seen[si] = true
-				out = append(out, si)
-			}
+			add(si)
 		}
 	}
 	return out

@@ -18,7 +18,34 @@ func newCollectionCmd() *cobra.Command {
 	cmd.AddCommand(newCollectionListCmd())
 	cmd.AddCommand(newCollectionAddCmd())
 	cmd.AddCommand(newCollectionCompactCmd())
+	cmd.AddCommand(newCollectionIndexCmd())
 	return cmd
+}
+
+func newCollectionIndexCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "index <dir>",
+		Short: "Build the collection artifact: manifest, statistics, and routing index",
+		Long: "index scans a collection's shards once and writes the index.tsm artifact that\n" +
+			"serve loads instead of rescanning every shard at startup. Build, add, and compact\n" +
+			"refresh it automatically; run this to create it for a collection built before the\n" +
+			"artifact existed, or to rebuild it after editing the shard directory by hand.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			start := time.Now()
+			if err := collection.WriteIndex(args[0], uint64(time.Now().Unix())); err != nil {
+				return err
+			}
+			ix, err := collection.LoadIndex(args[0])
+			if err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+				"indexed %d shards, %d docs in %s\n",
+				ix.NumShards(), ix.Stats.DocCount, time.Since(start).Round(time.Millisecond))
+			return nil
+		},
+	}
 }
 
 func newCollectionListCmd() *cobra.Command {

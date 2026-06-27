@@ -34,12 +34,24 @@ type Broker struct {
 // NewBroker builds a broker over already-opened shards with a global cascade. It
 // constructs the routing index and the fleet-wide statistics from the shards. The
 // cascade carries the global L1 cut and L2 model the broker reranks the merged
-// candidate set with.
+// candidate set with. This is the scan path: it walks every shard's vocabulary to
+// build the routing index, which is fine for a handful of shards but is what the
+// persisted artifact replaces at fleet scale, through NewBrokerWith.
 func NewBroker(shards []*Shard, cascade *rank.Cascade) *Broker {
+	return NewBrokerWith(shards, cascade, BuildRoutingIndex(shards), computeGlobalStats(shards))
+}
+
+// NewBrokerWith builds a broker over already-opened shards with a routing index and
+// fleet-wide statistics supplied from outside, the values a collection artifact loads.
+// It is the scale path: serve reads the manifest, the statistics, and the routing index
+// from one file rather than rescanning every shard, so startup is proportional to the
+// query vocabulary, not the corpus. The routing index's shard ids must line up with the
+// order of the shards slice.
+func NewBrokerWith(shards []*Shard, cascade *rank.Cascade, routing *RoutingIndex, stats GlobalStats) *Broker {
 	return &Broker{
 		shards:         shards,
-		routing:        BuildRoutingIndex(shards),
-		stats:          computeGlobalStats(shards),
+		routing:        routing,
+		stats:          stats,
 		cascade:        cascade,
 		maxConcurrency: runtime.GOMAXPROCS(0),
 	}
