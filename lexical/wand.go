@@ -79,7 +79,7 @@ func (c *cursor) loadBlock(i int) error {
 	if err != nil {
 		return err
 	}
-	ps, err := decodeBlock(h, prevLast)
+	ps, err := decodeBlock(h, prevLast, c.region.codec)
 	if err != nil {
 		return err
 	}
@@ -312,7 +312,7 @@ func (r *Region) eachPosting(e termEntry, fn func(posting)) error {
 		if err != nil {
 			return err
 		}
-		ps, err := decodeBlock(h, prevLast)
+		ps, err := decodeBlock(h, prevLast, r.codec)
 		if err != nil {
 			return err
 		}

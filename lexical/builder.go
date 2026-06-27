@@ -21,17 +21,32 @@ type Builder struct {
 	norms   map[uint32]*[numFields]uint32
 	maxDoc  uint32
 	hasDocs bool
+	codec   docCodec
 }
 
 // NewBuilder starts a builder with the given BM25F parameters. The same params
 // are written into the region and used by the traversal, so the block-max bounds
-// the build computes match the contributions the traversal computes.
+// the build computes match the contributions the traversal computes. The docID
+// gap codec defaults to varint, the densest option on web postings; WithDocCodec
+// can select StreamVByte.
 func NewBuilder(params Params) *Builder {
 	return &Builder{
 		params: params,
 		terms:  map[string]map[uint32]*[numFields]uint32{},
 		norms:  map[uint32]*[numFields]uint32{},
+		codec:  varintCodec{},
 	}
+}
+
+// WithDocCodec selects the docID gap codec before Build. id is a Codec* selector;
+// an unknown id falls back to the default. It is here so a build can select
+// StreamVByte for a SIMD decode path or a large-gap workload, or be pinned to a
+// codec for an apples-to-apples size or speed comparison.
+func (b *Builder) WithDocCodec(id uint16) *Builder {
+	if dc, err := codecByID(id); err == nil {
+		b.codec = dc
+	}
+	return b
 }
 
 // AddDoc indexes one document. fields maps each field to its raw text; the
@@ -105,7 +120,7 @@ func (b *Builder) Build() []byte {
 		return term, ps, true
 	}
 
-	return assembleRegion(n, norms, st, b.params, fieldLenFrom(b.norms), next)
+	return assembleRegion(n, norms, st, b.params, fieldLenFrom(b.norms), b.codec, next)
 }
 
 // termSource yields terms in ascending dictionary order, each with its postings
@@ -119,8 +134,9 @@ type termSource func() (term string, ps []posting, ok bool)
 // path: the in-memory Builder feeds it from its maps, the SpimiBuilder feeds it from
 // an external k-way merge, and because both deliver terms in the same order with
 // docID-sorted postings the output bytes match exactly. fieldLenOf reads a document's
-// per-field lengths so the block-max bound can be computed at build time.
-func assembleRegion(n uint32, norms []byte, st stats, params Params, fieldLenOf func(uint32) [numFields]uint32, next termSource) []byte {
+// per-field lengths so the block-max bound can be computed at build time. dc is the
+// docID gap codec; its id is recorded in the header so Open decodes with the same one.
+func assembleRegion(n uint32, norms []byte, st stats, params Params, fieldLenOf func(uint32) [numFields]uint32, dc docCodec, next termSource) []byte {
 	var postings []byte
 	var blockMax []byte
 	var sorted []string
@@ -169,7 +185,7 @@ func assembleRegion(n uint32, norms []byte, st stats, params Params, fieldLenOf 
 				listMax = bmax
 			}
 			blockMax = codec.AppendUint32(blockMax, uint32(bmax))
-			postings = encodeBlock(postings, block, prevLast)
+			postings = encodeBlock(postings, block, prevLast, dc)
 			prevLast = block[len(block)-1].docID
 			blockCount++
 		}
@@ -193,6 +209,7 @@ func assembleRegion(n uint32, norms []byte, st stats, params Params, fieldLenOf 
 	// Lay the parts out after the header and fill in the sub-offsets.
 	h := regionHeader{
 		flags:       flagIDFFreeBlockMax,
+		docidCodec:  dc.id(),
 		termCount:   uint32(len(sorted)),
 		docCount:    n,
 		avgFieldLen: st.avgFieldLen,

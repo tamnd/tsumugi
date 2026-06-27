@@ -155,9 +155,20 @@ func TestSearchMissingTerm(t *testing.T) {
 	}
 }
 
+// blockCodecs is every docID gap codec, so the round-trip tests cover each one and
+// a new codec is exercised the moment it is added to codecByID.
+var blockCodecs = []struct {
+	name string
+	dc   docCodec
+}{
+	{"varint", varintCodec{}},
+	{"streamvbyte", streamVByteCodec{}},
+}
+
 // TestBlockCodecRoundTrip drives encodeBlock and decodeBlock across the awkward
 // shapes: a single posting, a full block, a short trailing block, and field
-// masks with gaps. The decoded postings must equal the originals exactly.
+// masks with gaps. The decoded postings must equal the originals exactly, under
+// every gap codec.
 func TestBlockCodecRoundTrip(t *testing.T) {
 	cases := [][]posting{
 		{{docID: 0, fieldTF: [numFields]uint32{1, 0, 0, 0}}},
@@ -165,60 +176,80 @@ func TestBlockCodecRoundTrip(t *testing.T) {
 		mkPostings(1, blockSize),     // full block
 		mkPostings(100, blockSize-1), // short block
 		mkPostings(1, 3),             // tiny block
+		largeGapPostings(),           // gaps spanning all 1..4 byte widths
 	}
-	for ci, ps := range cases {
-		var buf []byte
-		buf = encodeBlock(buf, ps, 0)
-		h, err := readBlockHeader(buf, 0)
-		if err != nil {
-			t.Fatalf("case %d header: %v", ci, err)
-		}
-		if h.nextOffset != len(buf) {
-			t.Fatalf("case %d nextOffset %d want %d", ci, h.nextOffset, len(buf))
-		}
-		got, err := decodeBlock(h, 0)
-		if err != nil {
-			t.Fatalf("case %d decode: %v", ci, err)
-		}
-		if !reflect.DeepEqual(got, ps) {
-			t.Fatalf("case %d round trip\n got=%v\nwant=%v", ci, got, ps)
+	for _, codec := range blockCodecs {
+		for ci, ps := range cases {
+			var buf []byte
+			buf = encodeBlock(buf, ps, 0, codec.dc)
+			h, err := readBlockHeader(buf, 0)
+			if err != nil {
+				t.Fatalf("%s case %d header: %v", codec.name, ci, err)
+			}
+			if h.nextOffset != len(buf) {
+				t.Fatalf("%s case %d nextOffset %d want %d", codec.name, ci, h.nextOffset, len(buf))
+			}
+			got, err := decodeBlock(h, 0, codec.dc)
+			if err != nil {
+				t.Fatalf("%s case %d decode: %v", codec.name, ci, err)
+			}
+			if !reflect.DeepEqual(got, ps) {
+				t.Fatalf("%s case %d round trip\n got=%v\nwant=%v", codec.name, ci, got, ps)
+			}
 		}
 	}
 }
 
 // TestBlockChainPrevLast encodes two consecutive blocks the way the builder does,
 // delta-coding the second against the first block's last docID, and decodes them
-// back to the original absolute docIDs.
+// back to the original absolute docIDs, under every gap codec.
 func TestBlockChainPrevLast(t *testing.T) {
-	first := mkPostings(10, blockSize)
-	second := mkPostings(int(first[len(first)-1].docID)+5, 20)
-	var buf []byte
-	buf = encodeBlock(buf, first, 0)
-	prevLast := first[len(first)-1].docID
-	buf = encodeBlock(buf, second, prevLast)
+	for _, codec := range blockCodecs {
+		first := mkPostings(10, blockSize)
+		second := mkPostings(int(first[len(first)-1].docID)+5, 20)
+		var buf []byte
+		buf = encodeBlock(buf, first, 0, codec.dc)
+		prevLast := first[len(first)-1].docID
+		buf = encodeBlock(buf, second, prevLast, codec.dc)
 
-	h1, err := readBlockHeader(buf, 0)
-	if err != nil {
-		t.Fatalf("h1: %v", err)
+		h1, err := readBlockHeader(buf, 0)
+		if err != nil {
+			t.Fatalf("%s h1: %v", codec.name, err)
+		}
+		got1, err := decodeBlock(h1, 0, codec.dc)
+		if err != nil {
+			t.Fatalf("%s decode1: %v", codec.name, err)
+		}
+		if !reflect.DeepEqual(got1, first) {
+			t.Fatalf("%s first block mismatch", codec.name)
+		}
+		h2, err := readBlockHeader(buf, h1.nextOffset)
+		if err != nil {
+			t.Fatalf("%s h2: %v", codec.name, err)
+		}
+		got2, err := decodeBlock(h2, h1.lastDocID, codec.dc)
+		if err != nil {
+			t.Fatalf("%s decode2: %v", codec.name, err)
+		}
+		if !reflect.DeepEqual(got2, second) {
+			t.Fatalf("%s second block mismatch", codec.name)
+		}
 	}
-	got1, err := decodeBlock(h1, 0)
-	if err != nil {
-		t.Fatalf("decode1: %v", err)
+}
+
+// largeGapPostings builds a block whose docID gaps land in each StreamVByte length
+// class, 1 through 4 bytes, so the codec's per-gap length selection is exercised at
+// every width rather than only the small gaps a dense list produces.
+func largeGapPostings() []posting {
+	gaps := []uint32{1, 200, 1 << 9, 1 << 17, 1 << 25, 3}
+	ps := make([]posting, len(gaps))
+	var d uint32
+	for i, g := range gaps {
+		d += g
+		ps[i].docID = d
+		ps[i].fieldTF[FieldTitle] = uint32(i%3) + 1
 	}
-	if !reflect.DeepEqual(got1, first) {
-		t.Fatal("first block mismatch")
-	}
-	h2, err := readBlockHeader(buf, h1.nextOffset)
-	if err != nil {
-		t.Fatalf("h2: %v", err)
-	}
-	got2, err := decodeBlock(h2, h1.lastDocID)
-	if err != nil {
-		t.Fatalf("decode2: %v", err)
-	}
-	if !reflect.DeepEqual(got2, second) {
-		t.Fatal("second block mismatch")
-	}
+	return ps
 }
 
 func mkPostings(start, n int) []posting {
