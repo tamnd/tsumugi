@@ -23,13 +23,25 @@ ranked results off the same bytes.
 
 ## Status
 
-Early. The shard container (M0) is implemented and tested: a `.tsumugi` file is a
-self-describing single file with a CRC-checked header, footer, and per-region
-integrity, written append-then-footer with an atomic rename so a torn write is
-rejected at open, and read through a memory map so an uncompressed region serves
-with no heap copy. The `inspect` command prints a shard's header, region table,
-and statistics. The retrieval, ranking, graph, vector, and serving milestones are
-in progress against the design in spec 2067.
+The engine runs end to end. The shard container (M0), the lexical index with
+BM25F and BlockMax-WAND (M1), the forward store and quantized feature matrix
+(M2-M3), the compressed link graph and its signals (M4-M5), the learned-sparse
+impact index and quantized vectors (M6-M7), the ranking cascade (M8), the
+LambdaMART trainer and graded-metrics eval (M9), the per-shard search and the
+fleet-wide broker (M10), and the build tooling (M11) are all implemented and
+tested. A `.tsumugi` file is a self-describing single file with a CRC-checked
+header, footer, and per-region integrity, written append-then-footer with an
+atomic rename so a torn write is rejected at open, and read through a memory map
+so an uncompressed region serves with no heap copy.
+
+Proven end to end on a real [ccrawl-cli](https://github.com/tamnd/ccrawl-cli)
+export: `build` packs 20,246 documents from 18,777 hosts into 11 shards (92.4 MB)
+in 11s, `train` fits a 150-tree model, `serve` answers queries across all shards
+in under a millisecond each, and `compact` merges the 11 shards into 3 (84.3 MB)
+in 9s. The broker reproduces a single-index top-k bit for bit across a
+partitioned collection, and a worst-case all-matching query over 50,000 documents
+in 16 shards returns in 6.9 ms, inside the ten-millisecond budget the design is
+built to hold at a hundred thousand shards.
 
 ## Install
 
@@ -43,7 +55,29 @@ first version is tagged.
 
 ## Quick start
 
-The CLI reads `.tsumugi` shards. Point it at one to see the layout:
+Build a collection from a crawl export, fit a bootstrap model, and serve it:
+
+```bash
+# Pack a Parquet or JSONL crawl export into shards under ./data.
+tsumugi build --source crawl.parquet --out ./data --shard-size 2000
+
+# Fit a cold-start ranking model over the collection's features.
+tsumugi train ./data --out ./data/model.bin
+
+# Serve ranked results over HTTP with a per-request latency budget.
+tsumugi serve --dir ./data --model ./data/model.bin --addr :8080
+curl 'localhost:8080/search?q=education&k=10'
+```
+
+Manage a collection as later crawls arrive:
+
+```bash
+tsumugi collection list ./data           # shards, bases, sizes
+tsumugi collection add ./data --source fresh.jsonl
+tsumugi collection compact ./data        # merge shards back down
+```
+
+Point `inspect` at any shard to see its layout:
 
 ```bash
 tsumugi inspect shard.tsumugi
