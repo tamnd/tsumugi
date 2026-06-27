@@ -34,6 +34,9 @@ func newRoot() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
+	root.AddCommand(newBuildCmd())
+	root.AddCommand(newTrainCmd())
+	root.AddCommand(newCollectionCmd())
 	root.AddCommand(newInspectCmd())
 	root.AddCommand(newServeCmd())
 	return root
