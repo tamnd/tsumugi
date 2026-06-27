@@ -1,6 +1,9 @@
 package search
 
 import (
+	"errors"
+	"fmt"
+
 	"github.com/tamnd/tsumugi"
 	"github.com/tamnd/tsumugi/feature"
 	"github.com/tamnd/tsumugi/forward"
@@ -9,6 +12,13 @@ import (
 	"github.com/tamnd/tsumugi/sparse"
 	"github.com/tamnd/tsumugi/vector"
 )
+
+// ErrSchemaMismatch is returned when a shard's feature region, or a model the broker
+// ranks with, was built against a feature schema that does not match the one this
+// build scores against. Refusing loudly at load turns a silent wrong-column misread,
+// the failure that grows likely as a fleet of 100,000 shards is built over months
+// against an evolving schema, into a startup error.
+var ErrSchemaMismatch = errors.New("search: feature schema mismatch")
 
 // DefaultL0 is the number of candidates each retrieval plane returns from a shard
 // before fusion, the L0 width of the cascade.
@@ -95,6 +105,14 @@ func newShard(r *tsumugi.Reader, cascade *rank.Cascade) (*Shard, error) {
 		}
 		if s.feat, err = feature.Open(b); err != nil {
 			return nil, err
+		}
+		// Refuse a shard whose feature matrix was built against a different schema than
+		// this build scores against. The model is trained on a fixed column order; a
+		// shard that reorders, retypes, or drops a column would feed the model a row it
+		// reads as different signals, a silent scoring corruption, so it is rejected here.
+		if v, h := s.feat.SchemaVersion(), s.feat.SchemaHash(); v != feature.SchemaVersion || h != feature.DefaultSchemaHash() {
+			return nil, fmt.Errorf("%w: shard feature region is schema v%d hash %016x, this build expects v%d hash %016x",
+				ErrSchemaMismatch, v, h, feature.SchemaVersion, feature.DefaultSchemaHash())
 		}
 	}
 	// The forward region holds the candidate text the online L2 features decode:

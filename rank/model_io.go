@@ -11,7 +11,10 @@ import (
 // modelMagic tags a serialized ensemble file.
 var modelMagic = [4]byte{'T', 'R', 'N', 'K'}
 
-const modelVersion = 1
+// modelVersion is the current TRNK format. Version 2 added the feature-matrix
+// schema stamp (version and hash) after the tree count; version 1 carried no stamp
+// and is still read, its schema left zero so the loader treats it as unstamped.
+const modelVersion = 2
 
 // ErrBadModel is returned when a model stream does not parse.
 var ErrBadModel = errors.New("rank: bad model stream")
@@ -30,6 +33,15 @@ func (e *Ensemble) Save(w io.Writer) error {
 	binary.LittleEndian.PutUint32(hdr[4:], uint32(e.numFeatures))
 	binary.LittleEndian.PutUint32(hdr[8:], uint32(len(e.trees)))
 	if _, err := bw.Write(hdr[:]); err != nil {
+		return err
+	}
+	// The schema stamp follows the v1 header: the feature-matrix schema version and
+	// its fingerprint, so a serving node can refuse a model whose columns do not line
+	// up with the shards it would score.
+	var schema [12]byte
+	binary.LittleEndian.PutUint16(schema[0:], e.schemaVersion)
+	binary.LittleEndian.PutUint64(schema[4:], e.schemaHash)
+	if _, err := bw.Write(schema[:]); err != nil {
 		return err
 	}
 	for _, t := range e.trees {
@@ -76,11 +88,23 @@ func LoadEnsemble(r io.Reader) (*Ensemble, error) {
 	if _, err := io.ReadFull(br, hdr[:]); err != nil {
 		return nil, err
 	}
-	if hdr[0] != modelVersion {
+	if hdr[0] != 1 && hdr[0] != modelVersion {
 		return nil, ErrBadModel
 	}
 	numFeatures := int(binary.LittleEndian.Uint32(hdr[4:]))
 	numTrees := int(binary.LittleEndian.Uint32(hdr[8:]))
+	// Version 2 carries the schema stamp after the header; version 1 carries none, so
+	// its schema stays zero and the loader treats the model as unstamped.
+	var schemaVersion uint16
+	var schemaHash uint64
+	if hdr[0] >= 2 {
+		var schema [12]byte
+		if _, err := io.ReadFull(br, schema[:]); err != nil {
+			return nil, err
+		}
+		schemaVersion = binary.LittleEndian.Uint16(schema[0:])
+		schemaHash = binary.LittleEndian.Uint64(schema[4:])
+	}
 	trees := make([]*treeNode, numTrees)
 	for i := range trees {
 		t, err := readNode(br)
@@ -89,7 +113,12 @@ func LoadEnsemble(r io.Reader) (*Ensemble, error) {
 		}
 		trees[i] = t
 	}
-	return &Ensemble{trees: trees, numFeatures: numFeatures}, nil
+	return &Ensemble{
+		trees:         trees,
+		numFeatures:   numFeatures,
+		schemaVersion: schemaVersion,
+		schemaHash:    schemaHash,
+	}, nil
 }
 
 func readNode(r io.ByteReader) (*treeNode, error) {

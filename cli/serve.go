@@ -146,7 +146,12 @@ func openShards(dir string, model *rank.Model) ([]*search.Shard, *search.Broker,
 		}
 		shards = append(shards, s)
 	}
-	return shards, search.NewBroker(shards, newCascade(model)), nil
+	broker := search.NewBroker(shards, newCascade(model))
+	if err := broker.CheckModel(); err != nil {
+		closeAll()
+		return nil, nil, err
+	}
+	return shards, broker, nil
 }
 
 // shardsFromIndex opens the shards the artifact names, in the artifact's order, and
@@ -173,7 +178,14 @@ func shardsFromIndex(dir string, model *rank.Model, ix *collection.Index) ([]*se
 		TokenCount: ix.Stats.TokenCount,
 		AvgDocLen:  ix.Stats.AvgDocLen,
 	}
-	return shards, search.NewBrokerWith(shards, newCascade(model), routing, stats), nil
+	broker := search.NewBrokerWith(shards, newCascade(model), routing, stats)
+	if err := broker.CheckModel(); err != nil {
+		for _, opened := range shards {
+			_ = opened.Close()
+		}
+		return nil, nil, err
+	}
+	return shards, broker, nil
 }
 
 func newCascade(model *rank.Model) *rank.Cascade {

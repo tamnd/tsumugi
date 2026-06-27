@@ -57,6 +57,13 @@ func writeShardHash(t *testing.T, path string, texts []string, nodeBase uint32, 
 
 // writeModel trains a tiny ensemble and saves it to disk for the serve loader.
 func writeModel(t *testing.T, path string) {
+	writeModelStamped(t, path, feature.SchemaVersion, feature.DefaultSchemaHash())
+}
+
+// writeModelStamped trains the same tiny model writeModel does but stamps it with the
+// given feature schema before saving, so a test can write a model that does or does not
+// match the schema the serve path scores against.
+func writeModelStamped(t *testing.T, path string, version uint16, hash uint64) {
 	t.Helper()
 	nf := len(feature.DefaultSchema())
 	d := &rank.Dataset{NumFeatures: nf}
@@ -79,6 +86,7 @@ func writeModel(t *testing.T, path string) {
 	p := rank.DefaultParams()
 	p.Rounds = 20
 	ens := rank.Train(d, p)
+	ens.SetSchema(version, hash)
 	f, err := os.Create(path)
 	if err != nil {
 		t.Fatalf("create model: %v", err)
