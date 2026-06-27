@@ -10,6 +10,17 @@ import (
 	"github.com/tamnd/tsumugi/codec"
 )
 
+// mustBuild builds a region and fails the test on a build error, the convenient
+// form for the many tests that expect a normal corpus to build cleanly.
+func mustBuild(tb testing.TB, b *Builder) []byte {
+	tb.Helper()
+	region, err := b.Build()
+	if err != nil {
+		tb.Fatalf("build: %v", err)
+	}
+	return region
+}
+
 // clusteredCorpus draws n unit vectors of the given dimension grouped into
 // clusters, the way real embeddings sit in topical neighborhoods rather than
 // spread uniformly, so nearest-neighbor structure exists to recover.
@@ -107,7 +118,7 @@ func TestRecallTwoPart(t *testing.T) {
 	for _, v := range corpus {
 		b.Add(v)
 	}
-	r, err := Open(b.Build())
+	r, err := Open(mustBuild(t, b))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -137,7 +148,7 @@ func TestGraphRecallVsBrute(t *testing.T) {
 	for _, v := range corpus {
 		b.Add(v)
 	}
-	r, err := Open(b.Build())
+	r, err := Open(mustBuild(t, b))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -174,7 +185,7 @@ func TestNoRerankCandidateRecall(t *testing.T) {
 	for _, v := range corpus {
 		b.Add(v)
 	}
-	r, err := Open(b.Build())
+	r, err := Open(mustBuild(t, b))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -284,7 +295,7 @@ func TestFuseRRF(t *testing.T) {
 // TestEmptyAndCorrupt covers an empty region, a flipped header byte, and a
 // truncated region.
 func TestEmptyAndCorrupt(t *testing.T) {
-	empty := NewBuilder(64).Build()
+	empty := mustBuild(t, NewBuilder(64))
 	r, err := Open(empty)
 	if err != nil {
 		t.Fatalf("open empty: %v", err)
@@ -297,7 +308,7 @@ func TestEmptyAndCorrupt(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		b.Add(normalize(randVec(rand.New(rand.NewSource(int64(i))), 64)))
 	}
-	good := b.Build()
+	good := mustBuild(t, b)
 	bad := append([]byte(nil), good...)
 	bad[20] ^= 0xff // count, inside header CRC
 	if _, err := Open(bad); err == nil {
@@ -352,7 +363,7 @@ func TestOpenIsZeroCopy(t *testing.T) {
 	for _, v := range corpus {
 		b.Add(v)
 	}
-	region := b.Build()
+	region := mustBuild(t, b)
 	regionSize := len(region)
 
 	// Baseline heap with the region bytes already allocated (in production these are
@@ -387,4 +398,124 @@ func TestOpenIsZeroCopy(t *testing.T) {
 		t.Fatal("search over the view reader returned nothing")
 	}
 	runtime.KeepAlive(region)
+}
+
+// nearDupRows builds an int8 corpus of tight near-duplicate clusters, the shape that
+// makes the diversity heuristic seal a cluster into an island: every point in a
+// cluster is a near copy of its center, so the heuristic keeps almost no neighbors
+// for it and the others drop it, stranding the whole cluster from the entry walk.
+func nearDupRows(n, dim, clusters int, seed int64) [][]int8 {
+	rng := rand.New(rand.NewSource(seed))
+	centers := make([][]float64, clusters)
+	for c := range centers {
+		v := make([]float64, dim)
+		for j := range v {
+			v[j] = rng.NormFloat64()
+		}
+		centers[c] = v
+	}
+	rows := make([][]int8, n)
+	for i := range rows {
+		c := centers[rng.Intn(clusters)]
+		r := make([]int8, dim)
+		for j := range r {
+			q := int(math.Round((c[j] + rng.NormFloat64()*0.05) * 20))
+			if q > 127 {
+				q = 127
+			}
+			if q < -127 {
+				q = -127
+			}
+			r[j] = int8(q)
+		}
+		rows[i] = r
+	}
+	return rows
+}
+
+// TestRepairReconnectsOrphans is the M17 connectivity gate at the graph level. On a
+// near-duplicate-heavy corpus the raw build strands whole clusters from the entry, so
+// the documents in them are invisible to dense search, a silent recall hole. The test
+// first asserts the raw build does strand nodes, so it exercises the repair rather
+// than a graph that was already connected, then runs the repair the builder runs and
+// requires every node reachable, with no node pushed past the layer-0 degree budget
+// the fixed-width serialized format silently truncates at.
+func TestRepairReconnectsOrphans(t *testing.T) {
+	const n, dim, m, m0 = 2000, 128, 8, 16
+	rows := nearDupRows(n, dim, 30, 99)
+	// A low ef keeps the serial build cheap under the race detector; a narrow beam
+	// also strands more nodes, not fewer, so it exercises the repair harder.
+	g := newHNSW(rows, m, m0, 16, 7)
+	if pre := g.reachableCount(); pre >= n {
+		t.Fatalf("expected the raw build to strand nodes so the repair is exercised, got all %d reachable", pre)
+	} else {
+		t.Logf("raw build stranded %d of %d nodes from the entry", n-pre, n)
+	}
+	prev := -1
+	for {
+		g.repair()
+		got := g.reachableCount()
+		if got == n {
+			break
+		}
+		if got <= prev {
+			t.Fatalf("repair stalled at %d of %d reachable", got, n)
+		}
+		prev = got
+	}
+	for node, ns := range g.links {
+		if len(ns) > g.m0 {
+			t.Fatalf("node %d has %d layer-0 neighbors, over the m0 budget %d", node, len(ns), g.m0)
+		}
+	}
+}
+
+// TestBuildRegionFullyReachable is the same gate end to end through the serialized
+// region: a near-duplicate corpus built and reopened must expose a layer-0 graph in
+// which every document is reachable from the stored entry point, so the connectivity
+// the repair guarantees survives serialization and a search can reach any document.
+func TestBuildRegionFullyReachable(t *testing.T) {
+	const n, dim = 1500, 96
+	rng := rand.New(rand.NewSource(5))
+	centers := make([][]float32, 25)
+	for c := range centers {
+		centers[c] = normalize(randVec(rng, dim))
+	}
+	// A cheap low-degree, low-ef build keeps the test fast under the race detector; the
+	// connectivity invariant the test checks holds regardless of graph quality.
+	b := NewBuilder(dim).WithHNSW(8, 16, 16)
+	for i := 0; i < n; i++ {
+		c := centers[rng.Intn(len(centers))]
+		v := make([]float32, dim)
+		for j := range v {
+			v[j] = c[j] + 0.02*float32(rng.NormFloat64())
+		}
+		b.Add(normalize(v))
+	}
+	r, err := Open(mustBuild(t, b))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if r.Count() != n {
+		t.Fatalf("count %d, want %d", r.Count(), n)
+	}
+	seen := make([]bool, n)
+	entry := int32(r.h.entryPoint)
+	seen[entry] = true
+	reached := 1
+	stack := []int32{entry}
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for _, nb := range r.links.neighbors0(cur) {
+			if int(nb) < n && !seen[nb] {
+				seen[nb] = true
+				reached++
+				stack = append(stack, nb)
+			}
+		}
+	}
+	if reached != n {
+		t.Fatalf("only %d of %d documents reachable from the entry in the built region", reached, n)
+	}
 }

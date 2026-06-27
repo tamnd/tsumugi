@@ -213,7 +213,11 @@ func TestOnlineDenseCosine(t *testing.T) {
 	}
 	vb.Add(base)
 	vb.Add(orth)
-	vr, err := vector.Open(vb.Build())
+	vregion, err := vb.Build()
+	if err != nil {
+		t.Fatalf("build vector: %v", err)
+	}
+	vr, err := vector.Open(vregion)
 	if err != nil {
 		t.Fatalf("open vector: %v", err)
 	}

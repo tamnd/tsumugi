@@ -43,6 +43,139 @@ func newHNSW(rows [][]int8, m, m0 int, efConstruction int, seed int64) *hnswGrap
 	return g
 }
 
+// reachableCount returns how many nodes the search can reach from the entry point
+// over the layer-0 links. The walk starts at the entry and beams over layer-0, so a
+// node no layer-0 path reaches is invisible to dense search, a silent recall hole.
+// The diversity shrink can drop a back-link, so connectivity is a property to verify
+// after the build, not one the insert order guarantees. It is a directed reach over
+// g.links because that is exactly the edge set neighbors0 walks at query time.
+func (g *hnswGraph) reachableCount() int {
+	n := len(g.links)
+	if n == 0 || g.entry < 0 {
+		return n
+	}
+	seen := make([]bool, n)
+	seen[g.entry] = true
+	count := 1
+	stack := []int32{g.entry}
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for _, nb := range g.links[cur] {
+			if !seen[nb] {
+				seen[nb] = true
+				count++
+				stack = append(stack, nb)
+			}
+		}
+	}
+	return count
+}
+
+// repair grafts every node the search cannot reach from the entry back into the
+// reachable graph and returns the reachable count after the pass. On
+// near-duplicate-heavy corpora the diversity heuristic seals a tight cluster into an
+// island with no in-edge from the rest of the graph: the cluster's members keep only
+// each other as neighbors and every outside node drops them, so the entry walk never
+// reaches them and they are invisible to dense search. A web corpus is full of such
+// near-duplicates, so this is the common case, not a corner one, and erroring out
+// would refuse to index real data. Instead each orphan is given one layer-0 in-edge
+// from a reachable node near it, found by a greedy walk from the entry so the new
+// edge is short and the graft is local. The graft prefers a reachable node that still
+// has a free layer-0 slot so no existing edge is dropped; only when no reachable node
+// anywhere has a free slot does it replace a grafter's farthest neighbor, the one the
+// search is least likely to follow. Grafting an orphan pulls in everything reachable
+// from it, so the reachable set is grown incrementally as the pass runs and a single
+// pass reconnects the whole graph in the no-eviction case; the caller repeats until
+// the reachable count stops rising to absorb the rare eviction that re-orphans a node.
+func (g *hnswGraph) repair() int {
+	n := len(g.links)
+	if n == 0 || g.entry < 0 {
+		return n
+	}
+	seen := make([]bool, n)
+	seen[g.entry] = true
+	reached := 1
+	stack := []int32{g.entry}
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for _, nb := range g.links[cur] {
+			if !seen[nb] {
+				seen[nb] = true
+				reached++
+				stack = append(stack, nb)
+			}
+		}
+	}
+	if reached == n {
+		return n
+	}
+	// spare holds reachable nodes that still have a free layer-0 slot, the graft
+	// points that need no eviction. It is grown as newly reached nodes turn up.
+	var spare []int32
+	for i := 0; i < n; i++ {
+		if seen[i] && len(g.links[i]) < g.m0 {
+			spare = append(spare, int32(i))
+		}
+	}
+	// absorb marks start and everything reachable from it as seen, feeding the spare
+	// pool with any newly reached node that has a free slot.
+	absorb := func(start int32) {
+		ls := []int32{start}
+		for len(ls) > 0 {
+			c := ls[len(ls)-1]
+			ls = ls[:len(ls)-1]
+			if len(g.links[c]) < g.m0 {
+				spare = append(spare, c)
+			}
+			for _, nb := range g.links[c] {
+				if !seen[nb] {
+					seen[nb] = true
+					reached++
+					ls = append(ls, nb)
+				}
+			}
+		}
+	}
+	for i := 0; i < n; i++ {
+		if seen[i] {
+			continue
+		}
+		u := int32(i)
+		// Prefer a reachable node near u; fall back to any reachable node with a free
+		// slot; evict only when nothing has room.
+		v := g.greedy(u, g.entry, 0)
+		if len(g.links[v]) >= g.m0 {
+			for len(spare) > 0 {
+				c := spare[len(spare)-1]
+				if seen[c] && len(g.links[c]) < g.m0 {
+					v = c
+					break
+				}
+				spare = spare[:len(spare)-1]
+			}
+		}
+		if len(g.links[v]) < g.m0 {
+			g.links[v] = append(g.links[v], u)
+		} else {
+			v = g.greedy(u, g.entry, 0)
+			cur := g.links[v]
+			worst, wd := 0, g.dist(v, cur[0])
+			for j := 1; j < len(cur); j++ {
+				if d := g.dist(v, cur[j]); d > wd {
+					worst, wd = j, d
+				}
+			}
+			cur[worst] = u
+		}
+		seen[u] = true
+		reached++
+		absorb(u)
+	}
+	return reached
+}
+
 // dist is the build metric: smaller is nearer, so it returns the negated int8 dot
 // of the two rows.
 func (g *hnswGraph) dist(a, b int32) float64 {

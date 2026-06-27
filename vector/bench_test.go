@@ -14,7 +14,7 @@ func benchRegion(b *testing.B, n, dim, clusters int) (*Region, [][]float32) {
 	for _, v := range corpus {
 		bd.Add(v)
 	}
-	r, err := Open(bd.Build())
+	r, err := Open(mustBuild(b, bd))
 	if err != nil {
 		b.Fatalf("open: %v", err)
 	}
@@ -45,7 +45,7 @@ func BenchmarkSearchNoRerank(b *testing.B) {
 	for _, v := range corpus {
 		bd.Add(v)
 	}
-	r, err := Open(bd.Build())
+	r, err := Open(mustBuild(b, bd))
 	if err != nil {
 		b.Fatalf("open: %v", err)
 	}

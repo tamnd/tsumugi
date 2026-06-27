@@ -88,7 +88,11 @@ func buildShardFile(t testing.TB, path string, docs []doc, lo, hi int, nodeBase 
 		t.Fatalf("add feature: %v", err)
 	}
 	if withVec {
-		if err := w.AddRegion(tsumugi.RegionVector, tsumugi.CodecZstd, 0, 0, vb.Build()); err != nil {
+		vregion, err := vb.Build()
+		if err != nil {
+			t.Fatalf("build vector: %v", err)
+		}
+		if err := w.AddRegion(tsumugi.RegionVector, tsumugi.CodecZstd, 0, 0, vregion); err != nil {
 			t.Fatalf("add vector: %v", err)
 		}
 	}

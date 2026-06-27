@@ -60,6 +60,13 @@ const (
 // region or fail the header CRC.
 var ErrCorrupt = errors.New("vector: corrupt region")
 
+// ErrUnreachable is returned by Build when the graph cannot be made fully
+// reachable from the entry point. The build repairs orphaned nodes before framing
+// the region, so this is a defensive guard against a repair that fails to converge,
+// not a condition a normal build hits: an orphaned node is a document invisible to
+// dense search, a silent recall hole, so the build refuses to ship one.
+var ErrUnreachable = errors.New("vector: graph not fully reachable from entry")
+
 // header is the fixed prefix that fully parameterizes the reader. The three parts
 // (codes, int8 rerank, links) follow it in order at the recorded lengths.
 type header struct {
