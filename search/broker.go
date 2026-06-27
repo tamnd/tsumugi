@@ -169,7 +169,7 @@ func (b *Broker) Search(ctx context.Context, q Query) []Hit {
 		}
 		s := b.shards[si]
 		if exts[si] == nil {
-			exts[si] = s.newOnline(q, q.TermIDF, b.stats.AvgDocLen)
+			exts[si] = s.newOnline(q, q.TermIDF, b.stats.AvgFieldLen)
 		}
 		return s.l2Row(base, exts[si], id-s.nodeBase)
 	}

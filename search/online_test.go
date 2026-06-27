@@ -54,7 +54,7 @@ func buildForward(t testing.TB, docs []textDoc) *forward.Region {
 func extract(t testing.TB, q Query, docs []textDoc, idf map[string]float64, avgBody float64, id uint32) []float64 {
 	t.Helper()
 	fwd := buildForward(t, docs)
-	e := newOnlineExtractor(q, fwd, nil, idf, avgBody)
+	e := newOnlineExtractor(q, fwd, nil, idf, [3]float64{fBody: avgBody})
 	return e.features(id)
 }
 
@@ -219,7 +219,7 @@ func TestOnlineDenseCosine(t *testing.T) {
 	}
 	docs := []textDoc{{body: "a"}, {body: "b"}}
 	fwd := buildForward(t, docs)
-	e := newOnlineExtractor(Query{Vector: base}, fwd, vr, nil, 1)
+	e := newOnlineExtractor(Query{Vector: base}, fwd, vr, nil, [3]float64{fBody: 1})
 	same := e.features(0)[OnDenseCosine]
 	diff := e.features(1)[OnDenseCosine]
 	if same < 0.99 {
@@ -349,7 +349,7 @@ func trainExactMatchModel(t testing.TB) *rank.Model {
 
 func TestOnlineMissingValues(t *testing.T) {
 	// No forward region: text features are zero, not invented.
-	e := newOnlineExtractor(Query{Text: "apple"}, nil, nil, map[string]float64{"apple": 1}, 5)
+	e := newOnlineExtractor(Query{Text: "apple"}, nil, nil, map[string]float64{"apple": 1}, [3]float64{fBody: 5})
 	f := e.features(0)
 	if f[OnBM25Body] != 0 || f[OnTermCoverage] != 0 {
 		t.Fatalf("absent text should leave text features zero, got bm25 %.4f cov %.4f", f[OnBM25Body], f[OnTermCoverage])
@@ -397,7 +397,7 @@ func TestOnlineFeaturesOnCCrawl(t *testing.T) {
 	for _, term := range terms {
 		idf[term] = 1.0
 	}
-	e := newOnlineExtractor(q, fwd, nil, idf, 200)
+	e := newOnlineExtractor(q, fwd, nil, idf, [3]float64{fBody: 200})
 
 	for id := range docs {
 		f := e.features(uint32(id))
@@ -455,7 +455,7 @@ func BenchmarkOnlineExtract(b *testing.B) {
 	for _, t := range lexical.Analyze(q.Text) {
 		idf[t] = 1.0
 	}
-	e := newOnlineExtractor(q, fwd, nil, idf, 200)
+	e := newOnlineExtractor(q, fwd, nil, idf, [3]float64{fBody: 200})
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

@@ -258,7 +258,7 @@ func (s *Shard) Search(q Query) []Hit {
 	// query-dependent features the extractor computes per survivor. The single-shard
 	// path scores idf and the average body length against this shard's own counts,
 	// the local statistics that are the collection statistics when there is one shard.
-	ext := s.newOnline(q, q.TermIDF, s.localAvgBodyLen())
+	ext := s.newOnline(q, q.TermIDF, s.localAvgFieldLen())
 	l1feat := func(id uint32) []float64 { return feats[id] }
 	l2feat := func(id uint32) []float64 { return s.l2Row(feats[id], ext, id) }
 	cands := s.cascade.Rank(lexIDs, denseIDs, l1feat, l2feat, q.K)
@@ -273,12 +273,13 @@ func (s *Shard) Search(q Query) []Hit {
 // forward and vector regions. idfOf is the per-term idf to score BM25 with, the
 // broker's pushed-down collection idf on the fan-out path or the query's own
 // override; a nil map falls back to the shard-local idf when the lexical region can
-// supply it. avgBody is the average body length BM25 normalizes by.
-func (s *Shard) newOnline(q Query, idfOf map[string]float64, avgBody float64) *onlineExtractor {
+// supply it. avgField is the per-field average length BM25 normalizes each field by,
+// the fleet averages on the fan-out path or this shard's own on the single-shard path.
+func (s *Shard) newOnline(q Query, idfOf map[string]float64, avgField [3]float64) *onlineExtractor {
 	if idfOf == nil && s.lex != nil {
 		idfOf = s.localIDF(q.lexTerms())
 	}
-	return newOnlineExtractor(q, s.fwd, s.vec, idfOf, avgBody)
+	return newOnlineExtractor(q, s.fwd, s.vec, idfOf, avgField)
 }
 
 // l2Row assembles the full L2 feature vector for a candidate: the query-independent
@@ -311,18 +312,31 @@ func (s *Shard) localIDF(terms []string) map[string]float64 {
 	return out
 }
 
-// localAvgBodyLen is the shard's average body length in tokens, the BM25 length
-// normalizer for the single-shard path. It reads the token count the build recorded
-// and divides by the document count; a shard with neither recorded falls back to no
-// normalization.
-func (s *Shard) localAvgBodyLen() float64 {
+// localAvgFieldLen is the shard's per-field average length in tokens, the BM25 length
+// normalizer for the single-shard path where this shard's own statistics are the
+// collection statistics. It reads the per-field token sums the build recorded and
+// divides by the document count, indexed in the online extractor's field order
+// (title, body, url). The body falls back to the token_count sum when the per-field
+// stat is absent, the way a shard built before the per-field sums normalized it;
+// title and url fall back to zero, leaving those fields unnormalized as they were.
+func (s *Shard) localAvgFieldLen() [3]float64 {
+	var avg [3]float64
 	if s.docCount == 0 {
-		return 0
+		return avg
 	}
-	if v, ok := s.r.Stat(tsumugi.StatTokenCount); ok {
-		return v / float64(s.docCount)
+	n := float64(s.docCount)
+	if v, ok := s.r.Stat(tsumugi.StatBodyTokenCount); ok {
+		avg[fBody] = v / n
+	} else if v, ok := s.r.Stat(tsumugi.StatTokenCount); ok {
+		avg[fBody] = v / n
 	}
-	return 0
+	if v, ok := s.r.Stat(tsumugi.StatTitleTokenCount); ok {
+		avg[fTitle] = v / n
+	}
+	if v, ok := s.r.Stat(tsumugi.StatURLTokenCount); ok {
+		avg[fURL] = v / n
+	}
+	return avg
 }
 
 // localIDs drops the scores and returns the document ids in list order, the shape
