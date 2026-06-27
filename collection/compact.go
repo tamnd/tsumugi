@@ -50,6 +50,10 @@ func Compact(dir string, shardSize int) (Result, error) {
 	if err := os.MkdirAll(staging, 0o755); err != nil {
 		return Result{}, err
 	}
+	// Recompute the collection-wide PageRank over the reordered set, the same pass
+	// a fresh build runs, so the compacted shards carry the rank as if built whole.
+	ranks := globalRanks(docs)
+
 	res := Result{Docs: len(docs), Hosts: hosts}
 	var base uint32
 	index := 0
@@ -58,7 +62,7 @@ func Compact(dir string, shardSize int) (Result, error) {
 		if hi > len(docs) {
 			hi = len(docs)
 		}
-		n, err := writeShard(shardPath(staging, index), docs[lo:hi], base)
+		n, err := writeShard(shardPath(staging, index), docs[lo:hi], ranks[lo:hi], base)
 		if err != nil {
 			_ = os.RemoveAll(staging)
 			return Result{}, err
