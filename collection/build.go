@@ -115,7 +115,7 @@ func build(opts Options, baseStart uint32, indexStart int) (Result, error) {
 	// real signal exists; each shard then receives its slice of every signal vector
 	// to bake into its feature matrix. The signals are indexed by the same host+url
 	// order the shards are cut from, so sig.slice(lo, hi) lines up with docs[lo:hi].
-	sig := globalSignals(docs, opts.TrustSeeds, opts.SpamSeeds)
+	sig, graphRegion := globalSignals(docs, opts.TrustSeeds, opts.SpamSeeds)
 
 	res := Result{Docs: len(docs), Hosts: hosts}
 	base := baseStart
@@ -134,6 +134,18 @@ func build(opts Options, baseStart uint32, indexStart int) (Result, error) {
 		base += uint32(hi - lo)
 		index++
 		res.Shards++
+	}
+	// Persist the collection-wide link graph as its own artifact, the cross-shard
+	// graph the out-of-core StreamPageRank streams from at scale without buffering
+	// the adjacency. A fresh build's node space is the whole collection from global
+	// id zero (baseStart and indexStart are zero), so the region's dense [0, N) ids
+	// are the collection's global ids directly; an add extends an existing collection
+	// and its union graph is a later milestone's concern, so it leaves the artifact
+	// the original build wrote in place.
+	if baseStart == 0 && indexStart == 0 && len(graphRegion) > 0 {
+		if err := writeCollectionGraph(opts.Out, graphRegion, len(docs)); err != nil {
+			return Result{}, fmt.Errorf("write collection graph: %w", err)
+		}
 	}
 	// Refresh the collection artifact so serve reads the manifest, the fleet-wide
 	// statistics, and the routing index from one file instead of rescanning every

@@ -48,7 +48,9 @@ func buildMultiAndCombined(t testing.TB, limit, shardSize int) (multiDir string,
 		t.Fatalf("combined has %d docs, multi has %d", resC.Docs, resM.Docs)
 	}
 
-	paths, err := filepath.Glob(filepath.Join(combinedDir, "*.tsumugi"))
+	// Match only shard files: a built collection also drops a graph.tsumugi
+	// artifact in the directory, which is not a shard and must not be globbed here.
+	paths, err := filepath.Glob(filepath.Join(combinedDir, "shard-*.tsumugi"))
 	if err != nil || len(paths) != 1 {
 		t.Fatalf("combined shard glob: %v %v", paths, err)
 	}

@@ -31,6 +31,19 @@ func OutDegrees(g *Region) []uint32 {
 	return out
 }
 
+// OutDegreesFromSource fills the resident out-degree array from a callback that
+// reports one node's out-degree, the same uint32-per-node array OutDegrees builds
+// off a *Region. It exists so an mmap-backed InNeighborSource supplies the array
+// without a *Region in hand and without materializing the forward adjacency: a
+// disk-backed source reads only each node's degree code, never expanding the list.
+func OutDegreesFromSource(n int, outDegree func(v int) int) []uint32 {
+	out := make([]uint32, n)
+	for v := 0; v < n; v++ {
+		out[v] = uint32(outDegree(v))
+	}
+	return out
+}
+
 // StreamPageRank computes PageRank out of core: it streams the transpose adjacency
 // one in-list at a time from src and keeps only the two rank vectors and the
 // out-degree array resident, so it never holds the whole adjacency in memory. On the
