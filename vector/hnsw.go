@@ -6,17 +6,19 @@ import (
 	"sort"
 )
 
-// hnswGraph is the in-memory navigable small-world graph. The build distance is
-// the int8 dot over the scalar-quantized rotated vectors, an integer kernel that
-// tracks the exact dot to within a fraction of a percent yet is far cheaper to
-// evaluate the millions of times a build needs, so the edges connect true
-// neighbors and the search needs only a narrow beam. It is the same metric the
-// two-part search navigates with, so build and query agree. The int8 rows are
-// held for the build and dropped after; only the links persist. Each node keeps a
-// neighbor list per layer it reaches.
+// hnswGraph is the in-memory navigable small-world graph. The build distance is a
+// pluggable kernel over the node indices (distFn): the spec builds over the symmetric
+// one-bit Hamming popcount, an order of magnitude cheaper than a float dot and good
+// enough because the graph only has to get the search into the right neighborhood, with
+// the rerank fixing the final order (05 line 402, 406). The int8 dot is the alternative
+// when a measurement shows the popcount build loses too much recall on a corpus. Build
+// and query navigate with the same metric so they agree. Whatever data the distance reads
+// (one-bit codes or int8 rows) is held for the build and dropped after; only the links
+// persist. Each node keeps a neighbor list per layer it reaches.
 type hnswGraph struct {
 	m, m0    int
-	rows     [][]int8  // int8 rotated rows, build distance only
+	n        int
+	distFn   func(a, b int32) float64
 	links    [][]int32 // links[node] holds layer-0 neighbors
 	up       []map[int][]int32
 	entry    int32
@@ -25,22 +27,33 @@ type hnswGraph struct {
 	rng      *rand.Rand
 }
 
-func newHNSW(rows [][]int8, m, m0 int, efConstruction int, seed int64) *hnswGraph {
+// newHNSWDist builds a graph of n nodes over an arbitrary node-to-node distance, smaller
+// nearer. It is the general constructor the builder calls with the chosen build metric.
+func newHNSWDist(n int, distFn func(a, b int32) float64, m, m0, efConstruction int, seed int64) *hnswGraph {
 	g := &hnswGraph{
 		m:        m,
 		m0:       m0,
-		rows:     rows,
-		links:    make([][]int32, len(rows)),
-		up:       make([]map[int][]int32, len(rows)),
+		n:        n,
+		distFn:   distFn,
+		links:    make([][]int32, n),
+		up:       make([]map[int][]int32, n),
 		entry:    -1,
 		maxLayer: 0,
 		ml:       1 / math.Log(float64(m)),
 		rng:      rand.New(rand.NewSource(seed)),
 	}
-	for i := range rows {
+	for i := 0; i < n; i++ {
 		g.insert(int32(i), efConstruction)
 	}
 	return g
+}
+
+// newHNSW builds a graph over the int8 dot of the given rows, the convenience form the
+// tests use. The negated dot makes smaller nearer.
+func newHNSW(rows [][]int8, m, m0 int, efConstruction int, seed int64) *hnswGraph {
+	return newHNSWDist(len(rows), func(a, b int32) float64 {
+		return -float64(dotI8(rows[a], rows[b]))
+	}, m, m0, efConstruction, seed)
 }
 
 // reachableCount returns how many nodes the search can reach from the entry point
@@ -176,10 +189,10 @@ func (g *hnswGraph) repair() int {
 	return reached
 }
 
-// dist is the build metric: smaller is nearer, so it returns the negated int8 dot
-// of the two rows.
+// dist is the build metric: smaller is nearer. It delegates to the pluggable kernel the
+// graph was built with.
 func (g *hnswGraph) dist(a, b int32) float64 {
-	return -float64(dotI8(g.rows[a], g.rows[b]))
+	return g.distFn(a, b)
 }
 
 func (g *hnswGraph) maxAt(layer int) int {

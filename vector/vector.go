@@ -59,6 +59,11 @@ const (
 	// no int8 rerank copy. The asymmetric estimator over the multi-bit code is sharp enough
 	// to rank without it, the half-kilobyte path of spec 05.
 	flagMultibit = 1 << 2
+	// flagSymmetric marks spec doc 05's mode-1 design for the one-bit path: the graph was
+	// built over and is navigated by the symmetric one-bit Hamming popcount (query code
+	// against document code). The final score still comes from the int8 rerank when the
+	// rerank copy is present (two-part), so a symmetric region also carries flagHasRerank.
+	flagSymmetric = 1 << 3
 )
 
 // ErrCorrupt is returned when the region bytes do not parse as a valid VEC1

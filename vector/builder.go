@@ -23,6 +23,7 @@ type Builder struct {
 	normalized     bool
 	rerank         bool
 	codeBits       int
+	symmetric      bool
 	vecs           [][]float32
 }
 
@@ -68,6 +69,17 @@ func (b *Builder) WithCodeBits(bits int) *Builder {
 	}
 	return b
 }
+
+// WithSymmetricWalk selects spec doc 05's mode-1 design for the one-bit path: the graph
+// is built over the symmetric one-bit Hamming popcount and the search walks it with the
+// same popcount (query code against document code), reserving the int8 dot for the final
+// rerank of the candidate set. It is the cheapest walk, a popcount over a few uint64
+// words at each of the thousands of hops, against the int8 dot the default walk uses. It
+// applies only to the one-bit code (the multi-bit no-rerank path has no sign code to
+// popcount and keeps its estimator walk); calling it with multi-bit codes is ignored.
+// The default is off because the int8-dot walk measures higher recall on the gates; this
+// is the knob to trade a little recall for a much cheaper walk and build.
+func (b *Builder) WithSymmetricWalk(on bool) *Builder { b.symmetric = on; return b }
 
 // WithNormalized declares whether the input vectors are unit norm. The default is
 // true, the common case for cosine-trained embeddings, and it lets the region drop
@@ -130,6 +142,12 @@ func (b *Builder) Build() ([]byte, error) {
 	codeStride := codeHdr + codeBytes
 	rerankStride := rdim // power of two, already 8-aligned
 
+	// symmetric is the spec mode-1 design: build over and walk by the one-bit Hamming
+	// popcount. It needs the one-bit sign codes, so it applies only to the one-bit path;
+	// the multi-bit path has no sign code and keeps its estimator walk.
+	symmetric := b.symmetric && !multibit
+	var codeWords [][]uint64
+
 	codesPart := make([]byte, 0, n*codeStride)
 	for i := 0; i < n; i++ {
 		var scalar, norm float32
@@ -141,6 +159,12 @@ func (b *Builder) Build() ([]byte, error) {
 		} else {
 			oc := encodeOneBit(rotated[i])
 			scalar, norm = oc.scalar, oc.norm
+			if symmetric {
+				if codeWords == nil {
+					codeWords = make([][]uint64, n)
+				}
+				codeWords[i] = oc.bits
+			}
 			payload = make([]byte, 0, words*8)
 			for _, word := range oc.bits {
 				payload = codec.AppendUint64(payload, word)
@@ -153,8 +177,10 @@ func (b *Builder) Build() ([]byte, error) {
 		codesPart = append(codesPart, payload...)
 	}
 
-	// The int8 rows are the build distance for the graph regardless of mode; they
-	// are only written to the region when the rerank copy is kept.
+	// The int8 rows are the default build distance and, when the rerank copy is kept, the
+	// rerank vectors; they are computed regardless of build metric and written only when
+	// rerank is on. The symmetric build needs no int8 rows for its distance, but a two-part
+	// symmetric region still stores them for the rerank.
 	rows := make([][]int8, n)
 	for i := 0; i < n; i++ {
 		rows[i] = iq.encode(rotated[i])
@@ -169,7 +195,17 @@ func (b *Builder) Build() ([]byte, error) {
 		}
 	}
 
-	g := newHNSW(rows, b.m, b.m0, b.efConstruction, b.seed)
+	// The build distance is the symmetric one-bit Hamming popcount in mode-1, else the
+	// int8 dot. Both are smaller-is-nearer; Hamming counts disagreeing signs directly, the
+	// int8 dot is negated.
+	var g *hnswGraph
+	if symmetric {
+		g = newHNSWDist(n, func(a, b int32) float64 {
+			return float64(hammingWords(codeWords[a], codeWords[b]))
+		}, b.m, b.m0, b.efConstruction, b.seed)
+	} else {
+		g = newHNSW(rows, b.m, b.m0, b.efConstruction, b.seed)
+	}
 	// Guarantee the connectivity invariant the search relies on: every node must be
 	// reachable from the entry, or the document it holds is invisible to dense search.
 	// repair grafts orphans back in and a single pass reconnects the graph unless an
@@ -197,6 +233,9 @@ func (b *Builder) Build() ([]byte, error) {
 	}
 	if multibit {
 		flags |= flagMultibit
+	}
+	if symmetric {
+		flags |= flagSymmetric
 	}
 	entry := uint32(0)
 	if g.entry >= 0 {
