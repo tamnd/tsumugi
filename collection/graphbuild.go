@@ -30,6 +30,7 @@ type graphSignals struct {
 	reciprocity    []float64
 	hostLinkDiv    []float64
 	nearDup        []float64
+	outboundSpam   []float64
 }
 
 // slice returns the signals for the document range [lo, hi), the slice a single
@@ -48,6 +49,7 @@ func (s graphSignals) slice(lo, hi int) graphSignals {
 		reciprocity:    s.reciprocity[lo:hi],
 		hostLinkDiv:    s.hostLinkDiv[lo:hi],
 		nearDup:        s.nearDup[lo:hi],
+		outboundSpam:   s.outboundSpam[lo:hi],
 	}
 }
 
@@ -268,19 +270,21 @@ func globalSignals(docs []convert.Document, trustSeeds, spamSeeds []string) grap
 	anti := graph.AntiTrustRank(g, spam, cfg)
 	trust := trustSeedSet(g, dir, trustSeeds, anti, cfg)
 	tr := graph.TrustRank(g, trust, cfg)
+	sm := graph.SpamMass(pr, tr, trust)
 
 	return graphSignals{
 		pageRank:       pr,
 		hostRank:       graph.HostRank(g, hostOf, cfg),
 		domainRank:     graph.DomainRank(g, domainOf, cfg),
 		trust:          tr,
-		spamMass:       graph.SpamMass(pr, tr, trust),
+		spamMass:       sm,
 		inDegree:       graph.InDegrees(g),
 		linkingDomains: graph.LinkingDomains(g, domainOf),
 		linkingHosts:   graph.LinkingHosts(g, hostOf),
 		reciprocity:    graph.Reciprocity(g),
 		hostLinkDiv:    graph.HostLinkDiversity(g, hostOf),
 		nearDup:        nearDupPenalties(docs, pr),
+		outboundSpam:   graph.OutboundSpamRatio(g, sm, graph.DefaultSpamThreshold),
 	}
 }
 

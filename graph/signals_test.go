@@ -258,3 +258,44 @@ func TestHostLinkDiversity(t *testing.T) {
 		t.Fatalf("source-only host diversity %g, want 0", div[0])
 	}
 }
+
+// TestOutboundSpamRatio checks the local count of out-links that point at spam: a
+// page all of whose targets are spam scores one, a page half on spam scores a half,
+// a page that links only at clean targets scores zero, and a page with no out-links
+// scores zero.
+func TestOutboundSpamRatio(t *testing.T) {
+	// Targets 3 and 4 are spam (SpamMass above 0.5); 1 and 2 are clean.
+	// 0 -> {1,2,3,4}: half its links are spam.
+	// 5 -> {3,4}: all spam.
+	// 6 -> {1,2}: no spam.
+	// 7 has no out-links.
+	edges := [][2]int{{0, 1}, {0, 2}, {0, 3}, {0, 4}, {5, 3}, {5, 4}, {6, 1}, {6, 2}}
+	g := buildGraph(8, edges)
+	spamMass := []float64{0, 0, 0, 0.9, 0.7, 0, 0, 0}
+	r := OutboundSpamRatio(g, spamMass, DefaultSpamThreshold)
+	if math.Abs(r[0]-0.5) > 1e-12 {
+		t.Fatalf("outbound spam[0]=%g want 0.5 (2 of 4 targets spam)", r[0])
+	}
+	if math.Abs(r[5]-1) > 1e-12 {
+		t.Fatalf("outbound spam[5]=%g want 1 (all targets spam)", r[5])
+	}
+	if r[6] != 0 {
+		t.Fatalf("outbound spam[6]=%g want 0 (no spam targets)", r[6])
+	}
+	if r[7] != 0 {
+		t.Fatalf("outbound spam[7]=%g want 0 (no out-links)", r[7])
+	}
+}
+
+// TestOutboundSpamRatioThreshold checks the cutoff is strict: a target exactly at
+// the threshold does not count, only one above it does.
+func TestOutboundSpamRatioThreshold(t *testing.T) {
+	edges := [][2]int{{0, 1}, {0, 2}}
+	g := buildGraph(3, edges)
+	// Target 1 sits exactly at the threshold, target 2 just above it.
+	spamMass := []float64{0, DefaultSpamThreshold, DefaultSpamThreshold + 0.01}
+	r := OutboundSpamRatio(g, spamMass, DefaultSpamThreshold)
+	if math.Abs(r[0]-0.5) > 1e-12 {
+		t.Fatalf("outbound spam[0]=%g want 0.5 (only the above-threshold target counts)", r[0])
+	}
+}

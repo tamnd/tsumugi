@@ -116,3 +116,17 @@ func BenchmarkHostLinkDiversity(b *testing.B) {
 		_ = HostLinkDiversity(g, hostOf)
 	}
 }
+
+func BenchmarkOutboundSpamRatio(b *testing.B) {
+	const n = 50000
+	g, _ := Open(webLikeGraph(n, 200, 29).Build())
+	// A tenth of the nodes are spam, the rough shape SpamMass produces.
+	spamMass := make([]float64, n)
+	for i := 0; i < n; i += 10 {
+		spamMass[i] = 0.9
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = OutboundSpamRatio(g, spamMass, DefaultSpamThreshold)
+	}
+}
