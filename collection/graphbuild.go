@@ -29,6 +29,7 @@ type graphSignals struct {
 	linkingHosts   []int
 	reciprocity    []float64
 	hostLinkDiv    []float64
+	nearDup        []float64
 }
 
 // slice returns the signals for the document range [lo, hi), the slice a single
@@ -46,6 +47,7 @@ func (s graphSignals) slice(lo, hi int) graphSignals {
 		linkingHosts:   s.linkingHosts[lo:hi],
 		reciprocity:    s.reciprocity[lo:hi],
 		hostLinkDiv:    s.hostLinkDiv[lo:hi],
+		nearDup:        s.nearDup[lo:hi],
 	}
 }
 
@@ -278,6 +280,7 @@ func globalSignals(docs []convert.Document, trustSeeds, spamSeeds []string) grap
 		linkingHosts:   graph.LinkingHosts(g, hostOf),
 		reciprocity:    graph.Reciprocity(g),
 		hostLinkDiv:    graph.HostLinkDiversity(g, hostOf),
+		nearDup:        nearDupPenalties(docs, pr),
 	}
 }
 
