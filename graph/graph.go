@@ -24,7 +24,7 @@ import (
 
 const regionMagic = "GRA1"
 
-const regionVersion = 2
+const regionVersion = 3
 
 // Params tune the adjacency coder. The defaults match the WebGraph settings that
 // land near three bits an edge on a well-ordered web graph: reference within a
@@ -47,14 +47,17 @@ func DefaultParams() Params {
 var ErrCorrupt = errors.New("graph: corrupt region")
 
 // header is the fixed prefix of a graph region. The sub-blobs follow it in the
-// order doc 03 fixes for the region's parts: the id table, the forward adjacency,
-// the forward offsets, the transpose adjacency, and the transpose offsets. The
-// header carries every blob's length so a reader slices them by walking, plus the
-// node_base of the dense-to-global mapping: when the id table is absent
-// (idTableLen == 0) the dense space is a contiguous run of node ids and dense
-// docID d maps to global node id nodeBase+d with no table, the fast path doc 02
-// describes; when the global ids do not line up with the dense order the id table
-// holds the mapping and nodeBase is unused.
+// order doc 03 fixes for the region's four parts: the id table, the forward
+// adjacency (bitstream then offsets), the transpose adjacency (bitstream then
+// offsets), and the cross-shard edge list. The header carries every blob's length
+// so a reader slices them by walking, plus the node_base of the dense-to-global
+// mapping: when the id table is absent (idTableLen == 0) the dense space is a
+// contiguous run of node ids and dense docID d maps to global node id nodeBase+d
+// with no table, the fast path doc 02 describes; when the global ids do not line up
+// with the dense order the id table holds the mapping and nodeBase is unused. The
+// cross-shard edge list (xsLen) holds, per node that has them, the global node ids
+// of its out-neighbors in other shards, gap-encoded; it is empty when the region
+// has no cross-shard edges.
 type header struct {
 	version    uint8
 	params     Params
@@ -66,9 +69,10 @@ type header struct {
 	fwdEFLen   uint64
 	xpAdjLen   uint64
 	xpEFLen    uint64
+	xsLen      uint64
 }
 
-const headerLen = 4 + 1 + 4 + 4 + 8 + 8 + 8 + 8*4 + 4 // magic..crc, see encode
+const headerLen = 4 + 1 + 4 + 4 + 8 + 8 + 8 + 8*5 + 4 // magic..crc, see encode
 
 func (h header) encode() []byte {
 	b := make([]byte, 0, headerLen)
@@ -83,6 +87,7 @@ func (h header) encode() []byte {
 	b = codec.AppendUint64(b, h.fwdEFLen)
 	b = codec.AppendUint64(b, h.xpAdjLen)
 	b = codec.AppendUint64(b, h.xpEFLen)
+	b = codec.AppendUint64(b, h.xsLen)
 	b = codec.AppendUint32(b, codec.CRC32C(b))
 	return b
 }
@@ -108,5 +113,6 @@ func decodeHeader(b []byte) (header, error) {
 	h.fwdEFLen = codec.Uint64(b[45:])
 	h.xpAdjLen = codec.Uint64(b[53:])
 	h.xpEFLen = codec.Uint64(b[61:])
+	h.xsLen = codec.Uint64(b[69:])
 	return h, nil
 }

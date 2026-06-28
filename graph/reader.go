@@ -17,6 +17,7 @@ type Region struct {
 	fwdEF     *ef
 	xpAdj     []byte
 	xpEF      *ef
+	xs        *crossList // nil when the region has no cross-shard edges
 }
 
 // Open parses a graph region from its bytes.
@@ -67,6 +68,18 @@ func Open(b []byte) (*Region, error) {
 	if err != nil {
 		return nil, ErrCorrupt
 	}
+	off = end
+	var xs *crossList
+	if h.xsLen > 0 {
+		end = off + int(h.xsLen)
+		if end > len(b) {
+			return nil, ErrCorrupt
+		}
+		xs, err = decodeCrossList(b[off:end], h.params)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return &Region{
 		params:    h.params,
 		nodeCount: int(h.nodeCount),
@@ -77,6 +90,7 @@ func Open(b []byte) (*Region, error) {
 		fwdEF:     fwdEF,
 		xpAdj:     xpAdj,
 		xpEF:      xpEF,
+		xs:        xs,
 	}, nil
 }
 
@@ -111,8 +125,30 @@ func (g *Region) Dense(global uint64) (int, bool) {
 	return g.idt.dense(global)
 }
 
-// EdgeCount returns the number of directed edges.
+// EdgeCount returns the number of directed edges (the forward adjacency only; the
+// cross-shard edges are counted by CrossEdgeCount).
 func (g *Region) EdgeCount() uint64 { return g.edgeCount }
+
+// CrossNeighbors returns the global node ids of dense docID x's out-neighbors that
+// live in other shards, in ascending order, nil when x has none. These are the far
+// edges the forward adjacency cannot name; RouteCrossEdges resolves them to the
+// shards that own them.
+func (g *Region) CrossNeighbors(x int) []uint64 {
+	if g.xs == nil {
+		return nil
+	}
+	return g.xs.neighbors(x)
+}
+
+// ForEachCrossEdge calls fn with every local source that has far out-edges and its
+// target global ids, in ascending dense-source order. It is the sequential walk the
+// routing join uses, decoding each record once with no random access.
+func (g *Region) ForEachCrossEdge(fn func(source int, targets []uint64)) {
+	if g.xs == nil {
+		return
+	}
+	g.xs.forEach(fn)
+}
 
 // OutNeighbors decodes the out-list (links from x) on demand.
 func (g *Region) OutNeighbors(x int) []int {

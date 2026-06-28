@@ -10,6 +10,7 @@ type Builder struct {
 	out     [][]int32
 	params  Params
 	nodeIDs []uint64
+	cross   []crossEdge
 }
 
 // NewBuilder returns a builder over a dense node space [0, n).
@@ -43,6 +44,18 @@ func (b *Builder) AddEdge(from, to int) {
 	b.out[from] = append(b.out[from], int32(to))
 }
 
+// AddCrossEdge records a far out-edge: a link from local dense docID from to a node
+// in another shard, named by its corpus-stable global node id toGlobal. These do
+// not enter the forward or transpose adjacency (which are keyed by local dense
+// docID); they are framed into the region's cross-shard edge list, to be routed to
+// the owning shard later. Duplicates are dropped at Build.
+func (b *Builder) AddCrossEdge(from int, toGlobal uint64) {
+	if from < 0 || from >= b.n {
+		return
+	}
+	b.cross = append(b.cross, crossEdge{from: from, to: toGlobal})
+}
+
 // Build encodes the forward and transpose planes and frames the region.
 func (b *Builder) Build() []byte {
 	// Sort and dedupe each out-list, count edges.
@@ -67,8 +80,9 @@ func (b *Builder) Build() []byte {
 	xpAdj, xpOff := encodePlane(in, b.params)
 	fwdEF := buildEF(fwdOff).encode()
 	xpEF := buildEF(xpOff).encode()
+	xsBlob := buildCrossBlob(b.cross, b.params)
 
-	return frameRegion(b.n, edges, b.nodeIDs, fwdAdj, fwdEF, xpAdj, xpEF, b.params)
+	return frameRegion(b.n, edges, b.nodeIDs, fwdAdj, fwdEF, xpAdj, xpEF, xsBlob, b.params)
 }
 
 func sortDedup(s []int32) []int32 {
