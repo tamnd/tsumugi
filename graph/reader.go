@@ -79,7 +79,6 @@ func Open(b []byte) (*Region, error) {
 		if err != nil {
 			return nil, err
 		}
-		off = end
 	}
 	return &Region{
 		params:    h.params,
