@@ -54,7 +54,7 @@ func Compact(dir string, shardSize int) (Result, error) {
 	// pass a fresh build runs, so the compacted shards carry the signals as if built
 	// whole. A compact has no seed list to thread through, so it seeds trust from
 	// inverse PageRank alone, the same default a build with no curated seeds uses.
-	sig := globalSignals(docs, nil, nil)
+	sig, graphRegion := globalSignals(docs, nil, nil)
 
 	res := Result{Docs: len(docs), Hosts: hosts}
 	var base uint32
@@ -92,6 +92,14 @@ func Compact(dir string, shardSize int) (Result, error) {
 	}
 	if err := os.RemoveAll(staging); err != nil {
 		return Result{}, err
+	}
+	// A compact rebuilds the whole collection over the reordered set from global id
+	// zero, so refresh the collection-wide graph artifact the same way a fresh build
+	// writes it, keeping the streamed cross-shard graph in step with the new ids.
+	if len(graphRegion) > 0 {
+		if err := writeCollectionGraph(dir, graphRegion, len(docs)); err != nil {
+			return Result{}, fmt.Errorf("write collection graph: %w", err)
+		}
 	}
 	// The shard set changed, so the old artifact's manifest and routing are stale.
 	// Rebuild it over the compacted shards.

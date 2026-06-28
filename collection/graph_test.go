@@ -20,7 +20,7 @@ const ccrawlGraphParquet = "/Users/apple/data/ccrawl/markdown/CC-MAIN-2026-25/00
 // the links as markdown autolinks, the form the crawl export preserves, so the build
 // recovers the graph the same way it would from a real crawl. All pages share a host
 // so they land in one shard, which is what makes the edges intra-shard.
-func writeLinkedJSONL(t *testing.T, dir, name string, spokes int) string {
+func writeLinkedJSONL(t testing.TB, dir, name string, spokes int) string {
 	t.Helper()
 	path := filepath.Join(dir, name)
 	f, err := os.Create(path)
@@ -48,7 +48,7 @@ func writeLinkedJSONL(t *testing.T, dir, name string, spokes int) string {
 	return path
 }
 
-func writeRec(t *testing.T, f *os.File, url, host, body string) {
+func writeRec(t testing.TB, f *os.File, url, host, body string) {
 	t.Helper()
 	// Encode the body as a JSON string so the markdown newline and quotes are safe.
 	line := fmt.Sprintf(`{"url":%q,"host":%q,"markdown":%q}`+"\n", url, host, body)

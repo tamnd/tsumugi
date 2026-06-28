@@ -81,6 +81,16 @@ func buildDir(docs []convert.Document) *mph.Dir {
 // raw URLs sharing a canonical form, one linking the other: the same page) carries
 // no rank and is dropped.
 func buildGraph(docs []convert.Document, dir *mph.Dir) *graph.Region {
+	g, _ := buildGraphRegion(docs, dir)
+	return g
+}
+
+// buildGraphRegion is buildGraph that also returns the encoded region bytes, so the
+// build can persist the very graph it ranks over as the collection-wide graph
+// artifact. The bytes are exactly what graph.Builder.Build produces, the same bytes
+// graph.Open parses here, so the persisted artifact and the in-core region are one
+// graph in two forms.
+func buildGraphRegion(docs []convert.Document, dir *mph.Dir) (*graph.Region, []byte) {
 	gb := graph.NewBuilder(len(docs))
 	for i, d := range docs {
 		for _, tgt := range analyze.Links(d) {
@@ -89,14 +99,15 @@ func buildGraph(docs []convert.Document, dir *mph.Dir) *graph.Region {
 			}
 		}
 	}
-	g, err := graph.Open(gb.Build())
+	region := gb.Build()
+	g, err := graph.Open(region)
 	if err != nil {
 		// NewBuilder().Build() always produces a region graph.Open accepts; a
 		// failure here is a programming error in the graph package, not a data
 		// condition the build can recover from.
 		panic(err)
 	}
-	return g
+	return g, region
 }
 
 // groupings maps each document to a dense host id and a dense domain id, the
@@ -257,13 +268,16 @@ func collectionOrder(docs []convert.Document) []int {
 // serving reads. The seeds follow the spec: curated lists are an input recorded
 // with the build, extended automatically by inverse PageRank and filtered by
 // anti-trust.
-func globalSignals(docs []convert.Document, trustSeeds, spamSeeds []string) graphSignals {
+// It returns the signals and the encoded collection-wide graph region bytes, so the
+// build can persist that graph as the cross-shard graph artifact the out-of-core
+// StreamPageRank streams from at scale, without rebuilding it.
+func globalSignals(docs []convert.Document, trustSeeds, spamSeeds []string) (graphSignals, []byte) {
 	n := len(docs)
 	if n == 0 {
-		return graphSignals{}
+		return graphSignals{}, nil
 	}
 	dir := buildDir(docs)
-	g := buildGraph(docs, dir)
+	g, region := buildGraphRegion(docs, dir)
 	cfg := graph.DefaultPRConfig()
 	hostOf, domainOf := groupings(docs)
 
@@ -292,7 +306,7 @@ func globalSignals(docs []convert.Document, trustSeeds, spamSeeds []string) grap
 	// last so it can read them. It supersedes the per-document static-rank prior the
 	// analyze stage writes.
 	sig.staticRank = compositeStaticRank(docs, sig)
-	return sig
+	return sig, region
 }
 
 // globalRanks computes collection-wide PageRank over the whole link graph and
