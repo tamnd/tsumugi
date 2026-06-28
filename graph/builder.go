@@ -6,9 +6,10 @@ import "sort"
 // arrive as (from, to) dense docID pairs in any order; Build sorts and dedupes
 // each node's out-list, derives the transpose, and codes both planes.
 type Builder struct {
-	n      int
-	out    [][]int32
-	params Params
+	n       int
+	out     [][]int32
+	params  Params
+	nodeIDs []uint64
 }
 
 // NewBuilder returns a builder over a dense node space [0, n).
@@ -19,6 +20,17 @@ func NewBuilder(n int) *Builder {
 // WithParams overrides the adjacency-coder settings before any edges are added.
 func (b *Builder) WithParams(p Params) *Builder {
 	b.params = p
+	return b
+}
+
+// WithNodeIDs supplies the global node id of each dense docID, ids[d] the 64-bit
+// corpus-stable id of dense docID d, so the region carries the dense-to-global
+// identity mapping (a contiguous nodeBase or an explicit id table). The slice has
+// one entry per node. When it is not set the region uses the identity mapping,
+// global id equals dense docID, which is what a self-contained collection graph
+// wants.
+func (b *Builder) WithNodeIDs(ids []uint64) *Builder {
+	b.nodeIDs = ids
 	return b
 }
 
@@ -56,22 +68,7 @@ func (b *Builder) Build() []byte {
 	fwdEF := buildEF(fwdOff).encode()
 	xpEF := buildEF(xpOff).encode()
 
-	h := header{
-		version:   regionVersion,
-		params:    b.params,
-		nodeCount: uint32(b.n),
-		edgeCount: edges,
-		fwdAdjLen: uint64(len(fwdAdj)),
-		fwdEFLen:  uint64(len(fwdEF)),
-		xpAdjLen:  uint64(len(xpAdj)),
-		xpEFLen:   uint64(len(xpEF)),
-	}
-	region := h.encode()
-	region = append(region, fwdAdj...)
-	region = append(region, fwdEF...)
-	region = append(region, xpAdj...)
-	region = append(region, xpEF...)
-	return region
+	return frameRegion(b.n, edges, b.nodeIDs, fwdAdj, fwdEF, xpAdj, xpEF, b.params)
 }
 
 func sortDedup(s []int32) []int32 {

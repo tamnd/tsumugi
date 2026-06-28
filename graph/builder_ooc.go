@@ -31,9 +31,10 @@ import (
 // which is the per-shard case doc 06 says runs in memory. Disk is reached only when
 // the edge count exceeds the threshold, the corpus-wide case.
 type OOCBuilder struct {
-	n      int
-	params Params
-	spillN int // edges held in RAM before a run is spilled
+	n       int
+	params  Params
+	spillN  int      // edges held in RAM before a run is spilled
+	nodeIDs []uint64 // per-dense-docID global node id, nil for the identity mapping
 
 	buf  []oocEdge // current in-RAM batch, sorted and spilled when it reaches spillN
 	runs []string  // spilled run files, each sorted by (from, to)
@@ -58,6 +59,14 @@ func NewOOCBuilder(n int) *OOCBuilder {
 // WithParams overrides the adjacency-coder settings before any edges are added.
 func (b *OOCBuilder) WithParams(p Params) *OOCBuilder {
 	b.params = p
+	return b
+}
+
+// WithNodeIDs supplies the global node id of each dense docID so the region carries
+// the dense-to-global identity mapping, matching Builder.WithNodeIDs. When it is not
+// set the region uses the identity mapping.
+func (b *OOCBuilder) WithNodeIDs(ids []uint64) *OOCBuilder {
+	b.nodeIDs = ids
 	return b
 }
 
@@ -132,7 +141,7 @@ func (b *OOCBuilder) Build() ([]byte, error) {
 
 	fwdEF := buildEF(fwdOff).encode()
 	xpEF := buildEF(xpOff).encode()
-	return frameRegion(b.n, edges, fwdAdj, fwdEF, xpAdj, xpEF, b.params), nil
+	return frameRegion(b.n, edges, b.nodeIDs, fwdAdj, fwdEF, xpAdj, xpEF, b.params), nil
 }
 
 // buildInRAM sorts the buffered edges by source then by target and encodes both
@@ -146,7 +155,7 @@ func (b *OOCBuilder) buildInRAM() []byte {
 	xpAdj, xpOff, _ := encodePlaneWindowed(b.n, b.params, groupSlice(edges, false))
 	fwdEF := buildEF(fwdOff).encode()
 	xpEF := buildEF(xpOff).encode()
-	return frameRegion(b.n, ecount, fwdAdj, fwdEF, xpAdj, xpEF, b.params)
+	return frameRegion(b.n, ecount, b.nodeIDs, fwdAdj, fwdEF, xpAdj, xpEF, b.params)
 }
 
 // spill sorts the current buffer by (from, to) and writes it as a run file.
@@ -334,21 +343,27 @@ func encodePlaneWindowed(n int, p Params, next func() (int, []int32, bool)) (dat
 	return w.finish(), offsets, edges
 }
 
-// frameRegion assembles the GRA1 region header and concatenates the four
-// sub-blobs. Builder.Build and OOCBuilder.Build share it so the framing is one
-// definition.
-func frameRegion(n int, edges uint64, fwdAdj, fwdEF, xpAdj, xpEF []byte, p Params) []byte {
+// frameRegion assembles the GRA1 region header and concatenates the region parts
+// in doc 03's order: the id table (when the global ids need one), the forward
+// adjacency and its offsets, then the transpose adjacency and its offsets.
+// Builder.Build and OOCBuilder.Build share it so the framing is one definition.
+// ids is the per-dense-docID global node id, nil for the identity mapping.
+func frameRegion(n int, edges uint64, ids []uint64, fwdAdj, fwdEF, xpAdj, xpEF []byte, p Params) []byte {
+	nodeBase, idBlob := computeIDTable(n, ids)
 	h := header{
-		version:   regionVersion,
-		params:    p,
-		nodeCount: uint32(n),
-		edgeCount: edges,
-		fwdAdjLen: uint64(len(fwdAdj)),
-		fwdEFLen:  uint64(len(fwdEF)),
-		xpAdjLen:  uint64(len(xpAdj)),
-		xpEFLen:   uint64(len(xpEF)),
+		version:    regionVersion,
+		params:     p,
+		nodeCount:  uint32(n),
+		edgeCount:  edges,
+		idTableLen: uint64(len(idBlob)),
+		nodeBase:   nodeBase,
+		fwdAdjLen:  uint64(len(fwdAdj)),
+		fwdEFLen:   uint64(len(fwdEF)),
+		xpAdjLen:   uint64(len(xpAdj)),
+		xpEFLen:    uint64(len(xpEF)),
 	}
 	region := h.encode()
+	region = append(region, idBlob...)
 	region = append(region, fwdAdj...)
 	region = append(region, fwdEF...)
 	region = append(region, xpAdj...)
