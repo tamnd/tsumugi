@@ -26,6 +26,9 @@ type graphSignals struct {
 	spamMass       []float64
 	inDegree       []int
 	linkingDomains []int
+	linkingHosts   []int
+	reciprocity    []float64
+	hostLinkDiv    []float64
 }
 
 // slice returns the signals for the document range [lo, hi), the slice a single
@@ -40,6 +43,9 @@ func (s graphSignals) slice(lo, hi int) graphSignals {
 		spamMass:       s.spamMass[lo:hi],
 		inDegree:       s.inDegree[lo:hi],
 		linkingDomains: s.linkingDomains[lo:hi],
+		linkingHosts:   s.linkingHosts[lo:hi],
+		reciprocity:    s.reciprocity[lo:hi],
+		hostLinkDiv:    s.hostLinkDiv[lo:hi],
 	}
 }
 
@@ -269,6 +275,9 @@ func globalSignals(docs []convert.Document, trustSeeds, spamSeeds []string) grap
 		spamMass:       graph.SpamMass(pr, tr, trust),
 		inDegree:       graph.InDegrees(g),
 		linkingDomains: graph.LinkingDomains(g, domainOf),
+		linkingHosts:   graph.LinkingHosts(g, hostOf),
+		reciprocity:    graph.Reciprocity(g),
+		hostLinkDiv:    graph.HostLinkDiversity(g, hostOf),
 	}
 }
 

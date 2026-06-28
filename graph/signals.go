@@ -269,6 +269,97 @@ func LinkingDomains(g *Region, domainOf []int) []int {
 	return out
 }
 
+// LinkingHosts returns, per node, the number of distinct hosts among its
+// in-neighbors. hostOf maps a dense node id to a host id. It is the host-level
+// companion of LinkingDomains: a thousand in-links from one host (a sitewide
+// footer link, or a single-host farm) count as one host's opinion repeated, not a
+// thousand independent votes, so this resists the cheap single-host attack that
+// raw in-degree counts at face value.
+func LinkingHosts(g *Region, hostOf []int) []int {
+	out := make([]int, g.nodeCount)
+	for v := 0; v < g.nodeCount; v++ {
+		seen := map[int]struct{}{}
+		for _, u := range g.InNeighbors(v) {
+			if u < len(hostOf) {
+				seen[hostOf[u]] = struct{}{}
+			}
+		}
+		out[v] = len(seen)
+	}
+	return out
+}
+
+// Reciprocity returns, per node, the fraction of v's out-links that point at a
+// node that links back: |Out(v) intersect In(v)| / |Out(v)|. Legitimate linking
+// is mostly one-directional, a page cites a source and the source does not cite
+// back, so high reciprocity is a mild link-farm tell, the "link to me and I link
+// to you" exchange pattern. Both In(v) and Out(v) are read in the one pass. A node
+// with no out-links has reciprocity zero.
+func Reciprocity(g *Region) []float64 {
+	out := make([]float64, g.nodeCount)
+	for v := 0; v < g.nodeCount; v++ {
+		outs := g.OutNeighbors(v)
+		if len(outs) == 0 {
+			continue
+		}
+		in := map[int]struct{}{}
+		for _, u := range g.InNeighbors(v) {
+			in[u] = struct{}{}
+		}
+		hits := 0
+		for _, u := range outs {
+			if _, ok := in[u]; ok {
+				hits++
+			}
+		}
+		out[v] = float64(hits) / float64(len(outs))
+	}
+	return out
+}
+
+// HostLinkDiversity returns, per page, the normalized entropy of its host's
+// inbound source-host distribution: H(source host distribution of In(host)) /
+// log(distinct source hosts). It is computed on the same host graph the host-rank
+// projection builds, where a host's weighted in-edges are exactly its source-host
+// distribution, so the entropy is a sum over those weights and costs almost
+// nothing extra. Each page inherits its host's value the way it inherits host
+// rank. A value near one means the inbound links are spread evenly across many
+// hosts, the natural pattern; near zero means they concentrate on one or two
+// hosts, the farm pattern. It refines the distinct-host count: that says how many
+// hosts link in, this says how evenly. A host with one or zero distinct source
+// hosts has diversity zero.
+func HostLinkDiversity(g *Region, hostOf []int) []float64 {
+	idOf, inEdges, _ := projectGroups(g, hostOf)
+	m := len(idOf)
+	div := make([]float64, m)
+	for v := 0; v < m; v++ {
+		edges := inEdges[v]
+		if len(edges) <= 1 {
+			continue
+		}
+		var total float64
+		for _, e := range edges {
+			total += e.w
+		}
+		if total <= 0 {
+			continue
+		}
+		var h float64
+		for _, e := range edges {
+			p := e.w / total
+			if p > 0 {
+				h -= p * math.Log(p)
+			}
+		}
+		div[v] = h / math.Log(float64(len(edges)))
+	}
+	out := make([]float64, g.nodeCount)
+	for x := 0; x < g.nodeCount; x++ {
+		out[x] = div[idOf[hostOf[x]]]
+	}
+	return out
+}
+
 // HostRank aggregates the page graph up to hosts, runs a weighted PageRank on
 // the host graph dropping intra-host edges, and gives each page its host's rank.
 // Dropping the internal links is what makes host rank resist the internal-link
@@ -290,7 +381,28 @@ func DomainRank(g *Region, domainOf []int, cfg PRConfig) []float64 {
 // run a weighted power iteration, and inherit the group rank back to each page.
 func aggregateRank(g *Region, groupOf []int, cfg PRConfig) []float64 {
 	n := g.nodeCount
-	// Compact group ids to a dense range.
+	idOf, inEdges, outW := projectGroups(g, groupOf)
+	m := len(idOf)
+	if m == 0 {
+		return make([]float64, n)
+	}
+	gr := weightedPageRank(m, inEdges, outW, cfg)
+	out := make([]float64, n)
+	for x := 0; x < n; x++ {
+		out[x] = gr[idOf[groupOf[x]]]
+	}
+	return out
+}
+
+// projectGroups builds the inter-group graph shared by the host and domain
+// signals. It compacts the group ids to a dense range, projects the page edges
+// onto the group graph accumulating inter-group edge weights while dropping
+// intra-group edges, and returns the dense id map plus the weighted in-edges and
+// out-weights per group. The aggregate ranks run a weighted PageRank over the
+// result; host link diversity reads the same in-edge weights as each host's
+// source-host distribution.
+func projectGroups(g *Region, groupOf []int) (map[int]int, [][]wedge, []float64) {
+	n := g.nodeCount
 	idOf := map[int]int{}
 	for x := 0; x < n; x++ {
 		gid := groupOf[x]
@@ -300,10 +412,9 @@ func aggregateRank(g *Region, groupOf []int, cfg PRConfig) []float64 {
 	}
 	m := len(idOf)
 	if m == 0 {
-		return make([]float64, n)
+		return idOf, nil, nil
 	}
 
-	// Weighted inter-group edges, accumulated from the page edges.
 	type key struct{ u, v int }
 	w := map[key]float64{}
 	for u := 0; u < n; u++ {
@@ -317,20 +428,13 @@ func aggregateRank(g *Region, groupOf []int, cfg PRConfig) []float64 {
 		}
 	}
 
-	// Group in-edges and out-weights for the weighted iteration.
 	inEdges := make([][]wedge, m)
 	outW := make([]float64, m)
 	for k, weight := range w {
 		inEdges[k.v] = append(inEdges[k.v], wedge{u: k.u, w: weight})
 		outW[k.u] += weight
 	}
-
-	gr := weightedPageRank(m, inEdges, outW, cfg)
-	out := make([]float64, n)
-	for x := 0; x < n; x++ {
-		out[x] = gr[idOf[groupOf[x]]]
-	}
-	return out
+	return idOf, inEdges, outW
 }
 
 type wedge struct {

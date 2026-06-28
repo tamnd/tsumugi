@@ -78,3 +78,41 @@ func BenchmarkPageRank(b *testing.B) {
 		_ = PageRank(g, cfg)
 	}
 }
+
+// hostsOf derives the contiguous-host labeling webLikeGraph builds: ids are
+// grouped into hosts of hostSize, the same grouping the build's host signals see.
+func hostsOf(n, hostSize int) []int {
+	h := make([]int, n)
+	for u := 0; u < n; u++ {
+		h[u] = u / hostSize
+	}
+	return h
+}
+
+func BenchmarkLinkingHosts(b *testing.B) {
+	const n, hostSize = 50000, 200
+	g, _ := Open(webLikeGraph(n, hostSize, 17).Build())
+	hostOf := hostsOf(n, hostSize)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = LinkingHosts(g, hostOf)
+	}
+}
+
+func BenchmarkReciprocity(b *testing.B) {
+	g, _ := Open(webLikeGraph(50000, 200, 19).Build())
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = Reciprocity(g)
+	}
+}
+
+func BenchmarkHostLinkDiversity(b *testing.B) {
+	const n, hostSize = 50000, 200
+	g, _ := Open(webLikeGraph(n, hostSize, 23).Build())
+	hostOf := hostsOf(n, hostSize)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = HostLinkDiversity(g, hostOf)
+	}
+}

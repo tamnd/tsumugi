@@ -81,6 +81,49 @@ func TestGlobalSignalsCrossHost(t *testing.T) {
 	}
 }
 
+// TestGlobalLinkCountSignals proves the collection pass computes the distinct
+// linking-host count, reciprocity, and host link diversity, not just the domain
+// count. The fixture is a hub on host a fed by ten spokes that all live on host b,
+// so the hub draws ten in-links from a single host: its in-degree is ten but its
+// distinct linking-host count is one, exactly the single-host collapse the count
+// exists to expose.
+func TestGlobalLinkCountSignals(t *testing.T) {
+	const spokes = 10
+	docs := crossHostDocs(spokes)
+	sig := globalSignals(docs, nil, nil)
+
+	if len(sig.linkingHosts) != len(docs) {
+		t.Fatalf("linking hosts length %d != docs %d", len(sig.linkingHosts), len(docs))
+	}
+	// Ten spokes, all on host b, so the hub counts a single distinct linking host.
+	if sig.linkingHosts[0] != 1 {
+		t.Fatalf("hub linking hosts = %d, want 1", sig.linkingHosts[0])
+	}
+	if sig.linkingHosts[1] != 0 {
+		t.Fatalf("lonely page linking hosts = %d, want 0", sig.linkingHosts[1])
+	}
+	// The crawl is one-directional (spokes link the hub, the hub links nobody), so
+	// reciprocity is zero everywhere and bounded in [0,1].
+	for i, v := range sig.reciprocity {
+		if v < 0 || v > 1 {
+			t.Fatalf("reciprocity at %d = %g, out of [0,1]", i, v)
+		}
+	}
+	if sig.reciprocity[2] != 0 {
+		t.Fatalf("spoke reciprocity = %g, want 0 (its one out-link is not reciprocated)", sig.reciprocity[2])
+	}
+	// Host diversity is a normalized entropy, bounded in [0,1]. The hub's host draws
+	// from one source host, so its diversity is zero.
+	for i, v := range sig.hostLinkDiv {
+		if v < 0 || v > 1.0000001 {
+			t.Fatalf("host link diversity at %d = %g, out of [0,1]", i, v)
+		}
+	}
+	if sig.hostLinkDiv[0] != 0 {
+		t.Fatalf("single-source host diversity = %g, want 0", sig.hostLinkDiv[0])
+	}
+}
+
 // TestBuildBakesGraphSignals proves the cross-shard link signals reach the feature
 // matrix serving reads, not just PageRank. A shard size of two cuts host a (hub plus
 // lonely page) into shard 0 and the spokes on host b into shard 1, so host rank,
@@ -233,15 +276,36 @@ func TestGraphSignalsOnCCrawl(t *testing.T) {
 			t.Fatalf("spam mass at %d = %g, out of [0,1]", i, v)
 		}
 	}
-	var totIn, totLD int
+	var totIn, totLD, totLH int
 	for i := range docs {
-		if sig.inDegree[i] < 0 || sig.linkingDomains[i] < 0 {
+		if sig.inDegree[i] < 0 || sig.linkingDomains[i] < 0 || sig.linkingHosts[i] < 0 {
 			t.Fatalf("negative count at %d", i)
+		}
+		// A document cannot have more distinct linking hosts than distinct linking
+		// domains is false in general (a domain has many hosts), but it cannot have
+		// more linking hosts than raw in-links, and not more linking domains than
+		// linking hosts (each host rolls up into one domain).
+		if sig.linkingHosts[i] > sig.inDegree[i] {
+			t.Fatalf("linking hosts %d at %d exceeds in-degree %d", sig.linkingHosts[i], i, sig.inDegree[i])
+		}
+		if sig.linkingDomains[i] > sig.linkingHosts[i] {
+			t.Fatalf("linking domains %d at %d exceeds linking hosts %d", sig.linkingDomains[i], i, sig.linkingHosts[i])
 		}
 		totIn += sig.inDegree[i]
 		totLD += sig.linkingDomains[i]
+		totLH += sig.linkingHosts[i]
 	}
-	t.Logf("docs=%d totalInDegree=%d totalLinkingDomains=%d", len(docs), totIn, totLD)
+	for i, v := range sig.reciprocity {
+		if v < 0 || v > 1 {
+			t.Fatalf("reciprocity at %d = %g, out of [0,1]", i, v)
+		}
+	}
+	for i, v := range sig.hostLinkDiv {
+		if v < 0 || v > 1.0000001 {
+			t.Fatalf("host link diversity at %d = %g, out of [0,1]", i, v)
+		}
+	}
+	t.Logf("docs=%d totalInDegree=%d totalLinkingDomains=%d totalLinkingHosts=%d", len(docs), totIn, totLD, totLH)
 }
 
 // TestStreamPageRankMatchesCollectionInCore is the real-data gate for the

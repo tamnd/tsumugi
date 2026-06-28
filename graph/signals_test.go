@@ -187,3 +187,74 @@ func TestHostRank(t *testing.T) {
 		t.Fatalf("same-host nodes differ: %g vs %g", hr[0], hr[1])
 	}
 }
+
+// TestLinkingHosts checks distinct-host counting collapses many links from one
+// host to a single vote, the host-level companion of distinct linking domains.
+func TestLinkingHosts(t *testing.T) {
+	// 0,1,2 are host 0; 3 is host 1; 4 is host 2. All but 4 link to 5.
+	hostOf := []int{0, 0, 0, 1, 2, 3}
+	edges := [][2]int{{0, 5}, {1, 5}, {2, 5}, {3, 5}}
+	g := buildGraph(6, edges)
+	lh := LinkingHosts(g, hostOf)
+	if lh[5] != 2 {
+		t.Fatalf("linking hosts of 5 = %d, want 2 (host 0 and host 1)", lh[5])
+	}
+	if lh[0] != 0 {
+		t.Fatalf("linking hosts of 0 = %d, want 0 (no in-links)", lh[0])
+	}
+}
+
+// TestReciprocity checks the back-link fraction: a node whose out-links all point
+// at nodes that link back scores one, a purely one-directional node scores zero.
+func TestReciprocity(t *testing.T) {
+	// 0<->1 mutual; 0->2 one-way; 3->0 one-way (3 has no back-link from 0).
+	edges := [][2]int{{0, 1}, {1, 0}, {0, 2}, {3, 0}}
+	g := buildGraph(4, edges)
+	rc := Reciprocity(g)
+	// Out(0) = {1,2}, In(0) = {1,3}; intersection {1}, so 1/2.
+	if math.Abs(rc[0]-0.5) > 1e-12 {
+		t.Fatalf("reciprocity[0]=%g want 0.5", rc[0])
+	}
+	// Out(1) = {0}, In(1) = {0}; intersection {0}, so 1.
+	if math.Abs(rc[1]-1) > 1e-12 {
+		t.Fatalf("reciprocity[1]=%g want 1", rc[1])
+	}
+	// Out(3) = {0}, In(3) = {}; so 0.
+	if rc[3] != 0 {
+		t.Fatalf("reciprocity[3]=%g want 0", rc[3])
+	}
+	// Node 2 has no out-links, so reciprocity is zero by definition.
+	if rc[2] != 0 {
+		t.Fatalf("reciprocity[2]=%g want 0 (no out-links)", rc[2])
+	}
+}
+
+// TestHostLinkDiversity checks the normalized source-host entropy: a host whose
+// inbound links spread evenly across many source hosts scores near one, a host fed
+// mostly from a single source host scores lower, and a host fed from one source
+// host scores zero.
+func TestHostLinkDiversity(t *testing.T) {
+	// Hosts: A=0 (nodes 0,1,2,3), B=4 (node 4), C=5 (node 5), D=6 (node 6),
+	// E=7 (node 7).
+	// Even target: host B (node 4) gets one cross-host link each from A, C, D, E.
+	// Skewed target: host C (node 5) gets three links from A and one from D.
+	hostOf := []int{0, 0, 0, 0, 1, 2, 3, 4}
+	edges := [][2]int{
+		{0, 4}, {5, 4}, {6, 4}, {7, 4}, // B fed evenly by A,C,D,E
+		{1, 5}, {2, 5}, {3, 5}, {6, 5}, // C fed mostly by A (3) plus D (1)
+	}
+	g := buildGraph(8, edges)
+	div := HostLinkDiversity(g, hostOf)
+	// B inherits to node 4, C inherits to node 5. Even beats skewed.
+	if div[4] <= div[5] {
+		t.Fatalf("even host diversity %g not above skewed %g", div[4], div[5])
+	}
+	// B has four equal source hosts, so normalized entropy is one.
+	if math.Abs(div[4]-1) > 1e-9 {
+		t.Fatalf("even host diversity %g, want 1", div[4])
+	}
+	// A host (node 0..3 in host A) gets no inbound cross-host links, diversity zero.
+	if div[0] != 0 {
+		t.Fatalf("source-only host diversity %g, want 0", div[0])
+	}
+}
