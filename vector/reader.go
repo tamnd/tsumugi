@@ -24,7 +24,7 @@ type Region struct {
 	// codeBits levels packed LSB-first instead of one sign bit, and there is no int8 copy.
 	// codeBytes is the payload length after the scalar and optional norm, words*8 for the
 	// one-bit code and ceil(rdim*codeBits/8) for the multi-bit code.
-	multibit  bool
+	multibit bool
 	// symmetric is spec doc 05's mode-1 walk: the graph was built over and is navigated by
 	// the one-bit Hamming popcount (query code against document code) rather than the int8
 	// dot. It applies only to the one-bit path; the int8 rerank still scores the candidates.
