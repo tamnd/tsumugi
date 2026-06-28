@@ -54,7 +54,10 @@ func Compact(dir string, shardSize int) (Result, error) {
 	// pass a fresh build runs, so the compacted shards carry the signals as if built
 	// whole. A compact has no seed list to thread through, so it seeds trust from
 	// inverse PageRank alone, the same default a build with no curated seeds uses.
-	sig, graphRegion := globalSignals(docs, nil, nil)
+	sig, graphRegion, urlDir := globalSignals(docs, nil, nil)
+	// Reassign the partition global node ids over the reordered set, the same id the
+	// shards a fresh build writes carry as their graph id table.
+	gids := AssignGlobalIDs(docs, DefaultPartitionParams())
 
 	res := Result{Docs: len(docs), Hosts: hosts}
 	var base uint32
@@ -64,7 +67,7 @@ func Compact(dir string, shardSize int) (Result, error) {
 		if hi > len(docs) {
 			hi = len(docs)
 		}
-		n, err := writeShard(shardPath(staging, index), docs[lo:hi], sig.slice(lo, hi), base)
+		n, err := writeShard(shardPath(staging, index), docs[lo:hi], sig.slice(lo, hi), base, lo, gids, urlDir)
 		if err != nil {
 			_ = os.RemoveAll(staging)
 			return Result{}, err
