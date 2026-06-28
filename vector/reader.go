@@ -25,6 +25,10 @@ type Region struct {
 	// codeBytes is the payload length after the scalar and optional norm, words*8 for the
 	// one-bit code and ceil(rdim*codeBits/8) for the multi-bit code.
 	multibit  bool
+	// symmetric is spec doc 05's mode-1 walk: the graph was built over and is navigated by
+	// the one-bit Hamming popcount (query code against document code) rather than the int8
+	// dot. It applies only to the one-bit path; the int8 rerank still scores the candidates.
+	symmetric bool
 	codeBits  int
 	codeBytes int
 	// bitsOff is where a code row's sign words start, after the float16 scalar and the
@@ -85,6 +89,7 @@ func Open(b []byte) (*Region, error) {
 	words := rdim / 64
 	stride := int(h.codeStride)
 	multibit := h.flags&flagMultibit != 0
+	symmetric := h.flags&flagSymmetric != 0
 	codeBits := int(h.codeBits)
 	// codeBytes is the per-dimension payload after the scalar and optional norm: the words
 	// sign blocks for the one-bit code, ceil(rdim*codeBits/8) packed levels for multi-bit.
@@ -116,6 +121,7 @@ func Open(b []byte) (*Region, error) {
 		words:         words,
 		stride:        stride,
 		multibit:      multibit,
+		symmetric:     symmetric,
 		codeBits:      codeBits,
 		codeBytes:     codeBytes,
 		bitsOff:       bitsOff,
@@ -241,12 +247,21 @@ func (r *Region) Search(query []float32, k, efSearch, rerankDepth int) []Result 
 }
 
 // navDist returns the navigation metric for the walk, where smaller is nearer.
-// In the two-part mode it negates the int8 dot, the sharp copy the region already
-// stores (it tracks the true dot far better than the one-bit code), so a narrow
-// beam over the graph lands on the true neighbors. In the no-rerank mode there is
-// no int8 copy, so it falls back to the negated asymmetric RaBitQ estimate over
-// the one-bit code.
+// In the symmetric mode (spec doc 05 mode-1) it is the one-bit Hamming popcount of
+// the query code against each document code, the cheapest walk, taking priority over
+// the int8 dot even when the rerank copy is present because the graph was built over
+// the same popcount and the two must agree. In the two-part mode it negates the int8
+// dot, the sharp copy the region already stores (it tracks the true dot far better
+// than the one-bit code), so a narrow beam over the graph lands on the true neighbors.
+// In the no-rerank mode there is no int8 copy, so it falls back to the negated
+// asymmetric RaBitQ estimate over the one-bit code.
 func (r *Region) navDist(qRot []float32, qc queryCode) func(int32) float64 {
+	if r.symmetric {
+		qbits := encodeQueryBits(qRot)
+		return func(node int32) float64 {
+			return float64(hammingBytes(r.rowBits(node), qbits.bits))
+		}
+	}
 	if r.hasRerank {
 		qi8 := r.iq.encodeQuery(qRot)
 		rdim := int(r.h.rdim)
