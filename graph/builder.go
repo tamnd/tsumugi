@@ -90,7 +90,10 @@ func sortDedup(s []int32) []int32 {
 }
 
 // encodePlane codes every node's adjacency list back to back and returns the
-// bitstream bytes and the N+1 bit offsets where each record starts.
+// bitstream bytes and the N+1 bit offsets where each record starts. It is the
+// in-RAM path: the whole plane is resident as a slice. The out-of-core builder
+// shares the same record coding through encodeNodeCore, fed from a sliding window
+// instead of the full slice, so both paths emit byte-identical bytes.
 func encodePlane(lists [][]int32, p Params) (data []byte, offsets []uint64) {
 	w := &bitWriter{}
 	n := len(lists)
@@ -98,7 +101,11 @@ func encodePlane(lists [][]int32, p Params) (data []byte, offsets []uint64) {
 	refDepth := make([]int, n)
 	for x := 0; x < n; x++ {
 		offsets[x] = w.bits
-		encodeNode(w, lists, x, p, refDepth)
+		// The window back-references are slice lookups against the resident plane.
+		xx := x
+		listAt := func(back int) []int32 { return lists[xx-back] }
+		depthAt := func(back int) int { return refDepth[xx-back] }
+		refDepth[x] = encodeNodeCore(w, x, lists[x], listAt, depthAt, p)
 	}
 	offsets[n] = w.bits
 	return w.finish(), offsets
@@ -109,30 +116,35 @@ type interval struct {
 	length int
 }
 
-// encodeNode writes one node's adjacency record: degree, optional reference and
-// copy mask, intervals of consecutive ids, and the remaining residual gaps.
-func encodeNode(w *bitWriter, lists [][]int32, x int, p Params, refDepth []int) {
-	s := lists[x]
+// encodeNodeCore writes one node's adjacency record: degree, optional reference
+// and copy mask, intervals of consecutive ids, and the remaining residual gaps.
+// It reaches prior nodes only through listAt(back) and depthAt(back), the list
+// and reference depth of node x-back, so it does not require the full plane to be
+// resident: a streaming encoder can serve those from a window of the last Window
+// records. It returns the reference depth to record for node x. The two callers
+// (the resident encodePlane and the windowed out-of-core encoder) share this body
+// so their bitstreams are identical for the same lists.
+func encodeNodeCore(w *bitWriter, x int, s []int32, listAt func(back int) []int32, depthAt func(back int) int, p Params) (depth int) {
 	d := len(s)
 	w.writeGamma(uint64(d))
 	if d == 0 {
-		return
+		return 0
 	}
 
 	// Reference: pick the node within the window whose list shares the most
 	// elements with this one, if any, and copy those.
-	r, copyBits := chooseReference(lists, x, s, p, refDepth)
+	r, copyBits := chooseReferenceCore(x, s, listAt, depthAt, p)
 	w.writeGamma(uint64(r))
 	var copied []int32
 	if r > 0 {
-		ref := lists[x-r]
+		ref := listAt(r)
 		runs := boolRuns(copyBits)
 		w.writeGamma(uint64(len(runs)))
 		for _, rl := range runs {
 			w.writeGamma(uint64(rl))
 		}
 		copied = applyRuns(ref, runs)
-		refDepth[x] = refDepth[x-r] + 1
+		depth = depthAt(r) + 1
 	}
 
 	// What the copy did not cover.
@@ -162,27 +174,31 @@ func encodeNode(w *bitWriter, lists [][]int32, x int, p Params, refDepth []int) 
 		}
 		prev = int(v)
 	}
+	return depth
 }
 
-// chooseReference finds the best node to copy from within the window, subject to
-// the reference-chain cap. It returns the back distance and the per-element copy
-// mask over that node's list, or 0 and nil when no node shares an element.
-func chooseReference(lists [][]int32, x int, s []int32, p Params, refDepth []int) (int, []bool) {
-	lo := x - p.Window
-	if lo < 0 {
-		lo = 0
+// chooseReferenceCore finds the best node to copy from within the window, subject
+// to the reference-chain cap. It scans back distances 1..Window (closest first,
+// so the smallest back distance wins a tie under the strict comparison) through
+// the listAt and depthAt accessors, and returns the back distance and the
+// per-element copy mask over that node's list, or 0 and nil when no node in the
+// window shares an element.
+func chooseReferenceCore(x int, s []int32, listAt func(back int) []int32, depthAt func(back int) int, p Params) (int, []bool) {
+	maxBack := p.Window
+	if x < maxBack {
+		maxBack = x
 	}
 	best := 0
 	bestR := 0
 	var bestMask []bool
-	for y := x - 1; y >= lo; y-- {
-		if refDepth[y] >= p.MaxRef {
+	for back := 1; back <= maxBack; back++ {
+		if depthAt(back) >= p.MaxRef {
 			continue
 		}
-		mask, cnt := copyMask(lists[y], s)
+		mask, cnt := copyMask(listAt(back), s)
 		if cnt > best {
 			best = cnt
-			bestR = x - y
+			bestR = back
 			bestMask = mask
 		}
 	}

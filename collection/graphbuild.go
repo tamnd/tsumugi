@@ -87,11 +87,16 @@ func buildGraph(docs []convert.Document, dir *mph.Dir) *graph.Region {
 
 // buildGraphRegion is buildGraph that also returns the encoded region bytes, so the
 // build can persist the very graph it ranks over as the collection-wide graph
-// artifact. The bytes are exactly what graph.Builder.Build produces, the same bytes
-// graph.Open parses here, so the persisted artifact and the in-core region are one
-// graph in two forms.
+// artifact. The collection graph is the corpus-scale one (every shard's nodes, not
+// a single shard's), so it is built out of core: the OOC builder streams the edges
+// to sorted run files and encodes both planes from a merge, never materializing the
+// full forward and transpose adjacency, which at two billion nodes would not fit.
+// Below the spill threshold (the common case today) it stays entirely in RAM. The
+// bytes are byte-identical to graph.Builder.Build over the same edges, the same
+// bytes graph.Open parses here, so the persisted artifact and the in-core region
+// are one graph in two forms.
 func buildGraphRegion(docs []convert.Document, dir *mph.Dir) (*graph.Region, []byte) {
-	gb := graph.NewBuilder(len(docs))
+	gb := graph.NewOOCBuilder(len(docs))
 	for i, d := range docs {
 		for _, tgt := range analyze.Links(d) {
 			if j, ok := dir.Lookup([]byte(tgt)); ok && int(j) != i {
@@ -99,12 +104,17 @@ func buildGraphRegion(docs []convert.Document, dir *mph.Dir) (*graph.Region, []b
 			}
 		}
 	}
-	region := gb.Build()
+	region, err := gb.Build()
+	if err != nil {
+		// The only error path is a disk failure spilling or merging run files; the
+		// in-RAM path cannot fail. The build cannot proceed without its graph.
+		panic(err)
+	}
 	g, err := graph.Open(region)
 	if err != nil {
-		// NewBuilder().Build() always produces a region graph.Open accepts; a
-		// failure here is a programming error in the graph package, not a data
-		// condition the build can recover from.
+		// The builder always produces a region graph.Open accepts; a failure here is
+		// a programming error in the graph package, not a data condition the build
+		// can recover from.
 		panic(err)
 	}
 	return g, region
