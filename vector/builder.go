@@ -22,6 +22,7 @@ type Builder struct {
 	efConstruction int
 	normalized     bool
 	rerank         bool
+	codeBits       int
 	vecs           [][]float32
 }
 
@@ -35,6 +36,7 @@ func NewBuilder(dim int) *Builder {
 		efConstruction: DefaultEfConstruction,
 		normalized:     true,
 		rerank:         true,
+		codeBits:       1,
 	}
 }
 
@@ -50,6 +52,22 @@ func (b *Builder) WithHNSW(m, m0, efConstruction int) *Builder {
 // WithRerank toggles the int8 rerank copy. With it off the region is the
 // no-rerank one-bit form and the search scores with the RaBitQ estimator.
 func (b *Builder) WithRerank(on bool) *Builder { b.rerank = on; return b }
+
+// WithCodeBits selects the codes-part width. The default of one is the RaBitQ one-bit
+// code, which pairs with the int8 rerank copy for the two-part search. Four or five
+// selects the Extended-RaBitQ no-rerank form: each dimension is quantized to that many
+// bits, the asymmetric estimator over the wider code ranks sharply on its own, and the
+// int8 rerank copy is dropped (so this also turns rerank off). Five bits is retrieval
+// grade, four is the smaller, faster trade. Any value other than 1, 4, or 5 is rejected
+// at Build time. The wider code costs about half a kilobyte per vector against the one-bit
+// code's tens of bytes, the memory the no-rerank knob spends to skip the int8 copy.
+func (b *Builder) WithCodeBits(bits int) *Builder {
+	b.codeBits = bits
+	if bits > 1 {
+		b.rerank = false
+	}
+	return b
+}
 
 // WithNormalized declares whether the input vectors are unit norm. The default is
 // true, the common case for cosine-trained embeddings, and it lets the region drop
@@ -69,17 +87,19 @@ func (b *Builder) Add(vec []float32) {
 // only if the graph cannot be made fully reachable from the entry point, which the
 // orphan repair below prevents on any normal corpus.
 func (b *Builder) Build() ([]byte, error) {
+	if b.codeBits != 1 && b.codeBits != 4 && b.codeBits != 5 {
+		return nil, fmt.Errorf("vector: code bits %d not supported, want 1, 4, or 5", b.codeBits)
+	}
+	multibit := b.codeBits > 1
 	rot := newRotator(b.dim, b.seed)
 	rdim := rot.rdim
 	n := len(b.vecs)
 
 	rotated := make([][]float32, n)
-	codes := make([]oneBitCode, n)
 	var maxAbs float64
 	for i, v := range b.vecs {
 		oRot := rot.rotate(v)
 		rotated[i] = oRot
-		codes[i] = encodeOneBit(oRot)
 		for _, x := range oRot {
 			if a := math.Abs(float64(x)); a > maxAbs {
 				maxAbs = a
@@ -95,25 +115,42 @@ func (b *Builder) Build() ([]byte, error) {
 	words := rdim / 64
 	// Each code row is a float16 scalar (2 bytes), an optional float16 norm (2 bytes,
 	// dropped when the vectors are normalized because the norm is then a constant one),
-	// then the words sign blocks. The sign words are read byte-wise (codec.Uint64), so
-	// the row needs no eight-byte alignment and the half-width scalars are pure savings
-	// against the four-byte float32 the budget would otherwise carry.
+	// then the per-dimension code payload. The one-bit code packs that as words sign
+	// blocks; the multi-bit code packs codeBits levels per dimension, LSB first, into
+	// ceil(rdim*codeBits/8) bytes. Either payload is read byte-wise, so the row needs no
+	// eight-byte alignment and the half-width scalars are pure savings against float32.
 	codeHdr := 2
 	if !b.normalized {
 		codeHdr = 4
 	}
-	codeStride := codeHdr + words*8
+	codeBytes := words * 8
+	if multibit {
+		codeBytes = (rdim*b.codeBits + 7) / 8
+	}
+	codeStride := codeHdr + codeBytes
 	rerankStride := rdim // power of two, already 8-aligned
 
 	codesPart := make([]byte, 0, n*codeStride)
 	for i := 0; i < n; i++ {
-		codesPart = codec.AppendUint16(codesPart, codec.Float16bits(codes[i].scalar))
+		var scalar, norm float32
+		var payload []byte
+		if multibit {
+			mc := encodeMulti(rotated[i], b.codeBits)
+			scalar, norm = mc.scalar, mc.norm
+			payload = packLevels(mc.levels, b.codeBits)
+		} else {
+			oc := encodeOneBit(rotated[i])
+			scalar, norm = oc.scalar, oc.norm
+			payload = make([]byte, 0, words*8)
+			for _, word := range oc.bits {
+				payload = codec.AppendUint64(payload, word)
+			}
+		}
+		codesPart = codec.AppendUint16(codesPart, codec.Float16bits(scalar))
 		if !b.normalized {
-			codesPart = codec.AppendUint16(codesPart, codec.Float16bits(codes[i].norm))
+			codesPart = codec.AppendUint16(codesPart, codec.Float16bits(norm))
 		}
-		for _, w := range codes[i].bits {
-			codesPart = codec.AppendUint64(codesPart, w)
-		}
+		codesPart = append(codesPart, payload...)
 	}
 
 	// The int8 rows are the build distance for the graph regardless of mode; they
@@ -158,6 +195,9 @@ func (b *Builder) Build() ([]byte, error) {
 	if b.rerank {
 		flags |= flagHasRerank
 	}
+	if multibit {
+		flags |= flagMultibit
+	}
 	entry := uint32(0)
 	if g.entry >= 0 {
 		entry = uint32(g.entry)
@@ -165,6 +205,7 @@ func (b *Builder) Build() ([]byte, error) {
 
 	h := header{
 		version:        regionVersion,
+		codeBits:       uint8(b.codeBits),
 		flags:          flags,
 		dimKept:        uint32(b.dim),
 		rdim:           uint32(rdim),

@@ -54,6 +54,11 @@ const (
 const (
 	flagNormalized = 1 << 0
 	flagHasRerank  = 1 << 1
+	// flagMultibit marks the Extended-RaBitQ no-rerank form: the codes part holds
+	// codeBits-wide quantized levels per dimension instead of one sign bit, and there is
+	// no int8 rerank copy. The asymmetric estimator over the multi-bit code is sharp enough
+	// to rank without it, the half-kilobyte path of spec 05.
+	flagMultibit = 1 << 2
 )
 
 // ErrCorrupt is returned when the region bytes do not parse as a valid VEC1
@@ -71,6 +76,7 @@ var ErrUnreachable = errors.New("vector: graph not fully reachable from entry")
 // (codes, int8 rerank, links) follow it in order at the recorded lengths.
 type header struct {
 	version        uint8
+	codeBits       uint8
 	flags          uint32
 	dimKept        uint32
 	rdim           uint32
@@ -94,7 +100,10 @@ const headerLen = 92
 func (h header) encode() []byte {
 	b := make([]byte, 0, headerLen)
 	b = append(b, regionMagic...)
-	b = append(b, h.version, 0, 0, 0)
+	// byte 5 carries codeBits (1 for the one-bit code, 4 or 5 for the multi-bit code); the
+	// two bytes after stay reserved. The old version stored a zero here, which decodes as
+	// codeBits 0 and is normalized to 1, so the field is backward compatible.
+	b = append(b, h.version, h.codeBits, 0, 0)
 	b = codec.AppendUint32(b, h.flags)
 	b = codec.AppendUint32(b, h.dimKept)
 	b = codec.AppendUint32(b, h.rdim)
@@ -126,6 +135,10 @@ func decodeHeader(b []byte) (header, error) {
 	h.version = b[4]
 	if h.version != regionVersion {
 		return header{}, ErrCorrupt
+	}
+	h.codeBits = b[5]
+	if h.codeBits == 0 {
+		h.codeBits = 1
 	}
 	h.flags = codec.Uint32(b[8:])
 	h.dimKept = codec.Uint32(b[12:])
