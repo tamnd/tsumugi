@@ -56,6 +56,105 @@ func newHNSW(rows [][]int8, m, m0 int, efConstruction int, seed int64) *hnswGrap
 	}, m, m0, efConstruction, seed)
 }
 
+// newHNSWInc returns an empty graph for incremental inserts, the form the delta buffer
+// uses (05 "The delta buffer", line 998: the delta's HNSW is built one insert per new
+// document with the same insert routine the full build uses). distFn must read whatever
+// per-node data the caller grows in lockstep with addNode, since insert reads it during
+// the descent. No repair pass runs on the delta: it is small, queried under the same lock
+// that mutates it, and folded into the immutable region on compaction before it could
+// accumulate the near-duplicate islands the immutable build repairs.
+func newHNSWInc(distFn func(a, b int32) float64, m, m0, efConstruction int, seed int64) *hnswGraph {
+	return &hnswGraph{
+		m:        m,
+		m0:       m0,
+		n:        0,
+		distFn:   distFn,
+		links:    nil,
+		up:       nil,
+		entry:    -1,
+		maxLayer: 0,
+		ml:       1 / math.Log(float64(m)),
+		rng:      rand.New(rand.NewSource(seed)),
+	}
+}
+
+// addNode appends one node slot and inserts it, the incremental form. The caller must have
+// already appended this node's data to whatever arrays distFn reads, because insert walks
+// the graph computing distances against the new node during the call. It returns the new
+// node's index, which equals the caller's append index.
+func (g *hnswGraph) addNode(efConstruction int) int32 {
+	node := int32(len(g.links))
+	g.links = append(g.links, nil)
+	g.up = append(g.up, nil)
+	g.n = len(g.links)
+	g.insert(node, efConstruction)
+	return node
+}
+
+// beamSearchQ is the query-time HNSW descent against an arbitrary query distance (smaller
+// nearer): greedy through the upper layers from entry, then a width-efSearch beam on layer
+// 0. The graph shape is supplied through the neighbor accessors so the same routine drives
+// both the immutable region (links read from the mapping) and the in-RAM delta graph. It
+// returns candidate node IDs nearest first, or nil for an empty graph (entry < 0).
+func beamSearchQ(distQ func(int32) float64, entry int32, maxLayer, efSearch int,
+	upper func(node int32, layer int) []int32, zero func(node int32) []int32) []cand {
+	if entry < 0 {
+		return nil
+	}
+	ep := entry
+	for layer := maxLayer; layer >= 1; layer-- {
+		cur := ep
+		curD := distQ(cur)
+		for {
+			improved := false
+			for _, nb := range upper(cur, layer) {
+				if d := distQ(nb); d < curD {
+					cur, curD = nb, d
+					improved = true
+				}
+			}
+			if !improved {
+				break
+			}
+		}
+		ep = cur
+	}
+
+	visited := map[int32]bool{ep: true}
+	d0 := distQ(ep)
+	candHeap := &minHeap{{ep, d0}}
+	resHeap := &maxHeap{{ep, d0}}
+	for candHeap.Len() > 0 {
+		c := candHeap.popMin()
+		if resHeap.Len() >= efSearch && c.d > (*resHeap)[0].d {
+			break
+		}
+		for _, nb := range zero(c.id) {
+			if visited[nb] {
+				continue
+			}
+			visited[nb] = true
+			d := distQ(nb)
+			if resHeap.Len() < efSearch || d < (*resHeap)[0].d {
+				candHeap.pushItem(cand{nb, d})
+				resHeap.pushItem(cand{nb, d})
+				if resHeap.Len() > efSearch {
+					resHeap.popMax()
+				}
+			}
+		}
+	}
+	out := make([]cand, resHeap.Len())
+	copy(out, *resHeap)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].d != out[j].d {
+			return out[i].d < out[j].d
+		}
+		return out[i].id < out[j].id
+	})
+	return out
+}
+
 // reachableCount returns how many nodes the search can reach from the entry point
 // over the layer-0 links. The walk starts at the entry and beams over layer-0, so a
 // node no layer-0 path reaches is invisible to dense search, a silent recall hole.
