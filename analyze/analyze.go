@@ -150,6 +150,12 @@ const boilerplateLinkDensity = 0.5
 // split is the same content/chrome separation a readability mode produces, and the
 // content side is what would feed snippets and term extraction, so the ratio is a
 // byproduct of work the build does anyway.
+//
+// BoilerplateRatio is the exported entry point the collection-wide composite static
+// rank uses to read the quality term over every document; the per-document analyze
+// pass reads it through the same function.
+func BoilerplateRatio(body string) float64 { return boilerplateRatio(body) }
+
 func boilerplateRatio(body string) float64 {
 	var boiler, total int
 	for _, block := range textBlocks(body) {
