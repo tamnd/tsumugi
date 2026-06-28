@@ -245,6 +245,7 @@ func writeShard(path string, docs []convert.Document, sig graphSignals, base uin
 		fb.Set(id, feature.FeatReciprocity, sig.reciprocity[i])
 		fb.Set(id, feature.FeatHostLinkDiv, sig.hostLinkDiv[i])
 		fb.Set(id, feature.FeatNearDup, sig.nearDup[i])
+		fb.Set(id, feature.FeatOutboundSpam, sig.outboundSpam[i])
 		fwd.Set(id, "url", []byte(d.URL))
 		fwd.Set(id, "title", []byte(a.Title))
 		fwd.Set(id, "body", []byte(d.Body))

@@ -63,6 +63,7 @@ const (
 	FeatLinkingHosts   FeatureID = 23
 	FeatReciprocity    FeatureID = 24
 	FeatHostLinkDiv    FeatureID = 25
+	FeatOutboundSpam   FeatureID = 26
 )
 
 // Quant is a column's quantization scheme. Linear suits bounded, roughly uniform
@@ -120,6 +121,7 @@ func DefaultSchema() []Column {
 		{FeatLinkingHosts, 1, QuantLog},
 		{FeatReciprocity, 1, QuantLinear},
 		{FeatHostLinkDiv, 1, QuantLinear},
+		{FeatOutboundSpam, 1, QuantLinear},
 	}
 }
 

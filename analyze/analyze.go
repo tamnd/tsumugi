@@ -41,6 +41,7 @@ func Document(d convert.Document) Analysis {
 	depth, ulen, https, urlTokens := urlFeatures(d.URL)
 	quality := contentQuality(d.Body)
 	latin := latinRatio(d.Body)
+	boiler := boilerplateRatio(d.Body)
 
 	// A simple static rank: reward content, penalize depth, the prior every web
 	// ranker starts from before the link graph refines it.
@@ -63,6 +64,7 @@ func Document(d convert.Document) Analysis {
 		feature.FeatURLFieldLen:    float64(urlTokens),
 		feature.FeatHTTPS:          boolFeat(https),
 		feature.FeatContentQuality: quality,
+		feature.FeatBoilerplate:    boiler,
 		feature.FeatLanguage:       latin,
 	}
 	return Analysis{Title: title, Features: feats}
@@ -124,6 +126,117 @@ func contentQuality(body string) float64 {
 		}
 	}
 	return float64(alnum) / float64(len(body)) * 100
+}
+
+// boilerplateLinkDensity is the share of a block's visible text that must sit inside
+// link anchors for the block to count as boilerplate. At half or more of the text
+// being link labels the block is a nav bar, a footer link row, or a link list rather
+// than prose, the markdown shape of page chrome.
+const boilerplateLinkDensity = 0.5
+
+// boilerplateRatio estimates the fraction of a page's visible text that is chrome
+// (navigation, link rows, footers, link lists) rather than main content. The spec's
+// extractor walks the parsed blocks and scores each by text density, classifying the
+// low-density high-link blocks as boilerplate; this corpus stores the crawl as
+// markdown, which keeps both the block structure (blank lines separate blocks) and
+// the link markup, so the markdown analog scores each block by its link density. A
+// block whose visible text is mostly link labels is chrome; a block of prose carries
+// few link characters relative to its text. The ratio is the visible-text length of
+// the boilerplate blocks over the total visible-text length.
+//
+// A high ratio (most of the page is link chrome) is a negative quality signal:
+// doorway pages, auto-generated tag indexes, and thin pages are mostly link lists
+// around a sliver of content. A low ratio means the page is mostly substance. The
+// split is the same content/chrome separation a readability mode produces, and the
+// content side is what would feed snippets and term extraction, so the ratio is a
+// byproduct of work the build does anyway.
+func boilerplateRatio(body string) float64 {
+	var boiler, total int
+	for _, block := range textBlocks(body) {
+		visible, anchor := blockDensity(block)
+		if visible == 0 {
+			continue
+		}
+		total += visible
+		if float64(anchor)/float64(visible) >= boilerplateLinkDensity {
+			boiler += visible
+		}
+	}
+	if total == 0 {
+		return 0
+	}
+	return float64(boiler) / float64(total)
+}
+
+// textBlocks splits a markdown body into blocks, the runs of consecutive non-blank
+// lines separated by blank lines, the unit the boilerplate extractor scores. It is
+// the markdown stand-in for the parsed DOM blocks the spec's extractor walks.
+func textBlocks(body string) []string {
+	var blocks []string
+	var cur []string
+	for _, line := range strings.Split(body, "\n") {
+		if strings.TrimSpace(line) == "" {
+			if len(cur) > 0 {
+				blocks = append(blocks, strings.Join(cur, "\n"))
+				cur = nil
+			}
+			continue
+		}
+		cur = append(cur, line)
+	}
+	if len(cur) > 0 {
+		blocks = append(blocks, strings.Join(cur, "\n"))
+	}
+	return blocks
+}
+
+// blockDensity returns a block's visible-text length and how much of it lies inside
+// link anchor labels, both measured as letters and digits so markup punctuation,
+// list markers, emphasis, and whitespace count toward neither. A markdown link is
+// [label](target): the label is visible text and counts as anchor, the target is
+// markup and counts as nothing, which is what makes a row of links read as
+// all-anchor (boilerplate) and a paragraph with one citation read as mostly prose.
+func blockDensity(block string) (visible, anchor int) {
+	rs := []rune(block)
+	for i := 0; i < len(rs); {
+		if rs[i] == '[' {
+			j := i + 1
+			for j < len(rs) && rs[j] != ']' {
+				j++
+			}
+			if j < len(rs) && j+1 < len(rs) && rs[j+1] == '(' {
+				n := alnumCount(rs[i+1 : j])
+				visible += n
+				anchor += n
+				k := j + 2
+				for k < len(rs) && rs[k] != ')' {
+					k++
+				}
+				if k < len(rs) {
+					k++ // consume the closing paren of the target
+				}
+				i = k
+				continue
+			}
+		}
+		if unicode.IsLetter(rs[i]) || unicode.IsDigit(rs[i]) {
+			visible++
+		}
+		i++
+	}
+	return visible, anchor
+}
+
+// alnumCount counts the letters and digits in a rune slice, the visible-text measure
+// blockDensity uses on both link labels and prose so the two are comparable.
+func alnumCount(rs []rune) int {
+	var n int
+	for _, r := range rs {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			n++
+		}
+	}
+	return n
 }
 
 // latinRatio is one when the body is mostly latin-script letters and zero when it is

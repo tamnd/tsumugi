@@ -360,6 +360,40 @@ func HostLinkDiversity(g *Region, hostOf []int) []float64 {
 	return out
 }
 
+// DefaultSpamThreshold is the SpamMass above which a target page counts as spam for
+// the outbound-spam ratio. SpamMass is the fraction of a page's PageRank traceable
+// to spam seeds, so 0.5 is the point where more of the page's authority comes from
+// spam than from trust, the natural cutoff for treating the target as spam and the
+// same threshold the SpamMass feedback loop uses to nominate fresh spam seeds.
+const DefaultSpamThreshold = 0.5
+
+// OutboundSpamRatio returns, per node, the fraction of v's out-links that point at a
+// page whose SpamMass exceeds the threshold: |{u in Out(v): SpamMass(u) > thresh}| /
+// |Out(v)|. It is the local, per-page companion of AntiTrustRank: where AntiTrustRank
+// propagates distrust across the whole graph, this is the immediate count of how much
+// of a page's own linking aims at known spam, which catches a link farm or a page
+// injected with spam links directly, one hop rather than the propagated signal. The
+// two together catch both the page that links to spam and the page upstream of it. A
+// node with no out-links has ratio zero. spamMass is indexed by dense node id, the
+// SpamMass vector the build already computed.
+func OutboundSpamRatio(g *Region, spamMass []float64, threshold float64) []float64 {
+	out := make([]float64, g.nodeCount)
+	for v := 0; v < g.nodeCount; v++ {
+		outs := g.OutNeighbors(v)
+		if len(outs) == 0 {
+			continue
+		}
+		var hits int
+		for _, u := range outs {
+			if u < len(spamMass) && spamMass[u] > threshold {
+				hits++
+			}
+		}
+		out[v] = float64(hits) / float64(len(outs))
+	}
+	return out
+}
+
 // HostRank aggregates the page graph up to hosts, runs a weighted PageRank on
 // the host graph dropping intra-host edges, and gives each page its host's rank.
 // Dropping the internal links is what makes host rank resist the internal-link
