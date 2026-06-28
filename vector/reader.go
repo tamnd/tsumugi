@@ -20,6 +20,13 @@ type Region struct {
 	iq     int8Quant
 	words  int
 	stride int
+	// multibit is the Extended-RaBitQ no-rerank form: the per-dimension payload is
+	// codeBits levels packed LSB-first instead of one sign bit, and there is no int8 copy.
+	// codeBytes is the payload length after the scalar and optional norm, words*8 for the
+	// one-bit code and ceil(rdim*codeBits/8) for the multi-bit code.
+	multibit  bool
+	codeBits  int
+	codeBytes int
 	// bitsOff is where a code row's sign words start, after the float16 scalar and the
 	// optional float16 norm. hasStoredNorm is false when the region dropped the norm
 	// field because the vectors are normalized, in which case norm reads back as the
@@ -74,9 +81,18 @@ func Open(b []byte) (*Region, error) {
 		return nil, ErrCorrupt
 	}
 	n := int(h.count)
-	words := int(h.rdim) / 64
+	rdim := int(h.rdim)
+	words := rdim / 64
 	stride := int(h.codeStride)
-	// A normalized region stores only the float16 scalar (2 bytes) before the sign words;
+	multibit := h.flags&flagMultibit != 0
+	codeBits := int(h.codeBits)
+	// codeBytes is the per-dimension payload after the scalar and optional norm: the words
+	// sign blocks for the one-bit code, ceil(rdim*codeBits/8) packed levels for multi-bit.
+	codeBytes := words * 8
+	if multibit {
+		codeBytes = (rdim*codeBits + 7) / 8
+	}
+	// A normalized region stores only the float16 scalar (2 bytes) before the payload;
 	// otherwise it also stores the float16 norm (4 bytes total). Validate the stride
 	// against whichever layout the normalized flag implies.
 	hasStoredNorm := h.flags&flagNormalized == 0
@@ -84,7 +100,12 @@ func Open(b []byte) (*Region, error) {
 	if hasStoredNorm {
 		bitsOff = 4
 	}
-	if stride != bitsOff+words*8 || (n > 0 && len(b[off:codesEnd]) != n*stride) {
+	if stride != bitsOff+codeBytes || (n > 0 && len(b[off:codesEnd]) != n*stride) {
+		return nil, ErrCorrupt
+	}
+	// The multi-bit form never carries an int8 rerank copy, so a region claiming both is
+	// malformed.
+	if multibit && h.flags&flagHasRerank != 0 {
 		return nil, ErrCorrupt
 	}
 
@@ -94,6 +115,9 @@ func Open(b []byte) (*Region, error) {
 		iq:            newInt8Quant(h.i8scale),
 		words:         words,
 		stride:        stride,
+		multibit:      multibit,
+		codeBits:      codeBits,
+		codeBytes:     codeBytes,
 		bitsOff:       bitsOff,
 		hasStoredNorm: hasStoredNorm,
 		codes:         b[off:codesEnd],
@@ -131,7 +155,7 @@ func (r *Region) norm(node int32) float32 {
 
 func (r *Region) rowBits(node int32) []byte {
 	off := int(node)*r.stride + r.bitsOff
-	return r.codes[off : off+r.words*8]
+	return r.codes[off : off+r.codeBytes]
 }
 
 // Count returns the number of indexed vectors.
@@ -231,6 +255,11 @@ func (r *Region) navDist(qRot []float32, qc queryCode) func(int32) float64 {
 			return -float64(dotI8(qi8, row))
 		}
 	}
+	if r.multibit {
+		return func(node int32) float64 {
+			return -estimateMultiBytes(r.rowBits(node), r.codeBits, r.scalar(node), r.norm(node), qRot)
+		}
+	}
 	return func(node int32) float64 {
 		return -estimateBytes(r.rowBits(node), r.scalar(node), r.norm(node), qc)
 	}
@@ -305,14 +334,19 @@ func (r *Region) rerankAndTop(qRot []float32, qc queryCode, cands []cand, k, rer
 		cands = cands[:rerankDepth]
 	}
 	scored := make([]Result, len(cands))
-	if r.hasRerank {
+	switch {
+	case r.hasRerank:
 		scale := float64(r.iq.scale)
 		rdim := int(r.h.rdim)
 		for i, c := range cands {
 			row := r.rerank[int(c.id)*rdim : (int(c.id)+1)*rdim]
 			scored[i] = Result{DocID: uint32(c.id), Score: scale * dotF32I8(qRot, row)}
 		}
-	} else {
+	case r.multibit:
+		for i, c := range cands {
+			scored[i] = Result{DocID: uint32(c.id), Score: estimateMultiBytes(r.rowBits(c.id), r.codeBits, r.scalar(c.id), r.norm(c.id), qRot)}
+		}
+	default:
 		for i, c := range cands {
 			scored[i] = Result{DocID: uint32(c.id), Score: estimateBytes(r.rowBits(c.id), r.scalar(c.id), r.norm(c.id), qc)}
 		}
@@ -340,14 +374,19 @@ func (r *Region) BruteForce(query []float32, k int) []Result {
 	qc := encodeQuery(qRot)
 	n := int(r.h.count)
 	scored := make([]Result, n)
-	if r.hasRerank {
+	switch {
+	case r.hasRerank:
 		scale := float64(r.iq.scale)
 		rdim := int(r.h.rdim)
 		for i := 0; i < n; i++ {
 			row := r.rerank[i*rdim : (i+1)*rdim]
 			scored[i] = Result{DocID: uint32(i), Score: scale * dotF32I8(qRot, row)}
 		}
-	} else {
+	case r.multibit:
+		for i := 0; i < n; i++ {
+			scored[i] = Result{DocID: uint32(i), Score: estimateMultiBytes(r.rowBits(int32(i)), r.codeBits, r.scalar(int32(i)), r.norm(int32(i)), qRot)}
+		}
+	default:
 		for i := 0; i < n; i++ {
 			scored[i] = Result{DocID: uint32(i), Score: estimateBytes(r.rowBits(int32(i)), r.scalar(int32(i)), r.norm(int32(i)), qc)}
 		}
