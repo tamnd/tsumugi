@@ -31,6 +31,7 @@ type graphSignals struct {
 	hostLinkDiv    []float64
 	nearDup        []float64
 	outboundSpam   []float64
+	staticRank     []float64
 }
 
 // slice returns the signals for the document range [lo, hi), the slice a single
@@ -50,6 +51,7 @@ func (s graphSignals) slice(lo, hi int) graphSignals {
 		hostLinkDiv:    s.hostLinkDiv[lo:hi],
 		nearDup:        s.nearDup[lo:hi],
 		outboundSpam:   s.outboundSpam[lo:hi],
+		staticRank:     s.staticRank[lo:hi],
 	}
 }
 
@@ -272,7 +274,7 @@ func globalSignals(docs []convert.Document, trustSeeds, spamSeeds []string) grap
 	tr := graph.TrustRank(g, trust, cfg)
 	sm := graph.SpamMass(pr, tr, trust)
 
-	return graphSignals{
+	sig := graphSignals{
 		pageRank:       pr,
 		hostRank:       graph.HostRank(g, hostOf, cfg),
 		domainRank:     graph.DomainRank(g, domainOf, cfg),
@@ -286,6 +288,11 @@ func globalSignals(docs []convert.Document, trustSeeds, spamSeeds []string) grap
 		nearDup:        nearDupPenalties(docs, pr),
 		outboundSpam:   graph.OutboundSpamRatio(g, sm, graph.DefaultSpamThreshold),
 	}
+	// The composite static rank is a thin blend of the raw columns above, computed
+	// last so it can read them. It supersedes the per-document static-rank prior the
+	// analyze stage writes.
+	sig.staticRank = compositeStaticRank(docs, sig)
+	return sig
 }
 
 // globalRanks computes collection-wide PageRank over the whole link graph and
