@@ -190,7 +190,7 @@ func trustSeedSet(g *graph.Region, dir *mph.Dir, curated []string, anti []float6
 	if n == 0 {
 		return seeds
 	}
-	inv := graph.InversePageRank(g, cfg)
+	inv := streamInversePageRank(g, cfg)
 	cand := topKIndices(inv, inversePageRankCandidates)
 	drop := 2.0 / float64(n) // twice the uniform anti-trust baseline
 	for _, v := range cand {
@@ -262,6 +262,78 @@ func collectionOrder(docs []convert.Document) []int {
 	return graph.Reorder(out, hostOf, graph.DefaultBPConfig())
 }
 
+// streamPageRank computes the collection-wide PageRank out of core. Instead of
+// materializing the whole transpose as a flat CSR the way graph.PageRank does, it
+// streams one in-list at a time from the region through graph.StreamPageRankP, so the
+// resident set is the two float32 rank vectors plus the uint32 out-degree array,
+// node-proportional and independent of the edge count. At two billion documents the
+// flat CSR is hundreds of gigabytes and does not fit; the streamed vectors do. The
+// result is widened to float64 for the downstream signals (SpamMass, the near-dup
+// penalty, the feature column) that consume it; the widening is exact and the ranks
+// agree with the in-core PageRank to float32 precision. This is doc 07's out-of-core
+// ranking wired onto the build's main PageRank signal, replacing the in-core power
+// iteration over buildCSR.
+func streamPageRank(g *graph.Region, cfg graph.PRConfig) []float64 {
+	n := g.NodeCount()
+	if n == 0 {
+		return nil
+	}
+	return widen(graph.StreamPageRankP(g, graph.OutDegrees(g), graph.UniformTeleport(n), cfg))
+}
+
+// streamTrustRank is TrustRank streamed out of core: the same forward source as
+// streamPageRank, but the surfer teleports onto the trust seeds, so trust starts on
+// the seeds and flows forward along links. It replaces the in-core graph.TrustRank
+// over buildCSR and matches it to float32 precision.
+func streamTrustRank(g *graph.Region, seeds []int, cfg graph.PRConfig) []float64 {
+	n := g.NodeCount()
+	if n == 0 {
+		return nil
+	}
+	return widen(graph.StreamPageRankP(g, graph.OutDegrees(g), graph.SeedTeleport(n, seeds), cfg))
+}
+
+// streamInversePageRank streams the uniform rank over the reversed graph, ranking a
+// node by how well it reaches the rest of the graph. The reversed view forwards a
+// node's out-list as its in-list and divides by the original in-degree, so it never
+// materializes buildCSRRev; the build uses it to pick the inverse-PageRank trust-seed
+// candidates. It replaces the in-core graph.InversePageRank.
+func streamInversePageRank(g *graph.Region, cfg graph.PRConfig) []float64 {
+	n := g.NodeCount()
+	if n == 0 {
+		return nil
+	}
+	rev := graph.ReverseSource(g)
+	outdeg := graph.OutDegreesFromSource(n, g.InDegree)
+	return widen(graph.StreamPageRankP(rev, outdeg, graph.UniformTeleport(n), cfg))
+}
+
+// streamAntiTrustRank streams the spam-seed-biased rank over the reversed graph, so
+// distrust flows backward from a spam page to the pages that link to it. Same reversed
+// source as streamInversePageRank, teleporting onto the spam seeds. It replaces the
+// in-core graph.AntiTrustRank over buildCSRRev.
+func streamAntiTrustRank(g *graph.Region, spamSeeds []int, cfg graph.PRConfig) []float64 {
+	n := g.NodeCount()
+	if n == 0 {
+		return nil
+	}
+	rev := graph.ReverseSource(g)
+	outdeg := graph.OutDegreesFromSource(n, g.InDegree)
+	return widen(graph.StreamPageRankP(rev, outdeg, graph.SeedTeleport(n, spamSeeds), cfg))
+}
+
+// widen copies a float32 streamed rank vector into a float64 one for the downstream
+// signals that consume float64. The float32-to-float64 conversion is exact, so the
+// only difference from the in-core float64 ranks is the float32 rounding inside the
+// iteration, which is far finer than the byte-quantized feature column keeps.
+func widen(r []float32) []float64 {
+	out := make([]float64, len(r))
+	for i, v := range r {
+		out[i] = float64(v)
+	}
+	return out
+}
+
 // globalSignals computes every collection-wide link signal and returns one value
 // per document, indexed by the document's position in docs.
 //
@@ -291,11 +363,11 @@ func globalSignals(docs []convert.Document, trustSeeds, spamSeeds []string) (gra
 	cfg := graph.DefaultPRConfig()
 	hostOf, domainOf := groupings(docs)
 
-	pr := graph.PageRank(g, cfg)
+	pr := streamPageRank(g, cfg)
 	spam := resolveSeeds(spamSeeds, dir)
-	anti := graph.AntiTrustRank(g, spam, cfg)
+	anti := streamAntiTrustRank(g, spam, cfg)
 	trust := trustSeedSet(g, dir, trustSeeds, anti, cfg)
-	tr := graph.TrustRank(g, trust, cfg)
+	tr := streamTrustRank(g, trust, cfg)
 	sm := graph.SpamMass(pr, tr, trust)
 
 	sig := graphSignals{
@@ -329,7 +401,7 @@ func globalRanks(docs []convert.Document) []float64 {
 	}
 	dir := buildDir(docs)
 	g := buildGraph(docs, dir)
-	return graph.PageRank(g, graph.DefaultPRConfig())
+	return streamPageRank(g, graph.DefaultPRConfig())
 }
 
 // globalEdgeCount counts the edges the collection-wide directory resolves, the

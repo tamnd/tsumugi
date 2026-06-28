@@ -186,8 +186,15 @@ func TestMPHDirMatchesMapOnCCrawl(t *testing.T) {
 		t.Skip("no documents in parquet")
 	}
 
+	// Compare the in-core PageRank over the MPH directory's graph against the in-core
+	// PageRank over the map's graph: same algorithm both sides, so any difference is
+	// the directory resolving an edge the map does not (or missing one). globalRanks
+	// itself now streams the rank in float32; it is checked against the in-core path
+	// separately in TestGlobalRanksStreamMatchesInCore, so this directory equality
+	// stays an in-core float64 comparison where a one-ULP streaming difference cannot
+	// mask an edge divergence.
 	want := refRanksViaMap(docs)
-	got := globalRanks(docs)
+	got := graph.PageRank(buildGraph(docs, buildDir(docs)), graph.DefaultPRConfig())
 	if len(got) != len(want) {
 		t.Fatalf("length %d != reference %d", len(got), len(want))
 	}
@@ -197,6 +204,50 @@ func TestMPHDirMatchesMapOnCCrawl(t *testing.T) {
 		}
 	}
 	t.Logf("docs=%d ranks bit-for-bit identical to the plain-map directory", len(docs))
+}
+
+// TestGlobalRanksStreamMatchesInCore proves the build's production rank path, which
+// streams PageRank out of core through graph.StreamPageRankP and widens to float64,
+// agrees with the in-core graph.PageRank over the same collection graph to float32
+// precision. The build uses the streamed path so the rank vector, not the whole
+// transpose CSR, is the resident set at corpus scale; this gate is what lets that
+// swap stay invisible to every downstream signal that reads the ranks.
+func TestGlobalRanksStreamMatchesInCore(t *testing.T) {
+	const spokes = 40
+	var docs []convert.Document
+	docs = append(docs,
+		convert.Document{URL: "https://a.example/hub", Host: "a.example", Body: "# Hub"},
+		convert.Document{URL: "https://a.example/lonely", Host: "a.example", Body: "# Lonely"},
+	)
+	for i := 0; i < spokes; i++ {
+		// Spokes link to the hub and to the next spoke, so the graph has real
+		// structure (cycles, varied in and out degree) rather than a pure star.
+		docs = append(docs, convert.Document{
+			URL:  fmt.Sprintf("https://b.example/s%d", i),
+			Host: "b.example",
+			Body: fmt.Sprintf("# Spoke %d\nsee <https://a.example/hub> and <https://b.example/s%d>", i, (i+1)%spokes),
+		})
+	}
+
+	g := buildGraph(docs, buildDir(docs))
+	want := graph.PageRank(g, graph.DefaultPRConfig())
+	got := globalRanks(docs)
+	if len(got) != len(want) {
+		t.Fatalf("streamed length %d != in-core %d", len(got), len(want))
+	}
+	var worst float64
+	for i := range want {
+		d := want[i] - got[i]
+		if d < 0 {
+			d = -d
+		}
+		if d > worst {
+			worst = d
+		}
+	}
+	if worst > 1e-5 {
+		t.Fatalf("streamed global ranks diverge from in-core by %g, want < 1e-5", worst)
+	}
 }
 
 // TestGlobalGraphOnCCrawl records what the collection-wide resolution recovers on
