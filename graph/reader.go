@@ -4,11 +4,15 @@ import "sort"
 
 // Region is a parsed, read-only graph region. It holds the two adjacency
 // bitstreams and their offset indexes; neighbor lists are decoded on demand and
-// nothing is held expanded.
+// nothing is held expanded. It also holds the dense-to-global identity mapping:
+// either the nodeBase of a contiguous run, or the explicit id table when the
+// global ids do not line up with the dense order.
 type Region struct {
 	params    Params
 	nodeCount int
 	edgeCount uint64
+	nodeBase  uint64
+	idt       *idTable // nil on the contiguous fast path; dense docID d maps to nodeBase+d
 	fwdAdj    []byte
 	fwdEF     *ef
 	xpAdj     []byte
@@ -22,6 +26,18 @@ func Open(b []byte) (*Region, error) {
 		return nil, err
 	}
 	off := headerLen
+	var idt *idTable
+	if h.idTableLen > 0 {
+		end := off + int(h.idTableLen)
+		if end > len(b) {
+			return nil, ErrCorrupt
+		}
+		idt, err = decodeIDTable(b[off:end])
+		if err != nil {
+			return nil, err
+		}
+		off = end
+	}
 	end := off + int(h.fwdAdjLen)
 	if end > len(b) {
 		return nil, ErrCorrupt
@@ -55,6 +71,8 @@ func Open(b []byte) (*Region, error) {
 		params:    h.params,
 		nodeCount: int(h.nodeCount),
 		edgeCount: h.edgeCount,
+		nodeBase:  h.nodeBase,
+		idt:       idt,
 		fwdAdj:    fwdAdj,
 		fwdEF:     fwdEF,
 		xpAdj:     xpAdj,
@@ -64,6 +82,34 @@ func Open(b []byte) (*Region, error) {
 
 // NodeCount returns N, the dense node space size.
 func (g *Region) NodeCount() int { return g.nodeCount }
+
+// Global returns the global node id of dense docID d, the corpus-stable identity a
+// cross-shard edge keys by. On the contiguous fast path it is nodeBase+d; otherwise
+// the id table resolves it.
+func (g *Region) Global(d int) uint64 {
+	if g.idt == nil {
+		return g.nodeBase + uint64(d)
+	}
+	return g.idt.global(d)
+}
+
+// Dense resolves a global node id to its dense docID in this shard, returning false
+// when the shard does not hold that node, which is how an inbound cross-shard edge
+// to a node outside this shard is rejected. On the contiguous fast path it is the
+// range check and one subtraction; otherwise the id table binary-searches.
+func (g *Region) Dense(global uint64) (int, bool) {
+	if g.idt == nil {
+		if global < g.nodeBase {
+			return 0, false
+		}
+		d := global - g.nodeBase
+		if d >= uint64(g.nodeCount) {
+			return 0, false
+		}
+		return int(d), true
+	}
+	return g.idt.dense(global)
+}
 
 // EdgeCount returns the number of directed edges.
 func (g *Region) EdgeCount() uint64 { return g.edgeCount }

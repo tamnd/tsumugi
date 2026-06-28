@@ -24,7 +24,7 @@ import (
 
 const regionMagic = "GRA1"
 
-const regionVersion = 1
+const regionVersion = 2
 
 // Params tune the adjacency coder. The defaults match the WebGraph settings that
 // land near three bits an edge on a well-ordered web graph: reference within a
@@ -46,21 +46,29 @@ func DefaultParams() Params {
 // region or fail the header CRC.
 var ErrCorrupt = errors.New("graph: corrupt region")
 
-// header is the fixed prefix of a graph region. The four sub-blobs follow it in
-// order: forward adjacency, forward offsets, transpose adjacency, transpose
-// offsets. The header carries their lengths so a reader slices them by walking.
+// header is the fixed prefix of a graph region. The sub-blobs follow it in the
+// order doc 03 fixes for the region's parts: the id table, the forward adjacency,
+// the forward offsets, the transpose adjacency, and the transpose offsets. The
+// header carries every blob's length so a reader slices them by walking, plus the
+// node_base of the dense-to-global mapping: when the id table is absent
+// (idTableLen == 0) the dense space is a contiguous run of node ids and dense
+// docID d maps to global node id nodeBase+d with no table, the fast path doc 02
+// describes; when the global ids do not line up with the dense order the id table
+// holds the mapping and nodeBase is unused.
 type header struct {
-	version   uint8
-	params    Params
-	nodeCount uint32
-	edgeCount uint64
-	fwdAdjLen uint64
-	fwdEFLen  uint64
-	xpAdjLen  uint64
-	xpEFLen   uint64
+	version    uint8
+	params     Params
+	nodeCount  uint32
+	edgeCount  uint64
+	idTableLen uint64
+	nodeBase   uint64
+	fwdAdjLen  uint64
+	fwdEFLen   uint64
+	xpAdjLen   uint64
+	xpEFLen    uint64
 }
 
-const headerLen = 4 + 1 + 4 + 4 + 8 + 8*4 + 4 // magic..crc, see encode
+const headerLen = 4 + 1 + 4 + 4 + 8 + 8 + 8 + 8*4 + 4 // magic..crc, see encode
 
 func (h header) encode() []byte {
 	b := make([]byte, 0, headerLen)
@@ -69,6 +77,8 @@ func (h header) encode() []byte {
 	b = append(b, byte(h.params.Window), byte(h.params.MaxRef), byte(h.params.ZetaK), byte(h.params.LMin))
 	b = codec.AppendUint32(b, h.nodeCount)
 	b = codec.AppendUint64(b, h.edgeCount)
+	b = codec.AppendUint64(b, h.idTableLen)
+	b = codec.AppendUint64(b, h.nodeBase)
 	b = codec.AppendUint64(b, h.fwdAdjLen)
 	b = codec.AppendUint64(b, h.fwdEFLen)
 	b = codec.AppendUint64(b, h.xpAdjLen)
@@ -92,9 +102,11 @@ func decodeHeader(b []byte) (header, error) {
 	h.params = Params{Window: int(b[5]), MaxRef: int(b[6]), ZetaK: int(b[7]), LMin: int(b[8])}
 	h.nodeCount = codec.Uint32(b[9:])
 	h.edgeCount = codec.Uint64(b[13:])
-	h.fwdAdjLen = codec.Uint64(b[21:])
-	h.fwdEFLen = codec.Uint64(b[29:])
-	h.xpAdjLen = codec.Uint64(b[37:])
-	h.xpEFLen = codec.Uint64(b[45:])
+	h.idTableLen = codec.Uint64(b[21:])
+	h.nodeBase = codec.Uint64(b[29:])
+	h.fwdAdjLen = codec.Uint64(b[37:])
+	h.fwdEFLen = codec.Uint64(b[45:])
+	h.xpAdjLen = codec.Uint64(b[53:])
+	h.xpEFLen = codec.Uint64(b[61:])
 	return h, nil
 }
