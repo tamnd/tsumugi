@@ -36,10 +36,11 @@ type OOCBuilder struct {
 	spillN  int      // edges held in RAM before a run is spilled
 	nodeIDs []uint64 // per-dense-docID global node id, nil for the identity mapping
 
-	buf  []oocEdge // current in-RAM batch, sorted and spilled when it reaches spillN
-	runs []string  // spilled run files, each sorted by (from, to)
-	dir  string    // temp dir for run files, created on the first spill
-	err  error     // first spill error, surfaced at Build
+	buf   []oocEdge   // current in-RAM batch, sorted and spilled when it reaches spillN
+	runs  []string    // spilled run files, each sorted by (from, to)
+	dir   string      // temp dir for run files, created on the first spill
+	err   error       // first spill error, surfaced at Build
+	cross []crossEdge // far out-edges, kept in RAM: a small fraction of the edges
 }
 
 // oocEdge is one directed edge as a pair of dense node ids. uint32 holds the
@@ -98,6 +99,18 @@ func (b *OOCBuilder) AddEdge(from, to int) {
 	}
 }
 
+// AddCrossEdge records a far out-edge from local dense docID from to the global node
+// id toGlobal in another shard, matching Builder.AddCrossEdge. The cross edges are a
+// small fraction of the total (most edges stay within the shard's own adjacency in
+// any one routing pass), so they are buffered in RAM rather than spilled, and framed
+// into the region's cross-shard edge list at Build.
+func (b *OOCBuilder) AddCrossEdge(from int, toGlobal uint64) {
+	if b.err != nil || from < 0 || from >= b.n {
+		return
+	}
+	b.cross = append(b.cross, crossEdge{from: from, to: toGlobal})
+}
+
 // Build encodes the forward and transpose planes and frames the region, then
 // removes any spilled run files. It returns an error only on a disk failure in the
 // spill or merge; on the in-RAM path it never fails.
@@ -141,7 +154,8 @@ func (b *OOCBuilder) Build() ([]byte, error) {
 
 	fwdEF := buildEF(fwdOff).encode()
 	xpEF := buildEF(xpOff).encode()
-	return frameRegion(b.n, edges, b.nodeIDs, fwdAdj, fwdEF, xpAdj, xpEF, b.params), nil
+	xsBlob := buildCrossBlob(b.cross, b.params)
+	return frameRegion(b.n, edges, b.nodeIDs, fwdAdj, fwdEF, xpAdj, xpEF, xsBlob, b.params), nil
 }
 
 // buildInRAM sorts the buffered edges by source then by target and encodes both
@@ -155,7 +169,8 @@ func (b *OOCBuilder) buildInRAM() []byte {
 	xpAdj, xpOff, _ := encodePlaneWindowed(b.n, b.params, groupSlice(edges, false))
 	fwdEF := buildEF(fwdOff).encode()
 	xpEF := buildEF(xpOff).encode()
-	return frameRegion(b.n, ecount, b.nodeIDs, fwdAdj, fwdEF, xpAdj, xpEF, b.params)
+	xsBlob := buildCrossBlob(b.cross, b.params)
+	return frameRegion(b.n, ecount, b.nodeIDs, fwdAdj, fwdEF, xpAdj, xpEF, xsBlob, b.params)
 }
 
 // spill sorts the current buffer by (from, to) and writes it as a run file.
@@ -345,10 +360,11 @@ func encodePlaneWindowed(n int, p Params, next func() (int, []int32, bool)) (dat
 
 // frameRegion assembles the GRA1 region header and concatenates the region parts
 // in doc 03's order: the id table (when the global ids need one), the forward
-// adjacency and its offsets, then the transpose adjacency and its offsets.
-// Builder.Build and OOCBuilder.Build share it so the framing is one definition.
-// ids is the per-dense-docID global node id, nil for the identity mapping.
-func frameRegion(n int, edges uint64, ids []uint64, fwdAdj, fwdEF, xpAdj, xpEF []byte, p Params) []byte {
+// adjacency and its offsets, the transpose adjacency and its offsets, then the
+// cross-shard edge list. Builder.Build and OOCBuilder.Build share it so the framing
+// is one definition. ids is the per-dense-docID global node id, nil for the identity
+// mapping; xsBlob is the cross-shard edge list, nil when the graph has no far edges.
+func frameRegion(n int, edges uint64, ids []uint64, fwdAdj, fwdEF, xpAdj, xpEF, xsBlob []byte, p Params) []byte {
 	nodeBase, idBlob := computeIDTable(n, ids)
 	h := header{
 		version:    regionVersion,
@@ -361,6 +377,7 @@ func frameRegion(n int, edges uint64, ids []uint64, fwdAdj, fwdEF, xpAdj, xpEF [
 		fwdEFLen:   uint64(len(fwdEF)),
 		xpAdjLen:   uint64(len(xpAdj)),
 		xpEFLen:    uint64(len(xpEF)),
+		xsLen:      uint64(len(xsBlob)),
 	}
 	region := h.encode()
 	region = append(region, idBlob...)
@@ -368,6 +385,7 @@ func frameRegion(n int, edges uint64, ids []uint64, fwdAdj, fwdEF, xpAdj, xpEF [
 	region = append(region, fwdEF...)
 	region = append(region, xpAdj...)
 	region = append(region, xpEF...)
+	region = append(region, xsBlob...)
 	return region
 }
 
