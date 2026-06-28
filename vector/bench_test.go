@@ -37,6 +37,39 @@ func BenchmarkSearch(b *testing.B) {
 	}
 }
 
+// BenchmarkDeltaSearch times the union search: a 100k immutable region with a 2k
+// in-RAM delta in front of it, the freshness arrangement a serving shard runs between
+// compactions. The delta walk adds a small, bounded cost on top of the immutable walk,
+// so the union must stay inside the same sub-10ms shard budget the immutable-only
+// search meets. The delta is sized at the ~2% of shard the spec compacts at.
+func BenchmarkDeltaSearch(b *testing.B) {
+	corpus := clusteredCorpus(102_000, 128, 200, 42)
+	bd := NewBuilder(128)
+	for _, v := range corpus[:100_000] {
+		bd.Add(v)
+	}
+	r, err := Open(mustBuild(b, bd))
+	if err != nil {
+		b.Fatalf("open: %v", err)
+	}
+	d := r.NewDelta()
+	for i := 100_000; i < len(corpus); i++ {
+		if _, err := d.Add(corpus[i]); err != nil {
+			b.Fatalf("delta add: %v", err)
+		}
+	}
+	rng := rand.New(rand.NewSource(7))
+	queries := make([][]float32, 256)
+	for i := range queries {
+		queries[i] = normalize(randVec(rng, 128))
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		d.Search(queries[i%len(queries)], 10, DefaultEfSearch, DefaultEfDelta, DefaultRerankDepth)
+	}
+}
+
 // BenchmarkSearchNoRerank times the memory-light estimator path on the same
 // corpus, the mode a shard runs when it drops the int8 copy.
 func BenchmarkSearchNoRerank(b *testing.B) {

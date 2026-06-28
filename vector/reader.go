@@ -280,63 +280,32 @@ func (r *Region) navDist(qRot []float32, qc queryCode) func(int32) float64 {
 	}
 }
 
-// walk is the HNSW descent: greedy through the upper layers, then a beam on
-// layer 0 under the supplied navigation metric (smaller is nearer). It returns
-// candidate node IDs ordered nearest first.
+// walk is the HNSW descent over the immutable region: greedy through the upper layers,
+// then a beam on layer 0 under the supplied navigation metric (smaller is nearer). It
+// delegates to beamSearchQ with the region's mapped link accessors, the same routine the
+// delta graph walks with its in-RAM links, so the immutable and delta halves of a union
+// search navigate identically.
 func (r *Region) walk(distQ func(int32) float64, efSearch int) []cand {
-	ep := int32(r.h.entryPoint)
+	return beamSearchQ(distQ, int32(r.h.entryPoint), int(r.h.maxLayer), efSearch,
+		r.links.neighborsUpper, r.links.neighbors0)
+}
 
-	for layer := int(r.h.maxLayer); layer >= 1; layer-- {
-		cur := ep
-		curD := distQ(cur)
-		for {
-			improved := false
-			for _, nb := range r.links.neighborsUpper(cur, layer) {
-				if d := distQ(nb); d < curD {
-					cur, curD = nb, d
-					improved = true
-				}
-			}
-			if !improved {
-				break
-			}
-		}
-		ep = cur
+// rerankScore is the sharp final score for one immutable-region node, the score the rerank,
+// the brute-force oracle, and the delta union all rank a candidate by, so a candidate ranks
+// identically wherever it is scored. In the two-part mode it is the asymmetric int8 dot
+// scaled back to the true dot space (05 line 544); in the multi-bit and one-bit no-rerank
+// modes it is the asymmetric RaBitQ estimator over the code. Higher is nearer.
+func (r *Region) rerankScore(node int32, qRot []float32, qc queryCode) float64 {
+	switch {
+	case r.hasRerank:
+		rdim := int(r.h.rdim)
+		row := r.rerank[int(node)*rdim : (int(node)+1)*rdim]
+		return float64(r.iq.scale) * dotF32I8(qRot, row)
+	case r.multibit:
+		return estimateMultiBytes(r.rowBits(node), r.codeBits, r.scalar(node), r.norm(node), qRot)
+	default:
+		return estimateBytes(r.rowBits(node), r.scalar(node), r.norm(node), qc)
 	}
-
-	visited := map[int32]bool{ep: true}
-	d0 := distQ(ep)
-	candHeap := &minHeap{{ep, d0}}
-	resHeap := &maxHeap{{ep, d0}}
-	for candHeap.Len() > 0 {
-		c := candHeap.popMin()
-		if resHeap.Len() >= efSearch && c.d > (*resHeap)[0].d {
-			break
-		}
-		for _, nb := range r.links.neighbors0(c.id) {
-			if visited[nb] {
-				continue
-			}
-			visited[nb] = true
-			d := distQ(nb)
-			if resHeap.Len() < efSearch || d < (*resHeap)[0].d {
-				candHeap.pushItem(cand{nb, d})
-				resHeap.pushItem(cand{nb, d})
-				if resHeap.Len() > efSearch {
-					resHeap.popMax()
-				}
-			}
-		}
-	}
-	out := make([]cand, resHeap.Len())
-	copy(out, *resHeap)
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].d != out[j].d {
-			return out[i].d < out[j].d
-		}
-		return out[i].id < out[j].id
-	})
-	return out
 }
 
 // rerankAndTop scores the candidate set sharply and returns the top-k. In the
@@ -349,22 +318,8 @@ func (r *Region) rerankAndTop(qRot []float32, qc queryCode, cands []cand, k, rer
 		cands = cands[:rerankDepth]
 	}
 	scored := make([]Result, len(cands))
-	switch {
-	case r.hasRerank:
-		scale := float64(r.iq.scale)
-		rdim := int(r.h.rdim)
-		for i, c := range cands {
-			row := r.rerank[int(c.id)*rdim : (int(c.id)+1)*rdim]
-			scored[i] = Result{DocID: uint32(c.id), Score: scale * dotF32I8(qRot, row)}
-		}
-	case r.multibit:
-		for i, c := range cands {
-			scored[i] = Result{DocID: uint32(c.id), Score: estimateMultiBytes(r.rowBits(c.id), r.codeBits, r.scalar(c.id), r.norm(c.id), qRot)}
-		}
-	default:
-		for i, c := range cands {
-			scored[i] = Result{DocID: uint32(c.id), Score: estimateBytes(r.rowBits(c.id), r.scalar(c.id), r.norm(c.id), qc)}
-		}
+	for i, c := range cands {
+		scored[i] = Result{DocID: uint32(c.id), Score: r.rerankScore(c.id, qRot, qc)}
 	}
 	sort.Slice(scored, func(i, j int) bool {
 		if scored[i].Score != scored[j].Score {
@@ -389,22 +344,8 @@ func (r *Region) BruteForce(query []float32, k int) []Result {
 	qc := encodeQuery(qRot)
 	n := int(r.h.count)
 	scored := make([]Result, n)
-	switch {
-	case r.hasRerank:
-		scale := float64(r.iq.scale)
-		rdim := int(r.h.rdim)
-		for i := 0; i < n; i++ {
-			row := r.rerank[i*rdim : (i+1)*rdim]
-			scored[i] = Result{DocID: uint32(i), Score: scale * dotF32I8(qRot, row)}
-		}
-	case r.multibit:
-		for i := 0; i < n; i++ {
-			scored[i] = Result{DocID: uint32(i), Score: estimateMultiBytes(r.rowBits(int32(i)), r.codeBits, r.scalar(int32(i)), r.norm(int32(i)), qRot)}
-		}
-	default:
-		for i := 0; i < n; i++ {
-			scored[i] = Result{DocID: uint32(i), Score: estimateBytes(r.rowBits(int32(i)), r.scalar(int32(i)), r.norm(int32(i)), qc)}
-		}
+	for i := 0; i < n; i++ {
+		scored[i] = Result{DocID: uint32(i), Score: r.rerankScore(int32(i), qRot, qc)}
 	}
 	sort.Slice(scored, func(i, j int) bool {
 		if scored[i].Score != scored[j].Score {
