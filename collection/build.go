@@ -13,6 +13,7 @@ import (
 	"github.com/tamnd/tsumugi/forward"
 	"github.com/tamnd/tsumugi/graph"
 	"github.com/tamnd/tsumugi/lexical"
+	"github.com/tamnd/tsumugi/mph"
 )
 
 // DefaultShardSize is the document count a shard holds by default, the granularity
@@ -115,7 +116,17 @@ func build(opts Options, baseStart uint32, indexStart int) (Result, error) {
 	// real signal exists; each shard then receives its slice of every signal vector
 	// to bake into its feature matrix. The signals are indexed by the same host+url
 	// order the shards are cut from, so sig.slice(lo, hi) lines up with docs[lo:hi].
-	sig, graphRegion := globalSignals(docs, opts.TrustSeeds, opts.SpamSeeds)
+	sig, graphRegion, dir := globalSignals(docs, opts.TrustSeeds, opts.SpamSeeds)
+
+	// Assign every document its corpus-stable global node id by the host and domain
+	// partition, the id the graph region keys a far out-edge by. It is a separate id
+	// from the dense docID a shard numbers its documents 0..N with: the dense id is
+	// the within-shard position the postings and forward store use, the global id is
+	// the host-clustered name a cross-shard edge points at, so a page's far targets on
+	// one host fall in a contiguous id range the cross-shard list gap-encodes cheaply.
+	// The shards carry it as their graph id table; serving keeps using the contiguous
+	// nodeBase+dense docID handle, which is untouched.
+	gids := AssignGlobalIDs(docs, DefaultPartitionParams())
 
 	res := Result{Docs: len(docs), Hosts: hosts}
 	base := baseStart
@@ -126,7 +137,7 @@ func build(opts Options, baseStart uint32, indexStart int) (Result, error) {
 			hi = len(docs)
 		}
 		path := shardPath(opts.Out, index)
-		n, err := writeShard(path, docs[lo:hi], sig.slice(lo, hi), base)
+		n, err := writeShard(path, docs[lo:hi], sig.slice(lo, hi), base, lo, gids, dir)
 		if err != nil {
 			return Result{}, err
 		}
@@ -197,7 +208,7 @@ func readSource(path string, limit int) ([]convert.Document, int, error) {
 // link signals in sig (one entry per document, aligned to docs); the forward store
 // keeps the url, title, and body so the shard holds the text it was built from; the
 // graph region carries the link graph recovered from the page bodies.
-func writeShard(path string, docs []convert.Document, sig graphSignals, base uint32) (int64, error) {
+func writeShard(path string, docs []convert.Document, sig graphSignals, base uint32, lo int, gids []uint64, dir *mph.Dir) (int64, error) {
 	lb := lexical.NewBuilder(lexical.DefaultParams())
 	fb := feature.NewBuilder(feature.DefaultSchema(), feature.SchemaVersion)
 	cols := docColumns()
@@ -209,18 +220,10 @@ func writeShard(path string, docs []convert.Document, sig graphSignals, base uin
 		}
 	}
 	fwd := forward.NewBuilder(fwdCols)
-	gb := graph.NewBuilder(len(docs))
-
-	// Map each document's canonical URL to its local node id so an extracted link
-	// whose target lives in this shard resolves to an intra-shard edge. A target
-	// that resolves outside the shard is dropped here; the cross-shard edges are the
-	// next milestone's concern, where a collection-wide node id carries them.
-	urlToID := make(map[string]int, len(docs))
-	for i, d := range docs {
-		if cu, ok := analyze.CanonicalURL(d.URL); ok {
-			urlToID[cu] = i
-		}
-	}
+	// The shard's graph region carries the partition global node ids for its nodes as
+	// its id table (dense docID d in this shard is collection index lo+d, whose global
+	// id is gids[lo+d]), the names a cross-shard edge resolves against.
+	gb := graph.NewBuilder(len(docs)).WithNodeIDs(gids[lo : lo+len(docs)])
 
 	var tokens, titleTokens, bodyTokens, urlTokens float64
 	for i, d := range docs {
@@ -265,9 +268,21 @@ func writeShard(path string, docs []convert.Document, sig graphSignals, base uin
 		fwd.Set(id, "url", []byte(d.URL))
 		fwd.Set(id, "title", []byte(a.Title))
 		fwd.Set(id, "body", []byte(d.Body))
+		// Resolve each outbound link against the collection-wide directory. A target
+		// the collection holds is either in this shard (an intra-shard edge, keyed by
+		// the local dense docID) or in another shard (a cross-shard edge, keyed by the
+		// target's global node id, framed into the region's cross-shard list to route to
+		// the owning shard later). A target the crawl never captured does not resolve
+		// and is dropped, which on a breadth-first sample is almost all of them.
 		for _, tgt := range analyze.Links(d) {
-			if j, ok := urlToID[tgt]; ok {
-				gb.AddEdge(i, j)
+			j, ok := dir.Lookup([]byte(tgt))
+			if !ok || int(j) == lo+i {
+				continue
+			}
+			if int(j) >= lo && int(j) < lo+len(docs) {
+				gb.AddEdge(i, int(j)-lo)
+			} else {
+				gb.AddCrossEdge(i, gids[j])
 			}
 		}
 	}

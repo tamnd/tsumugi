@@ -39,7 +39,7 @@ func crossHostDocs(spokes int) []convert.Document {
 func TestGlobalSignalsCrossHost(t *testing.T) {
 	const spokes = 10
 	docs := crossHostDocs(spokes)
-	sig, _ := globalSignals(docs, nil, nil)
+	sig, _, _ := globalSignals(docs, nil, nil)
 
 	if sig.inDegree[0] != spokes {
 		t.Fatalf("hub in-degree = %d, want %d", sig.inDegree[0], spokes)
@@ -90,7 +90,7 @@ func TestGlobalSignalsCrossHost(t *testing.T) {
 func TestGlobalLinkCountSignals(t *testing.T) {
 	const spokes = 10
 	docs := crossHostDocs(spokes)
-	sig, _ := globalSignals(docs, nil, nil)
+	sig, _, _ := globalSignals(docs, nil, nil)
 
 	if len(sig.linkingHosts) != len(docs) {
 		t.Fatalf("linking hosts length %d != docs %d", len(sig.linkingHosts), len(docs))
@@ -233,7 +233,7 @@ func TestGraphSignalsOnCCrawl(t *testing.T) {
 		t.Skip("no documents in parquet")
 	}
 
-	sig, _ := globalSignals(docs, nil, nil)
+	sig, _, _ := globalSignals(docs, nil, nil)
 	if len(sig.pageRank) != len(docs) {
 		t.Fatalf("pagerank length %d != docs %d", len(sig.pageRank), len(docs))
 	}

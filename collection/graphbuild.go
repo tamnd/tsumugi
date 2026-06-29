@@ -350,13 +350,16 @@ func widen(r []float32) []float64 {
 // serving reads. The seeds follow the spec: curated lists are an input recorded
 // with the build, extended automatically by inverse PageRank and filtered by
 // anti-trust.
-// It returns the signals and the encoded collection-wide graph region bytes, so the
+// It returns the signals, the encoded collection-wide graph region bytes (so the
 // build can persist that graph as the cross-shard graph artifact the out-of-core
-// StreamPageRank streams from at scale, without rebuilding it.
-func globalSignals(docs []convert.Document, trustSeeds, spamSeeds []string) (graphSignals, []byte) {
+// StreamPageRank streams from at scale, without rebuilding it), and the canonical-URL
+// directory it resolved the graph against, so the shard writer can resolve each link
+// target to a collection index, and so decide an intra-shard from a cross-shard edge,
+// without building a second directory over the whole collection.
+func globalSignals(docs []convert.Document, trustSeeds, spamSeeds []string) (graphSignals, []byte, *mph.Dir) {
 	n := len(docs)
 	if n == 0 {
-		return graphSignals{}, nil
+		return graphSignals{}, nil, nil
 	}
 	dir := buildDir(docs)
 	g, region := buildGraphRegion(docs, dir)
@@ -388,7 +391,7 @@ func globalSignals(docs []convert.Document, trustSeeds, spamSeeds []string) (gra
 	// last so it can read them. It supersedes the per-document static-rank prior the
 	// analyze stage writes.
 	sig.staticRank = compositeStaticRank(docs, sig)
-	return sig, region
+	return sig, region, dir
 }
 
 // globalRanks computes collection-wide PageRank over the whole link graph and
