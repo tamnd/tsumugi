@@ -284,3 +284,44 @@ func BenchmarkBrokerSearchCached(b *testing.B) {
 func prodCascade(model *rank.Model) *rank.Cascade {
 	return rank.NewCascade(&rank.Linear{RetrievalWeight: 1}, model)
 }
+
+// routingVocab builds a deterministic term-to-shards map for the routing benchmarks, a
+// large vocabulary spread across many shards, the shape the front-coded index is sized for.
+func routingVocab(numTerms, numShard int) map[string][]int {
+	postings := make(map[string][]int, numTerms)
+	for i := 0; i < numTerms; i++ {
+		fan := 1 + i%4
+		sh := make([]int, fan)
+		for j := 0; j < fan; j++ {
+			sh[j] = (i*7 + j*13) % numShard
+		}
+		postings[fmt.Sprintf("term%06d", i)] = sh
+	}
+	return postings
+}
+
+// BenchmarkRoutingBuild times constructing the front-coded, bloom-fronted routing index
+// from a term-to-shards map, the one-time startup cost a broker pays when it loads the
+// persisted artifact at fleet scale.
+func BenchmarkRoutingBuild(b *testing.B) {
+	postings := routingVocab(200000, 10000)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = NewRoutingIndex(postings, nil, 10000)
+	}
+}
+
+// BenchmarkRouteTerms times a routing lookup on the hot path, a few-term query against a
+// large vocabulary, the per-query routing cost doc 11 budgets under half a millisecond. It
+// covers present terms (a dictionary hit) and an absent term (a bloom reject).
+func BenchmarkRouteTerms(b *testing.B) {
+	postings := routingVocab(200000, 10000)
+	ri := NewRoutingIndex(postings, nil, 10000)
+	terms := []string{"term000123", "term100000", "term199999", "not_in_vocab"}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if got := ri.RouteTerms(terms); len(got) == 0 {
+			b.Fatal("routed nothing")
+		}
+	}
+}
