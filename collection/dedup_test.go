@@ -158,4 +158,3 @@ func TestDedupOnCCrawl(t *testing.T) {
 		t.Fatalf("distinct canonical survivors %d != distinct canonical URLs %d", len(seen), len(canon))
 	}
 }
-
