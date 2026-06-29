@@ -169,9 +169,10 @@ func build(opts Options, baseStart uint32, indexStart int) (Result, error) {
 }
 
 // readSource reads every document from a crawl export, skipping records with no body
-// since they carry no text to index, and counts the distinct hosts. It buffers the
-// whole crawl so the build can order it; a crawl too large to buffer is the streaming
-// case left for later.
+// since they carry no text to index, collapsing records that share a canonical URL to
+// the most recent fetch, and counts the distinct hosts of what survives. It buffers
+// the whole crawl so the build can order it; a crawl too large to buffer is the
+// streaming case left for later.
 func readSource(path string, limit int) ([]convert.Document, int, error) {
 	src, err := convert.OpenSource(path)
 	if err != nil {
@@ -179,8 +180,7 @@ func readSource(path string, limit int) ([]convert.Document, int, error) {
 	}
 	defer func() { _ = src.Close() }()
 
-	var docs []convert.Document
-	hosts := map[string]struct{}{}
+	var raw []convert.Document
 	for {
 		d, ok, err := src.Next()
 		if err != nil {
@@ -192,13 +192,51 @@ func readSource(path string, limit int) ([]convert.Document, int, error) {
 		if d.Body == "" {
 			continue
 		}
-		docs = append(docs, d)
-		hosts[d.Host] = struct{}{}
-		if limit > 0 && len(docs) >= limit {
+		raw = append(raw, d)
+		if limit > 0 && len(raw) >= limit {
 			break
 		}
 	}
+	docs, _ := dedupByIdentity(raw)
+	hosts := map[string]struct{}{}
+	for _, d := range docs {
+		hosts[d.Host] = struct{}{}
+	}
 	return docs, len(hosts), nil
+}
+
+// dedupByIdentity collapses documents that name the same page to one, keying on doc
+// 02's canonical URL identity: two URL spellings of a page (a trailing slash, a
+// tracking parameter, a default port) fold to one canonical URL and so to one
+// document, which is what keeps a page from being indexed, ranked, and counted twice.
+// When a canonical URL appears more than once, the most recent fetch wins (the crawl
+// dates are YYYY-MM-DD, so a lexical comparison is chronological), and a tie keeps the
+// one already held so the result is deterministic. The surviving documents stay in
+// first-seen order, so a build over the same crawl is reproducible. A record whose URL
+// has no canonical form has no identity to collide on and is kept as-is. The second
+// return is the number of duplicates dropped, for the caller to report or test.
+func dedupByIdentity(docs []convert.Document) ([]convert.Document, int) {
+	at := make(map[string]int, len(docs)) // canonical URL -> index into out
+	out := make([]convert.Document, 0, len(docs))
+	dropped := 0
+	for _, d := range docs {
+		cu, ok := analyze.CanonicalURL(d.URL)
+		if !ok {
+			out = append(out, d)
+			continue
+		}
+		i, seen := at[cu]
+		if !seen {
+			at[cu] = len(out)
+			out = append(out, d)
+			continue
+		}
+		dropped++
+		if d.CrawlDate > out[i].CrawlDate {
+			out[i] = d
+		}
+	}
+	return out, dropped
 }
 
 // writeShard builds the lexical, feature, forward, and graph regions for one slice
