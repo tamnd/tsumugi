@@ -31,6 +31,16 @@ const (
 	wStaticNearDup    = 0.20
 )
 
+// The content-quality term is itself a blend of the page-local quality signals, both in
+// [0,1] and both positive, so the term stays in [0,1] and the composite stays monotone.
+// Boilerplate carries most of the weight because it measures the page's own substance
+// directly; language consistency is the lighter cross-check that the page's language fits
+// its host, the spam-signature signal of spec doc 07.
+const (
+	wQualityBoiler = 0.70
+	wQualityLang   = 0.30
+)
+
 // staticRankEps and staticCountEps are the offsets that keep the log scale defined.
 // The rank signals (page, host, domain, trust) are tiny positive fractions from the
 // power iteration, so a vanishing eps keeps their heavy tail spread under the log;
@@ -49,8 +59,9 @@ const (
 //
 // Each heavy-tailed authority signal is log-scaled and min-max normalized to [0,1]
 // over the corpus so one giant-PageRank page does not swamp the others and the scale
-// is stable across shards. The quality term is 1 minus the boilerplate ratio, already
-// in [0,1]. Freshness defaults to the neutral fully-fresh value until the freshness
+// is stable across shards. The quality term blends 1 minus the boilerplate ratio with
+// the language-consistency signal, both already in [0,1]. Freshness defaults to the
+// neutral fully-fresh value until the freshness
 // family populates a per-page estimate; being uniform it shifts every rank equally
 // and does not change the order, but the term is kept so the blend is complete and
 // reads the real value once it lands. SpamMass and the near-dup penalty enter
@@ -67,7 +78,8 @@ func compositeStaticRank(docs []convert.Document, s graphSignals) []float64 {
 	ntr := normLog(s.trust, staticRankEps)
 	nid := normLogInt(s.linkingDomains, staticCountEps)
 	for i := 0; i < n; i++ {
-		quality := 1 - analyze.BoilerplateRatio(docs[i].Body)
+		quality := wQualityBoiler*(1-analyze.BoilerplateRatio(docs[i].Body)) +
+			wQualityLang*langConsistencyAt(s, i)
 		const freshness = 1.0 // neutral until the freshness family lands
 		rank[i] = wStaticPageRank*npr[i] +
 			wStaticHostRank*nhost[i] +
@@ -80,6 +92,18 @@ func compositeStaticRank(docs []convert.Document, s graphSignals) []float64 {
 			wStaticNearDup*s.nearDup[i]
 	}
 	return rank
+}
+
+// langConsistencyAt reads the language-consistency score of document i, defaulting to the
+// neutral value when the signal is absent. The full build always populates it, but the
+// direct-call tests build a graphSignals from the authority and spam columns alone, and a
+// neutral default lets the composite read uniformly for them without a nil check at every
+// call site, the same not-evidence stance languageConsistency itself takes.
+func langConsistencyAt(s graphSignals, i int) float64 {
+	if s.langConsist == nil {
+		return languageNeutral
+	}
+	return s.langConsist[i]
 }
 
 // normLog log-scales a float signal with the given offset and min-max normalizes the
