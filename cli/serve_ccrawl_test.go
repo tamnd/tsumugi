@@ -178,6 +178,106 @@ func TestAggregatorCCrawl(t *testing.T) {
 	}
 }
 
+// TestAggregatorCCrawlDocFreqsExact is the cross-broker exact-idf proof on real data: an
+// aggregator over two brokers that split the real shards gathers the same fleet-wide df and
+// document count a single broker over every shard reports, so the idf the aggregator pushes
+// down is the one a monolith would compute. The real corpus is exactly where a broker's own
+// df diverges from the fleet's, because a term's documents are spread unevenly across the
+// shards two brokers hold, so this is the gap TestAggregatorCCrawl could not assert
+// bit-exactness against: with the fleet df gathered at the aggregator the statistic is now
+// identical to the monolith's, term for term, over real text.
+func TestAggregatorCCrawlDocFreqsExact(t *testing.T) {
+	if _, err := os.Stat(ccrawlParquet); err != nil {
+		t.Skipf("ccrawl parquet not present: %v", err)
+	}
+	if testing.Short() {
+		t.Skip("skipping real-data build in short mode")
+	}
+	tmp := t.TempDir()
+	out := filepath.Join(tmp, "coll")
+	res, err := collection.Build(collection.Options{Source: ccrawlParquet, Out: out, ShardSize: 1000, Limit: 8000})
+	if err != nil {
+		t.Fatalf("Build from ccrawl: %v", err)
+	}
+	if res.Shards < 4 {
+		t.Fatalf("need at least 4 shards to split across two brokers, got %d", res.Shards)
+	}
+
+	modelPath := filepath.Join(tmp, "model.bin")
+	writeModel(t, modelPath)
+	f, err := os.Open(modelPath)
+	if err != nil {
+		t.Fatalf("open model: %v", err)
+	}
+	ens, err := rank.LoadEnsemble(f)
+	_ = f.Close()
+	if err != nil {
+		t.Fatalf("load model: %v", err)
+	}
+	model := ens.Compile()
+
+	// all is the broker over every shard, the monolith ground truth for the fleet statistics;
+	// it owns the file mappings, so it is the one closed. The aggregator's two sub-brokers
+	// reference the same read-only shards split in half.
+	shards, all, err := openShards(out, model)
+	if err != nil {
+		t.Fatalf("openShards: %v", err)
+	}
+	defer func() { _ = all.Close() }()
+	pl := buildPipeline(shards)
+
+	half := len(shards) / 2
+	b0 := search.NewBroker(shards[:half], newCascade(model))
+	b1 := search.NewBroker(shards[half:], newCascade(model))
+	agg := search.NewAggregator([]search.Searcher{b0, b1})
+
+	ctx := context.Background()
+	if agg.NumDocs() != all.NumDocs() {
+		t.Fatalf("aggregator NumDocs = %d, monolith %d", agg.NumDocs(), all.NumDocs())
+	}
+
+	// Gather the real retrieval terms the analysis chain produces for a set of common content
+	// words, the terms the aggregator would push idf down for, and check the fleet df matches
+	// the monolith's for every one of them.
+	queries := []string{"data", "page", "home", "search", "news", "world", "time", "people"}
+	checked, skewed := 0, 0
+	for _, qs := range queries {
+		pq := pl.parse(qs)
+		if pq.Empty() {
+			continue
+		}
+		terms := toQuery(pq, 10).Terms
+		if len(terms) == 0 {
+			continue
+		}
+		want := all.DocFreqs(ctx, terms)
+		got := agg.DocFreqs(ctx, terms)
+		for _, term := range terms {
+			if got[term] != want[term] {
+				t.Fatalf("query %q fleet df[%q] = %d, monolith %d", qs, term, got[term], want[term])
+			}
+			if want[term] == 0 {
+				continue
+			}
+			checked++
+			// A term whose documents do not all sit in one broker's shards has a broker-local df
+			// below the fleet df, the skew the gather corrects; count how many real terms show it
+			// so the test fails loudly if the corpus happened to land every term in one broker.
+			d0 := b0.DocFreqs(ctx, terms)
+			d1 := b1.DocFreqs(ctx, terms)
+			if d0[term] != want[term] && d1[term] != want[term] {
+				skewed++
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatalf("no real term resolved to a non-zero df over %d docs", res.Docs)
+	}
+	if skewed == 0 {
+		t.Fatalf("no term's df was split across both brokers; the corpus shows no cross-broker skew to correct")
+	}
+}
+
 // TestDegradeCCrawl exercises the degradation ladder on real data: it builds a real
 // multi-shard collection and runs every rung of the ladder, checking that the
 // full-quality rung matches the plain completeness path bit for bit, that every rung

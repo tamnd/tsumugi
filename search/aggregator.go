@@ -4,6 +4,7 @@ import (
 	"context"
 	"runtime"
 	"sort"
+	"sync"
 )
 
 // Searcher is one node in the serving tree. A broker over shards and an aggregator over
@@ -20,6 +21,15 @@ type Searcher interface {
 	// aggregator can account for a child that was dropped at the deadline without having
 	// heard from it.
 	NumShards() int
+	// NumDocs is the fleet-wide document count beneath the node, the N idf divides by, so
+	// a parent aggregator sums its children's NumDocs into the fleet N it computes one
+	// shared idf against.
+	NumDocs() uint64
+	// DocFreqs sums each term's document frequency across the subtree beneath the node, so
+	// a parent aggregator can add the per-child counts into the fleet-wide df no single
+	// child can see. It is the cross-node half of the global idf the broker already
+	// computes across its own shards.
+	DocFreqs(ctx context.Context, terms []string) map[string]uint32
 }
 
 // Aggregator is the top tier of the serving topology: it holds no shards, it holds a set
@@ -46,11 +56,16 @@ type Aggregator struct {
 }
 
 // NewAggregator builds an aggregator over already-constructed child nodes, each a broker or
-// a sub-aggregator. The children must share the collection's fleet-wide statistics so their
-// L2 scores are comparable at the merge, the common single-GlobalStats case the cheap exact
-// merge rests on; a deployment that partitions statistics across child groups is the case
-// the spec hands a re-run of L2 at the aggregator, which this merge does not yet do (see
-// the package notes).
+// a sub-aggregator. The children must share the collection's fleet-wide normalization
+// statistics, the average document and field lengths and the static-rank and PageRank
+// constants, so their L2 scores are comparable at the merge, the common single-GlobalStats
+// case the cheap exact merge rests on. The one fleet-wide statistic the aggregator does not
+// rely on the children already sharing is the per-term idf: a broker can only gather df over
+// its own shards, so the aggregator gathers the df across every child and pushes one shared
+// idf down at query time (see SearchComplete), which is what makes the merge exact even when
+// the brokers' vocabularies diverge. A deployment that partitions the rest of the statistics
+// across child groups is the case the spec hands a re-run of L2 at the aggregator, which this
+// merge does not yet do (see the package notes).
 func NewAggregator(children []Searcher) *Aggregator {
 	return &Aggregator{children: children, maxConcurrency: runtime.GOMAXPROCS(0)}
 }
@@ -68,6 +83,58 @@ func (a *Aggregator) NumShards() int {
 // NumChildren is the count of immediate child nodes the aggregator fans across.
 func (a *Aggregator) NumChildren() int { return len(a.children) }
 
+// NumDocs is the fleet-wide document count beneath the aggregator, the sum over its
+// children, so the aggregator divides one shared idf by the same N a single index over the
+// whole subtree would (the Searcher contract).
+func (a *Aggregator) NumDocs() uint64 {
+	var n uint64
+	for _, c := range a.children {
+		n += c.NumDocs()
+	}
+	return n
+}
+
+// DocFreqs sums each term's document frequency across the whole subtree by gathering it
+// from every child concurrently and adding the per-child counts. A child is a broker that
+// sums over its shards or a sub-aggregator that recurses, so the gather composes down the
+// tree the same way the search does, and the total is the term's true fleet-wide df. It
+// reads only bloom filters and dictionaries, so it is cheap next to the search it precedes,
+// and it honors the deadline: a cancelled context returns whatever has been gathered,
+// which only loosens an idf, never corrupts a score.
+func (a *Aggregator) DocFreqs(ctx context.Context, terms []string) map[string]uint32 {
+	if len(terms) == 0 {
+		return nil
+	}
+	df := make(map[string]uint32)
+	var mu sync.Mutex
+	sem := make(chan struct{}, a.maxConcurrency)
+	var wg sync.WaitGroup
+	for _, c := range a.children {
+		select {
+		case <-ctx.Done():
+			wg.Wait()
+			return df
+		case sem <- struct{}{}:
+		}
+		wg.Add(1)
+		go func(c Searcher) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			local := c.DocFreqs(ctx, terms)
+			if len(local) == 0 {
+				return
+			}
+			mu.Lock()
+			for t, f := range local {
+				df[t] += f
+			}
+			mu.Unlock()
+		}(c)
+	}
+	wg.Wait()
+	return df
+}
+
 // Search fans the query across the children and returns the merged fleet-wide top-k,
 // dropping the completeness indicator. SearchComplete returns the same top-k with the
 // count of shards reached so a caller can tell a complete answer from a degraded one.
@@ -83,6 +150,21 @@ func (a *Aggregator) Search(ctx context.Context, q Query) []Hit {
 // partial whenever any shard anywhere beneath the tree was missed and is never passed off as
 // complete (doc 11, "Failure modes and partial results", composed up a level).
 func (a *Aggregator) SearchComplete(ctx context.Context, q Query) Results {
+	// Phase one of cross-broker exact idf: a term's fleet-wide df is the sum across every
+	// broker's shards, which no single broker can see, because a broker gathers df only over
+	// its own shards and divides by its own N. So the aggregator gathers the df across all
+	// the children, turns it into one fleet-wide idf against the fleet N, and pushes it down
+	// into the query before fan-out. Each broker then scores against this shared idf instead
+	// of its own partial one (the broker honors a pre-set TermIDF rather than recomputing),
+	// so the brokers' L2 scores land on one scale and the merge below is a comparison of
+	// comparable scores, the cheap exact merge (doc 11, "Exactness up the tree"). The
+	// children must already share the fleet-wide GlobalStats for the rest of the
+	// normalization (avg lengths, N), the NewAggregator contract; idf is the one statistic
+	// the aggregator must gather at query time because it is specific to the query's terms.
+	// A query that already carries idf overrides or has no lexical terms skips the gather.
+	if len(q.Terms) > 0 && q.TermIDF == nil {
+		q.TermIDF = idfFromDF(a.DocFreqs(ctx, q.Terms), a.NumDocs())
+	}
 	results, _ := a.fanOut(ctx, q)
 
 	var hits []Hit
