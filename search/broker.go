@@ -375,12 +375,19 @@ dispatch:
 // returns the collection-wide idf per term. The document count is the fleet-wide N from
 // the broker's statistics, the same N a single index over every shard would divide by,
 // and the df is summed over exactly the shards routing selected, which for a lexical
-// term are all the shards that hold it, so the sum is the term's true collection df. The
+// term are all the shards that hold it, so the sum is the term's true collection df. An
+// empty result lets the fan-out fall back to shard-local idf.
+func (b *Broker) globalIDF(ctx context.Context, terms []string, targets []int) map[string]float64 {
+	return idfFromDF(b.gatherDF(ctx, terms, targets), b.stats.DocCount)
+}
+
+// gatherDF sums each term's document frequency across a set of this broker's shards. The
 // gather reads only bloom filters and dictionaries, so it is cheap next to the retrieval
 // it precedes; it runs concurrently under the broker's concurrency bound and a cancelled
 // context returns whatever has been gathered, which only loosens an idf, never corrupts a
-// score. An empty result lets the fan-out fall back to shard-local idf.
-func (b *Broker) globalIDF(ctx context.Context, terms []string, targets []int) map[string]float64 {
+// score. The returned map holds only the terms some shard carried, so a term no shard
+// holds is absent rather than zero.
+func (b *Broker) gatherDF(ctx context.Context, terms []string, targets []int) map[string]uint32 {
 	df := make(map[string]uint32)
 	var mu sync.Mutex
 	sem := make(chan struct{}, b.maxConcurrency)
@@ -389,7 +396,7 @@ func (b *Broker) globalIDF(ctx context.Context, terms []string, targets []int) m
 		select {
 		case <-ctx.Done():
 			wg.Wait()
-			return idfFromDF(df, b.stats.DocCount)
+			return df
 		case sem <- struct{}{}:
 		}
 		wg.Add(1)
@@ -408,7 +415,24 @@ func (b *Broker) globalIDF(ctx context.Context, terms []string, targets []int) m
 		}(si)
 	}
 	wg.Wait()
-	return idfFromDF(df, b.stats.DocCount)
+	return df
+}
+
+// NumDocs is the fleet-wide document count beneath this broker, the N idf divides by, so
+// an aggregator over several brokers sums their NumDocs into the fleet N it computes one
+// shared idf against (the Searcher contract).
+func (b *Broker) NumDocs() uint64 { return b.stats.DocCount }
+
+// DocFreqs sums each term's document frequency across the broker's shards that hold it, so
+// an aggregator can add the per-broker counts into the fleet-wide df no single broker can
+// see (the Searcher contract). It routes the terms to the shards that carry them and
+// gathers only those, the same cheap bloom-and-dictionary read globalIDF uses, and honors
+// the deadline by returning whatever it has gathered when the context is cancelled.
+func (b *Broker) DocFreqs(ctx context.Context, terms []string) map[string]uint32 {
+	if len(terms) == 0 {
+		return nil
+	}
+	return b.gatherDF(ctx, terms, b.routing.RouteTerms(terms))
 }
 
 // idfFromDF turns gathered per-term document frequencies into per-term idf against the

@@ -125,6 +125,47 @@ func BenchmarkAggregatorSearch(b *testing.B) {
 	}
 }
 
+// BenchmarkAggregatorDocFreqs measures the fleet-wide df gather the aggregator runs before
+// fan-out to push one shared idf down across its brokers. It is the cost the cross-broker
+// exact rerank adds to a query, so the point is that it is small next to the search it
+// precedes (BenchmarkAggregatorSearch over the same tree): the gather reads only the bloom
+// filters and dictionaries for the query's terms, never the postings, so it scales with the
+// term count and the broker fan-out, not with the corpus.
+func BenchmarkAggregatorDocFreqs(b *testing.B) {
+	const n, brokers, perBroker = 50000, 4, 4
+	parts := brokers * perBroker
+	docs := makeCorpus(n)
+	dir := b.TempDir()
+	model := trainModel(b)
+
+	size := n / parts
+	shards := make([]*Shard, parts)
+	for p := 0; p < parts; p++ {
+		path := filepath.Join(dir, fmt.Sprintf("s%d.tsumugi", p))
+		lo := p * size
+		buildShardFile(b, path, docs, lo, lo+size, uint32(lo), false)
+		sh, err := OpenShard(path, prodCascade(model))
+		if err != nil {
+			b.Fatalf("open shard %d: %v", p, err)
+		}
+		shards[p] = sh
+	}
+	children := make([]Searcher, brokers)
+	for k := 0; k < brokers; k++ {
+		children[k] = NewBroker(shards[k*perBroker:(k+1)*perBroker], prodCascade(model))
+	}
+	agg := NewAggregator(children)
+
+	ctx := context.Background()
+	terms := []string{"common", "document", "number", "term0"}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if df := agg.DocFreqs(ctx, terms); len(df) == 0 {
+			b.Fatal("df gather returned nothing")
+		}
+	}
+}
+
 // BenchmarkBrokerSearchDegraded measures each rung of the degradation ladder over the
 // same sixteen-shard corpus the other broker benchmarks use, so the budget each rung
 // recovers can be read against the full-quality path. The ladder is a budget tool, so
