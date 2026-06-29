@@ -26,11 +26,12 @@ func queryAnalyzerHash() uint64 { return lexical.DefaultAnalyzer.Hash() }
 
 func newServeCmd() *cobra.Command {
 	var (
-		dir       string
-		addr      string
-		modelP    string
-		timeout   time.Duration
-		cacheSize int
+		dir         string
+		addr        string
+		modelP      string
+		timeout     time.Duration
+		cacheSize   int
+		maxInFlight int
 	)
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -62,14 +63,19 @@ func newServeCmd() *cobra.Command {
 				broker.SetResultCache(search.NewResultCache(cacheSize))
 			}
 
-			srv := &httpServer{broker: broker, pipeline: pl, timeout: timeout}
+			// Bound the in-flight searches so the broker degrades by rejecting rather than
+			// collapsing under unbounded concurrency. A request that cannot get a slot is
+			// answered 503 fast rather than queued into latency it would miss its deadline in.
+			// A zero capacity disables the gate, leaving the broker unbounded.
+			adm := search.NewAdmission(maxInFlight)
+			srv := &httpServer{broker: broker, pipeline: pl, timeout: timeout, admission: adm}
 			mux := http.NewServeMux()
 			mux.HandleFunc("/search", srv.search)
 			mux.HandleFunc("/healthz", srv.health)
 
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "serving %d shards (%d docs) on %s\n",
 				broker.NumShards(), broker.Stats().DocCount, addr)
-			return http.ListenAndServe(addr, mux)
+			return serveHTTP(cmd.Context(), addr, mux, adm, timeout)
 		},
 	}
 	cmd.Flags().StringVar(&dir, "dir", "", "directory of .tsumugi shards to serve")
@@ -77,7 +83,39 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&modelP, "model", "", "trained ranking model file")
 	cmd.Flags().DurationVar(&timeout, "timeout", 10*time.Millisecond, "per-request deadline")
 	cmd.Flags().IntVar(&cacheSize, "cache", 0, "result cache capacity in entries (0 disables the cache)")
+	cmd.Flags().IntVar(&maxInFlight, "max-inflight", 0, "maximum concurrent in-flight searches (0 disables admission control)")
 	return cmd
+}
+
+// serveHTTP runs the broker's HTTP server until the context is cancelled, then drains the
+// in-flight searches before returning, so a deploy or a restart does not drop the queries
+// that were in flight when the shutdown signal arrived. On cancellation it stops admitting
+// new searches, stops the listener from accepting new connections, and waits for the
+// admission gate to drain, bounded by one request deadline so a stuck search cannot hang
+// the shutdown. A nil context runs the server with no drain, the bare-listen behavior.
+func serveHTTP(ctx context.Context, addr string, h http.Handler, adm *search.Admission, timeout time.Duration) error {
+	srv := &http.Server{Addr: addr, Handler: h}
+	if ctx == nil {
+		return srv.ListenAndServe()
+	}
+	errc := make(chan error, 1)
+	go func() { errc <- srv.ListenAndServe() }()
+	select {
+	case err := <-errc:
+		return err // the listener failed on its own (bad addr, port in use)
+	case <-ctx.Done():
+	}
+	// Stop admitting, then drain. The drain bound is the request deadline, doubled so the
+	// last admitted search has a full deadline to finish plus slack for the socket write,
+	// with a floor for a zero-deadline server so the drain still terminates.
+	bound := 2 * timeout
+	if bound <= 0 {
+		bound = 5 * time.Second
+	}
+	dctx, cancel := context.WithTimeout(context.Background(), bound)
+	defer cancel()
+	_ = adm.Drain(dctx)
+	return srv.Shutdown(dctx)
 }
 
 // openCollection opens every shard in a directory, loads the model, wires a broker
@@ -209,6 +247,12 @@ type httpServer struct {
 	broker   *search.Broker
 	pipeline *pipeline
 	timeout  time.Duration
+
+	// admission bounds the in-flight searches. The slot is acquired at the top of the
+	// handler and released with a deferred Release that covers the response encode and the
+	// socket write, the hold-for-the-whole-search discipline doc 11 pins. A disabled gate
+	// (capacity zero) admits everything, so the field is never nil but may be a no-op.
+	admission *search.Admission
 }
 
 type searchResponse struct {
@@ -256,6 +300,19 @@ type hitJSON struct {
 }
 
 func (s *httpServer) search(w http.ResponseWriter, r *http.Request) {
+	// Acquire an admission slot first, before any work, and hold it with a deferred Release
+	// at the top so it covers the whole search including the response encode and the socket
+	// write below, the hold-for-the-whole-search discipline that keeps the slot count a true
+	// bound on in-flight searches (doc 11). A request that cannot get a slot is rejected fast
+	// with 503 rather than queued into latency it would miss its deadline in.
+	slot := s.admission.Acquire()
+	if slot == nil {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "broker at capacity", http.StatusServiceUnavailable)
+		return
+	}
+	defer slot.Release()
+
 	k := 10
 	if v := r.URL.Query().Get("k"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -331,5 +388,10 @@ func (s *httpServer) health(w http.ResponseWriter, _ *http.Request) {
 		"status": "ok",
 		"shards": s.broker.NumShards(),
 		"docs":   s.broker.Stats().DocCount,
+		// in_flight against capacity is the load metric an operator watches to see when the
+		// broker is near capacity and shedding load (doc 11, "Metrics"). capacity is zero
+		// when admission control is disabled.
+		"in_flight": s.admission.InFlight(),
+		"capacity":  s.admission.Cap(),
 	})
 }
