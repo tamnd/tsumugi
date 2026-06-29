@@ -2,8 +2,13 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/tamnd/tsumugi/collection"
@@ -480,4 +485,93 @@ func TestCacheCCrawl(t *testing.T) {
 	if b.ResultCache().Len() != 0 {
 		t.Fatalf("cache not empty after Clear: %d entries", b.ResultCache().Len())
 	}
+}
+
+// TestServeAdmissionCCrawl drives the HTTP serve path over a real multi-shard collection
+// with a bounded admission gate under concurrent load, the property admission control
+// exists for: the broker stays at its true capacity and sheds the overflow rather than
+// collapsing. It fires many concurrent real queries at a small gate and checks every
+// response is either a served 200 or a fast 503, that at least one of each is seen so both
+// arms are exercised, that the in-flight count returns to zero once the burst drains (no
+// leaked slot, the tatami over-admission bug the held-for-the-whole-search discipline
+// fixes), and that the served responses carry real hits.
+func TestServeAdmissionCCrawl(t *testing.T) {
+	if _, err := os.Stat(ccrawlParquet); err != nil {
+		t.Skipf("ccrawl parquet not present: %v", err)
+	}
+	if testing.Short() {
+		t.Skip("skipping real-data build in short mode")
+	}
+	tmp := t.TempDir()
+	out := filepath.Join(tmp, "coll")
+	res, err := collection.Build(collection.Options{Source: ccrawlParquet, Out: out, ShardSize: 1000, Limit: 8000})
+	if err != nil {
+		t.Fatalf("Build from ccrawl: %v", err)
+	}
+	if res.Shards < 2 {
+		t.Fatalf("need at least 2 shards to exercise the fan-out, got %d", res.Shards)
+	}
+
+	modelPath := filepath.Join(tmp, "model.bin")
+	writeModel(t, modelPath)
+	broker, pl, err := openCollection(out, modelPath)
+	if err != nil {
+		t.Fatalf("openCollection: %v", err)
+	}
+	defer func() { _ = broker.Close() }()
+
+	const capacity = 4
+	adm := search.NewAdmission(capacity)
+	srv := &httpServer{broker: broker, pipeline: pl, timeout: 0, admission: adm}
+	ts := httptest.NewServer(http.HandlerFunc(srv.search))
+	defer ts.Close()
+
+	queries := []string{"data", "page", "home", "search", "news", "world", "time", "people"}
+	const workers = 64
+	var ok, busy, withHits int64
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			q := queries[i%len(queries)]
+			resp, err := http.Get(ts.URL + "?q=" + q + "&k=10")
+			if err != nil {
+				return
+			}
+			defer func() { _ = resp.Body.Close() }()
+			switch resp.StatusCode {
+			case http.StatusOK:
+				atomic.AddInt64(&ok, 1)
+				var got searchResponse
+				if json.NewDecoder(resp.Body).Decode(&got) == nil && len(got.Hits) > 0 {
+					atomic.AddInt64(&withHits, 1)
+				}
+			case http.StatusServiceUnavailable:
+				atomic.AddInt64(&busy, 1)
+			default:
+				t.Errorf("unexpected status %d", resp.StatusCode)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if ok == 0 {
+		t.Fatal("no request was admitted under load")
+	}
+	if busy == 0 {
+		t.Fatalf("no request was shed: %d workers against a capacity-%d gate should overflow", workers, capacity)
+	}
+	if ok+busy != workers {
+		t.Fatalf("admitted %d + shed %d != %d workers", ok, busy, workers)
+	}
+	if withHits == 0 {
+		t.Fatal("no admitted request returned hits over the real corpus")
+	}
+	// The held-for-the-whole-search discipline means every served request released its slot:
+	// after the burst the broker is back to zero in-flight, no leaked slot.
+	if got := adm.InFlight(); got != 0 {
+		t.Fatalf("in-flight after the burst = %d, want 0 (leaked slot)", got)
+	}
+	t.Logf("admission under load: %d served, %d shed, capacity %d, %d workers", ok, busy, capacity, workers)
 }
