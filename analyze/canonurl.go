@@ -1,10 +1,27 @@
 package analyze
 
 import (
+	"crypto/sha256"
 	"net/url"
 	"sort"
 	"strings"
 )
+
+// DocID is doc 02's portable document identity: the SHA-256 of a URL's canonical
+// form, the 32-byte key that names the same page across crawls and across shards. The
+// bool is false when the URL is not a usable absolute web link, the same contract
+// CanonicalURL keeps, so the build can skip a row that has no identity rather than
+// store the hash of an empty string. It is the durable, human-auditable key the dense
+// docID (a per-shard build-order position) and the global node id (an MPH slot) are
+// not: two crawls of one page compute the same doc_id because they compute the same
+// canonical URL, which is what lets a later crawl recognize a page it has seen.
+func DocID(raw string) ([32]byte, bool) {
+	cu, ok := CanonicalURL(raw)
+	if !ok {
+		return [32]byte{}, false
+	}
+	return sha256.Sum256([]byte(cu)), true
+}
 
 // Canonical URL identity (doc 02). A page is reachable under many URLs that name the
 // same document, and an edge or a document counted once per spelling inflates the

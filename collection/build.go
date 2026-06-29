@@ -269,6 +269,13 @@ func writeShard(path string, docs []convert.Document, sig graphSignals, base uin
 		// stage wrote into FeatStaticRank above; it is the blend over the whole
 		// collection's signals that orders the postings.
 		fb.Set(id, feature.FeatStaticRank, sig.staticRank[i])
+		// doc_id is the portable cross-crawl identity, the sha256 of the canonical URL.
+		// A row with no usable canonical URL stores the zero id rather than the hash of
+		// an empty string, the same absence the graph build reads from a non-resolving
+		// link; every ingested document has a host, so this is the rare malformed case.
+		if did, ok := analyze.DocID(d.URL); ok {
+			fwd.Set(id, "doc_id", did[:])
+		}
 		fwd.Set(id, "url", []byte(d.URL))
 		fwd.Set(id, "title", []byte(a.Title))
 		fwd.Set(id, "body", []byte(d.Body))
