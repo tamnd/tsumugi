@@ -110,12 +110,41 @@ type shardResult struct {
 	feats map[uint32][]float64
 }
 
+// Results is a fleet-wide top-k with the completeness the query reached. A query
+// returns the best top-k it can with an honest completeness indicator rather than
+// failing or overrunning, so a partial answer is a normal degraded result, not an
+// error (doc 11, "Failure modes and partial results"). ShardsTotal is the number of
+// contributing shards routing selected; ShardsOK is the number that responded inside
+// the deadline. The engine never silently returns a partial result as if it were
+// complete: Complete is true only when every contributing shard responded.
+type Results struct {
+	Hits        []Hit
+	ShardsTotal int
+	ShardsOK    int
+}
+
+// Complete reports whether every contributing shard responded by the deadline, so the
+// top-k is over the whole contributing set rather than a subset. It is the flag the
+// serve path surfaces to the client.
+func (r Results) Complete() bool { return r.ShardsOK == r.ShardsTotal }
+
 // Search fans the query out to the routed shards, gathers their candidates, merges
 // the per-shard ranked lists into global ranked lists, and runs the global rerank,
-// returning the fleet-wide top-k. The fan-out is concurrent and bounded by a
-// semaphore; the context cancels it on deadline so a slow shard cannot hold the
-// whole query past its budget.
+// returning the fleet-wide top-k. It is the back-compatible shape that drops the
+// completeness indicator; SearchComplete returns the same top-k with the count of
+// shards reached so a caller can tell a complete answer from a degraded one.
 func (b *Broker) Search(ctx context.Context, q Query) []Hit {
+	return b.SearchComplete(ctx, q).Hits
+}
+
+// SearchComplete is Search with the completeness indicator doc 11 requires. The
+// fan-out waits for the contributing shards up to the deadline and a shard that has
+// not responded is dropped, so the result is exact over the shards that responded and
+// missing a dropped shard's contribution, and the returned Results says how many of
+// the contributing shards that is. A slow shard cannot hold the whole query past its
+// budget, because the collection stops at the deadline rather than waiting for every
+// dispatched shard.
+func (b *Broker) SearchComplete(ctx context.Context, q Query) Results {
 	// Analyze the query once at the broker and ship the term set to every shard, so the
 	// analysis chain runs one time per query rather than once per shard the fan-out
 	// visits. The shards score q.Terms directly; routing and the idf gather read the
@@ -132,15 +161,12 @@ func (b *Broker) Search(ctx context.Context, q Query) []Hit {
 	if len(q.Terms) > 0 && q.TermIDF == nil {
 		q.TermIDF = b.globalIDF(ctx, q.Terms, targets)
 	}
-	results := b.fanOut(ctx, q, targets)
+	results, ok := b.fanOut(ctx, q, targets)
 
 	var allLex, allDense []scored
 	feats := make(map[uint32][]float64)
 	owner := make(map[uint32]int) // global id -> index of the shard that holds it
 	for _, r := range results {
-		if r == nil {
-			continue
-		}
 		allLex = append(allLex, r.lex...)
 		allDense = append(allDense, r.dense...)
 		for id, fv := range r.feats {
@@ -178,26 +204,33 @@ func (b *Broker) Search(ctx context.Context, q Query) []Hit {
 	for i, c := range cands {
 		hits[i] = Hit{DocID: c.DocID, Score: c.Score}
 	}
-	return hits
+	return Results{Hits: hits, ShardsTotal: len(targets), ShardsOK: ok}
 }
 
 // fanOut runs the routed shards' retrievals concurrently, bounded by the broker's
-// concurrency limit, and returns each shard's result shifted into the global id
-// space. A cancelled context stops dispatching further shards.
-func (b *Broker) fanOut(ctx context.Context, q Query, targets []int) []*shardResult {
-	results := make([]*shardResult, len(targets))
+// concurrency limit, and returns each responding shard's result shifted into the
+// global id space along with the count of shards that responded. It is deadline-aware
+// on both ends: a cancelled context stops dispatching further shards, and the
+// collection stops at the deadline rather than waiting for a dispatched-but-slow
+// shard, so a slow shard is dropped instead of holding the query past its budget. A
+// dropped shard's slice of the corpus is simply absent from the merge, which the
+// returned count reports so the caller can flag the result partial.
+func (b *Broker) fanOut(ctx context.Context, q Query, targets []int) ([]*shardResult, int) {
+	// The channel is buffered to the full target count so a shard goroutine that
+	// finishes after the collection has stopped at the deadline can still send and
+	// exit rather than leaking, blocked on a reader that has gone away.
+	out := make(chan *shardResult, len(targets))
 	sem := make(chan struct{}, b.maxConcurrency)
-	var wg sync.WaitGroup
-	for i, si := range targets {
+	dispatched := 0
+dispatch:
+	for _, si := range targets {
 		select {
 		case <-ctx.Done():
-			wg.Wait()
-			return results
+			break dispatch
 		case sem <- struct{}{}:
 		}
-		wg.Add(1)
-		go func(i, si int) {
-			defer wg.Done()
+		dispatched++
+		go func(si int) {
 			defer func() { <-sem }()
 			s := b.shards[si]
 			lex, dense, feats := s.retrieve(q)
@@ -214,11 +247,19 @@ func (b *Broker) fanOut(ctx context.Context, q Query, targets []int) []*shardRes
 			for id, fv := range feats {
 				gf[base+id] = fv
 			}
-			results[i] = &shardResult{shard: si, lex: gl, dense: gd, feats: gf}
-		}(i, si)
+			out <- &shardResult{shard: si, lex: gl, dense: gd, feats: gf}
+		}(si)
 	}
-	wg.Wait()
-	return results
+	results := make([]*shardResult, 0, dispatched)
+	for len(results) < dispatched {
+		select {
+		case r := <-out:
+			results = append(results, r)
+		case <-ctx.Done():
+			return results, len(results)
+		}
+	}
+	return results, len(results)
 }
 
 // globalIDF gathers each query term's document frequency across the routed shards and
