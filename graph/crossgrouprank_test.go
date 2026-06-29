@@ -32,7 +32,12 @@ func hostGraph(domains, hostsPer, pagesPer, seqBits int) (edges []prEdge, hostOf
 	}
 	// Deterministic links: each page points at a few pages on other hosts and one page on
 	// its own host, so the projection has both inter-group weight to rank and intra-group
-	// edges to drop.
+	// edges to drop. Every page also links to the first page of the first host, a hub that
+	// gives host 0 (and domain 0) a clear in-weight lead over the others, so the host graph is
+	// genuinely asymmetric and its rank is not the uniform stationary distribution a
+	// vertex-transitive (circulant) graph would have. That makes the rank platform-stable: a
+	// flat rank only stays flat to floating-point noise, an asymmetric one has real gaps.
+	hub := idx(0, 0, 0)
 	for d := 0; d < domains; d++ {
 		for h := 0; h < hostsPer; h++ {
 			for p := 0; p < pagesPer; p++ {
@@ -46,6 +51,10 @@ func hostGraph(domains, hostsPer, pagesPer, seqBits int) (edges []prEdge, hostOf
 				// one intra-host edge to the next page in the same host
 				if pagesPer > 1 {
 					edges = append(edges, prEdge{i, idx(d, h, (p+1)%pagesPer)})
+				}
+				// link to the hub (an intra-host edge for host 0's own pages, dropped there)
+				if i != hub {
+					edges = append(edges, prEdge{i, hub})
 				}
 			}
 		}

@@ -1,5 +1,7 @@
 package graph
 
+import "sort"
+
 // This file is the host and domain rank doc 07 specifies for the sharded corpus graph
 // (the "Per-shard versus global" section, L985-994). The page-level link signals
 // (PageRank, TrustRank) are global iterations with a per-iteration cross-shard exchange,
@@ -112,9 +114,24 @@ func StreamGroupRank(shards []*Region, groupOfGlobal func(uint64) int, cfg PRCon
 		})
 	}
 
+	// Build the contracted graph in a fixed key order so the rank is deterministic: a map
+	// range would feed weightedPageRank its in-edges in a different float summation order each
+	// run, which drifts the result in the last bits and across platforms. The group graph is
+	// tiny, so sorting its edges costs nothing.
+	keys := make([]key, 0, len(w))
+	for k := range w {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].v != keys[j].v {
+			return keys[i].v < keys[j].v
+		}
+		return keys[i].u < keys[j].u
+	})
 	inEdges := make([][]wedge, m)
 	outW := make([]float64, m)
-	for k, weight := range w {
+	for _, k := range keys {
+		weight := w[k]
 		inEdges[k.v] = append(inEdges[k.v], wedge{u: k.u, w: weight})
 		outW[k.u] += weight
 	}
