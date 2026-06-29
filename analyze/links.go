@@ -71,43 +71,15 @@ func Links(d convert.Document) []string {
 	return out
 }
 
-// CanonicalURL reduces a raw URL string to the same stable absolute form Links
+// CanonicalURL reduces a raw URL string to the same canonical identity form Links
 // produces for its targets, so a document's own URL can be matched against the link
-// targets of other documents to resolve an edge. The bool is false when the string
-// is not a usable absolute web URL. It is the conservative normalization the link
-// graph keys off; the canonical identity stage folds URLs harder.
+// targets of other documents to resolve an edge, and so the same page written two
+// ways becomes one document identity. The bool is false when the string is not a
+// usable absolute web URL. The fold itself lives in normalizeURL (see canonurl.go).
 func CanonicalURL(raw string) (string, bool) {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
 		return "", false
 	}
 	return normalizeURL(u)
-}
-
-// normalizeURL reduces a URL to a stable absolute form for edge identity: it keeps
-// only http and https, lowercases the scheme and host, drops the fragment, and
-// drops the default port, so http://Example.com:80/a#x and http://example.com/a are
-// one edge. It is deliberately conservative; full canonical-URL folding (path case,
-// trailing slash, query ordering, tracking-param stripping) is the canonical
-// identity stage's job, not the link extractor's. The bool is false when the URL is
-// not a usable absolute web link.
-func normalizeURL(u *url.URL) (string, bool) {
-	scheme := strings.ToLower(u.Scheme)
-	if scheme != "http" && scheme != "https" {
-		return "", false
-	}
-	host := strings.ToLower(u.Host)
-	if host == "" {
-		return "", false
-	}
-	if i := strings.LastIndexByte(host, ':'); i >= 0 {
-		port := host[i+1:]
-		if (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
-			host = host[:i]
-		}
-	}
-	u.Scheme = scheme
-	u.Host = host
-	u.Fragment = ""
-	return u.String(), true
 }
