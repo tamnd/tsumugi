@@ -19,11 +19,13 @@ import (
 // shardGlob matches the shard files a collection holds.
 const shardGlob = "shard-*.tsumugi"
 
-// docColumns is the forward-store schema every shard carries: the url and title for
-// display, and the body so a shard holds the text it was built from, which is what
-// lets Compact rebuild merged shards from the documents alone.
+// docColumns is the forward-store schema every shard carries: the doc_id (doc 02's
+// 32-byte sha256-of-canonical-URL identity, the durable cross-crawl key), the url and
+// title for display, and the body so a shard holds the text it was built from, which
+// is what lets Compact rebuild merged shards from the documents alone.
 func docColumns() []forwardColumn {
 	return []forwardColumn{
+		{Name: "doc_id"},
 		{Name: "url"},
 		{Name: "title"},
 		{Name: "body", Blob: true},
