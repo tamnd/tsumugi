@@ -74,7 +74,7 @@ func appendSortedShards(dst []int32, ids []int) []int32 {
 	tmp := make([]int, len(ids))
 	copy(tmp, ids)
 	sort.Ints(tmp)
-	var prev int = -1
+	prev := -1
 	for _, id := range tmp {
 		if id != prev {
 			dst = append(dst, int32(id))
