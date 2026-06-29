@@ -21,6 +21,11 @@ type Builder struct {
 	raw     map[uint32][]float64 // docID -> per-column raw value
 	maxDoc  uint32
 	hasDocs bool
+
+	// lay holds the per-column layout and dequant params the last Build derived, so the
+	// collection build can read the constants back out for the footer statistics without
+	// recomputing them. It is nil until Build runs.
+	lay []colLayout
 }
 
 // NewBuilder starts a builder over a column schema. Columns are packed into a row
@@ -165,6 +170,8 @@ func (b *Builder) Build() []byte {
 		p0, p1, p2 := quantParams(c, mn, mx)
 		lay[ci] = colLayout{Column: c, offset: b.offsets[ci], p0: p0, p1: p1, p2: p2}
 	}
+	// Keep the layout so Dequant can hand the constants to the footer statistics.
+	b.lay = lay
 
 	// Second pass: quantize each row into fixed-width bytes.
 	rows := make([]byte, int(n)*int(b.stride))
