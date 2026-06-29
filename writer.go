@@ -29,6 +29,41 @@ type Writer struct {
 	stats   Stats
 	enc     *zstd.Encoder
 	closed  bool
+
+	// Shared zstd dictionaries registered with AddDictionary, framed into the
+	// RegionDictionary region on Close. dictByID holds each id's content for the
+	// CodecZstdDict path; encDict caches a per-dictionary encoder.
+	dicts    []dictEntry
+	dictByID map[uint32][]byte
+	encDict  map[uint32]*zstd.Encoder
+}
+
+// AddDictionary registers a shared zstd dictionary under a non-zero id. A region
+// written with CodecZstdDict names a registered id in its descriptor, and the
+// dictionaries are framed into the RegionDictionary region on Close so the reader
+// recovers them. The id must be non-zero (0 means no dictionary) and unique, and
+// the content is copied so the caller may reuse its buffer.
+func (w *Writer) AddDictionary(id uint32, content []byte) error {
+	if w.closed {
+		return fmt.Errorf("tsumugi: AddDictionary after Close")
+	}
+	if id == 0 {
+		return fmt.Errorf("tsumugi: dictionary id must be non-zero")
+	}
+	if len(content) == 0 {
+		return fmt.Errorf("tsumugi: dictionary content is empty")
+	}
+	if _, dup := w.dictByID[id]; dup {
+		return fmt.Errorf("tsumugi: dictionary id %d already registered", id)
+	}
+	cp := make([]byte, len(content))
+	copy(cp, content)
+	if w.dictByID == nil {
+		w.dictByID = map[uint32][]byte{}
+	}
+	w.dictByID[id] = cp
+	w.dicts = append(w.dicts, dictEntry{id: id, content: cp})
+	return nil
 }
 
 // Create opens a new shard for writing at path. The shard is built in a sibling
@@ -102,6 +137,26 @@ func (w *Writer) AddRegion(kind RegionKind, c Codec, flags uint16, dictID uint32
 			w.enc = enc
 		}
 		onDisk = w.enc.EncodeAll(raw, make([]byte, 0, len(raw)/2+64))
+	case CodecZstdDict:
+		content, ok := w.dictByID[dictID]
+		if !ok {
+			return fmt.Errorf("tsumugi: codec zstd+dict needs a registered dictionary, id %d unknown", dictID)
+		}
+		enc := w.encDict[dictID]
+		if enc == nil {
+			e, err := zstd.NewWriter(nil,
+				zstd.WithEncoderLevel(zstd.SpeedBetterCompression),
+				zstd.WithEncoderDictRaw(dictID, content))
+			if err != nil {
+				return err
+			}
+			if w.encDict == nil {
+				w.encDict = map[uint32]*zstd.Encoder{}
+			}
+			w.encDict[dictID] = e
+			enc = e
+		}
+		onDisk = enc.EncodeAll(raw, make([]byte, 0, len(raw)/2+64))
 	default:
 		return fmt.Errorf("tsumugi: codec %d not supported by AddRegion", c)
 	}
@@ -149,9 +204,21 @@ func (w *Writer) Close() error {
 	if w.closed {
 		return nil
 	}
+	// Frame the registered dictionaries into the RegionDictionary region before
+	// the footer, while AddRegion still accepts writes, so its descriptor lands
+	// in the footer like any other region.
+	if len(w.dicts) > 0 {
+		if err := w.AddRegion(RegionDictionary, CodecNone, 0, 0, encodeDictRegion(w.dicts)); err != nil {
+			w.abort()
+			return err
+		}
+	}
 	w.closed = true
 	if w.enc != nil {
 		_ = w.enc.Close()
+	}
+	for _, e := range w.encDict {
+		_ = e.Close()
 	}
 
 	footer := Footer{Schema: w.schema, Regions: w.regions, Stats: w.stats}

@@ -20,6 +20,14 @@ type Reader struct {
 	dec     *zstd.Decoder
 	decOnce sync.Once
 
+	// Shared dictionaries loaded eagerly from the RegionDictionary region at Open,
+	// keyed by dict_id. decDict is one decoder with every raw dictionary
+	// registered, built on first CodecZstdDict access; DecodeAll selects the right
+	// dictionary by the id the frame carries.
+	dictContent map[uint32][]byte
+	decDict     *zstd.Decoder
+	decDictOnce sync.Once
+
 	mu        sync.Mutex
 	validated map[RegionKind]bool // regions whose on-disk CRC has been checked
 }
@@ -85,7 +93,55 @@ func (r *Reader) parse() error {
 		return ErrCorruptFooter
 	}
 	r.Header = hdr
+
+	// Load shared dictionaries eagerly: the region is small and any CodecZstdDict
+	// region needs them, so paying the parse once at Open is cheaper than racing
+	// to build it on the first decode.
+	if err := r.loadDictionaries(); err != nil {
+		return err
+	}
 	return nil
+}
+
+// loadDictionaries reads the RegionDictionary region, if present, validates its
+// CRC, and parses the shared dictionaries into dictContent keyed by dict_id.
+func (r *Reader) loadDictionaries() error {
+	desc, ok := r.Footer.region(RegionDictionary)
+	if !ok {
+		return nil
+	}
+	if desc.Offset+desc.Length > uint64(len(r.data)) {
+		return ErrCorruptFooter
+	}
+	onDisk := r.data[desc.Offset : desc.Offset+desc.Length]
+	if codec.CRC32C(onDisk) != desc.CRC {
+		return ErrRegionCRC
+	}
+	m, err := decodeDictRegion(onDisk)
+	if err != nil {
+		return err
+	}
+	r.dictContent = m
+	r.validated[RegionDictionary] = true
+	return nil
+}
+
+// dictDecoder builds, once, a single decoder with every shared dictionary
+// registered as raw content. DecodeAll then selects the dictionary by the id the
+// compressed frame carries, so one decoder serves every CodecZstdDict region.
+func (r *Reader) dictDecoder() (*zstd.Decoder, error) {
+	var derr error
+	r.decDictOnce.Do(func() {
+		if len(r.dictContent) == 0 {
+			return
+		}
+		opts := make([]zstd.DOption, 0, len(r.dictContent))
+		for id, content := range r.dictContent {
+			opts = append(opts, zstd.WithDecoderDictRaw(id, content))
+		}
+		r.decDict, derr = zstd.NewReader(nil, opts...)
+	})
+	return r.decDict, derr
 }
 
 // HasRegion reports whether a region kind is present.
@@ -131,9 +187,26 @@ func (r *Reader) Region(kind RegionKind) ([]byte, error) {
 			return nil, derr
 		}
 		return r.dec.DecodeAll(onDisk, make([]byte, 0, desc.RawLength))
+	case CodecZstdDict:
+		dec, derr := r.dictDecoder()
+		if derr != nil {
+			return nil, derr
+		}
+		if dec == nil {
+			return nil, ErrNoRegion
+		}
+		return dec.DecodeAll(onDisk, make([]byte, 0, desc.RawLength))
 	default:
 		return nil, ErrNoRegion
 	}
+}
+
+// Dictionary returns a registered shared dictionary's raw content by id and
+// whether it was present. The returned slice aliases the mapping; callers must
+// not mutate it.
+func (r *Reader) Dictionary(id uint32) ([]byte, bool) {
+	c, ok := r.dictContent[id]
+	return c, ok
 }
 
 // DocCount returns N, the dense docID space size.
@@ -160,6 +233,9 @@ func (r *Reader) AnalyzerHash() (uint64, bool) {
 func (r *Reader) Close() error {
 	if r.dec != nil {
 		r.dec.Close()
+	}
+	if r.decDict != nil {
+		r.decDict.Close()
 	}
 	if r.mm != nil {
 		return r.mm.Close()
