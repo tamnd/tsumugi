@@ -286,3 +286,98 @@ func TestDegradeCCrawl(t *testing.T) {
 		t.Fatalf("no query returned a hit at any degradation level over %d real docs", res.Docs)
 	}
 }
+
+// TestCacheCCrawl exercises the result cache on real data: it builds a real multi-shard
+// collection, wires a cache into the broker, and checks that a repeated query is served
+// from cache returning the same ranked top-k the cold query computed, that the cache
+// reports a hit only the second time, and that the cache holds the warmed queries. This
+// is the proof the cache keys and serves correctly over the real corpus, where the query
+// understanding (analysis, expansion) the key normalizes on is the real chain, not a
+// hand-built term set.
+func TestCacheCCrawl(t *testing.T) {
+	if _, err := os.Stat(ccrawlParquet); err != nil {
+		t.Skipf("ccrawl parquet not present: %v", err)
+	}
+	if testing.Short() {
+		t.Skip("skipping real-data build in short mode")
+	}
+	tmp := t.TempDir()
+	out := filepath.Join(tmp, "coll")
+	res, err := collection.Build(collection.Options{Source: ccrawlParquet, Out: out, ShardSize: 1000, Limit: 8000})
+	if err != nil {
+		t.Fatalf("Build from ccrawl: %v", err)
+	}
+
+	modelPath := filepath.Join(tmp, "model.bin")
+	writeModel(t, modelPath)
+	f, err := os.Open(modelPath)
+	if err != nil {
+		t.Fatalf("open model: %v", err)
+	}
+	ens, err := rank.LoadEnsemble(f)
+	_ = f.Close()
+	if err != nil {
+		t.Fatalf("load model: %v", err)
+	}
+	model := ens.Compile()
+
+	shards, b, err := openShards(out, model)
+	if err != nil {
+		t.Fatalf("openShards: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+	b.SetResultCache(search.NewResultCache(64))
+	pl := buildPipeline(shards)
+
+	queries := []string{"data", "page", "home", "search", "news", "world", "time", "people"}
+	warmed := 0
+	for _, qs := range queries {
+		pq := pl.parse(qs)
+		if pq.Empty() {
+			continue
+		}
+		q := toQuery(pq, 10)
+
+		cold, hit := b.SearchCached(context.Background(), q)
+		if hit {
+			t.Fatalf("query %q: first run reported a cache hit", qs)
+		}
+		if !cold.Complete() {
+			t.Fatalf("query %q: cold run flagged partial, %d of %d shards", qs, cold.ShardsOK, cold.ShardsTotal)
+		}
+		for _, h := range cold.Hits {
+			if int(h.DocID) >= res.Docs {
+				t.Fatalf("query %q: hit %d outside the %d docs", qs, h.DocID, res.Docs)
+			}
+		}
+
+		warm, hit := b.SearchCached(context.Background(), q)
+		if !hit {
+			t.Fatalf("query %q: repeated run did not hit the cache", qs)
+		}
+		if len(warm.Hits) != len(cold.Hits) {
+			t.Fatalf("query %q: warm returned %d hits, cold %d", qs, len(warm.Hits), len(cold.Hits))
+		}
+		for i := range cold.Hits {
+			if warm.Hits[i] != cold.Hits[i] {
+				t.Fatalf("query %q rank %d: warm %+v, cold %+v", qs, i, warm.Hits[i], cold.Hits[i])
+			}
+		}
+		if warm.ShardsTotal != cold.ShardsTotal {
+			t.Fatalf("query %q: warm ShardsTotal %d, cold %d", qs, warm.ShardsTotal, cold.ShardsTotal)
+		}
+		warmed++
+	}
+	if warmed == 0 {
+		t.Fatalf("no query warmed the cache over %d real docs", res.Docs)
+	}
+	if b.ResultCache().Len() != warmed {
+		t.Fatalf("cache holds %d entries, want the %d warmed queries", b.ResultCache().Len(), warmed)
+	}
+
+	// A publish-style invalidation clears the warmed entries, so the next query is cold again.
+	b.ResultCache().Clear()
+	if b.ResultCache().Len() != 0 {
+		t.Fatalf("cache not empty after Clear: %d entries", b.ResultCache().Len())
+	}
+}
