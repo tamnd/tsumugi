@@ -78,6 +78,33 @@ func hostGroupKey(host string) string {
 	return reversedDomain(host) + "\x00" + host
 }
 
+// partitionSeqBits returns the sequence-bit width AssignGlobalIDs splits the id at for
+// docs under p: the requested floor, widened until the low field holds the largest host.
+// It is the one place the widening rule lives, so a caller that needs to decode a global
+// id back to its host group (the high bits above the sequence, what the host and domain
+// rank projects by) recovers the same split the assignment used. The host of a document is
+// its Host field, falling back to the canonical URL's host, the same key AssignGlobalIDs
+// groups by, so the largest-host count matches.
+func partitionSeqBits(docs []convert.Document, p PartitionParams) uint {
+	seqBits := p.SeqBits
+	counts := make(map[string]int, len(docs))
+	var maxHost int
+	for _, d := range docs {
+		h := d.Host
+		if h == "" {
+			h = analyze.HostOf(d.URL)
+		}
+		counts[h]++
+		if counts[h] > maxHost {
+			maxHost = counts[h]
+		}
+	}
+	for seqBits < 63 && uint64(maxHost) > (uint64(1)<<seqBits) {
+		seqBits++
+	}
+	return seqBits
+}
+
 // AssignGlobalIDs assigns every document a corpus-wide global node id by the host and
 // domain partition: it groups the documents by host, orders the hosts by reversed
 // registered domain (so a domain's hosts take adjacent group ids), assigns each host a
@@ -125,17 +152,9 @@ func AssignGlobalIDs(docs []convert.Document, p PartitionParams) []uint64 {
 		return hosts[i] < hosts[j]
 	})
 
-	// Widen the sequence field if the largest host overflows the requested floor.
-	seqBits := p.SeqBits
-	var maxHost int
-	for _, idxs := range byHost {
-		if len(idxs) > maxHost {
-			maxHost = len(idxs)
-		}
-	}
-	for seqBits < 63 && uint64(maxHost) > (uint64(1)<<seqBits) {
-		seqBits++
-	}
+	// Widen the sequence field if the largest host overflows the requested floor, the same
+	// split partitionSeqBits exposes to a caller that later decodes the id back to its group.
+	seqBits := partitionSeqBits(docs, p)
 
 	// Assign each host a group id by its order, and each document the packed id, its
 	// pages sequenced by url so a host's pages are in a stable within-host order.
