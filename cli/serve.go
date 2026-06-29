@@ -26,10 +26,11 @@ func queryAnalyzerHash() uint64 { return lexical.DefaultAnalyzer.Hash() }
 
 func newServeCmd() *cobra.Command {
 	var (
-		dir     string
-		addr    string
-		modelP  string
-		timeout time.Duration
+		dir       string
+		addr      string
+		modelP    string
+		timeout   time.Duration
+		cacheSize int
 	)
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -54,6 +55,13 @@ func newServeCmd() *cobra.Command {
 			}
 			defer func() { _ = broker.Close() }()
 
+			// Wire a result cache when one is sized, so the head of the heavy-tailed query
+			// distribution serves from cache without re-running the cascade. A size of zero
+			// leaves the broker cacheless, running every query through the cascade.
+			if cacheSize > 0 {
+				broker.SetResultCache(search.NewResultCache(cacheSize))
+			}
+
 			srv := &httpServer{broker: broker, pipeline: pl, timeout: timeout}
 			mux := http.NewServeMux()
 			mux.HandleFunc("/search", srv.search)
@@ -68,6 +76,7 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&addr, "addr", ":8080", "address to listen on")
 	cmd.Flags().StringVar(&modelP, "model", "", "trained ranking model file")
 	cmd.Flags().DurationVar(&timeout, "timeout", 10*time.Millisecond, "per-request deadline")
+	cmd.Flags().IntVar(&cacheSize, "cache", 0, "result cache capacity in entries (0 disables the cache)")
 	return cmd
 }
 
@@ -219,6 +228,11 @@ type searchResponse struct {
 	Lang       string `json:"lang,omitempty"`
 	Corrected  bool   `json:"corrected,omitempty"`
 	Suggestion string `json:"suggestion,omitempty"`
+
+	// Cached is true when the result was served from the broker's result cache rather than
+	// computed by the cascade, so a client or an operator can see the cache hit rate in the
+	// responses themselves.
+	Cached bool `json:"cached,omitempty"`
 }
 
 // completenessJSON is the response's completeness indicator: complete is true when
@@ -276,10 +290,13 @@ func (s *httpServer) search(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 	}
 	start := time.Now()
-	// Serve at the degradation level the remaining deadline budget calls for, so a
-	// request entering with little budget left answers within budget at a known lower
-	// quality rather than overrunning the per-request deadline (doc 11, degradation order).
-	res := s.broker.SearchWithinBudget(ctx, q)
+	// Serve from the result cache when one is wired, falling back to the budgeted search
+	// on a miss. A miss serves at the degradation level the remaining deadline budget calls
+	// for, so a request entering with little budget left answers within budget at a known
+	// lower quality rather than overrunning the per-request deadline (doc 11, degradation
+	// order); a hit serves the cached full-quality result regardless of the current budget.
+	res, hit := s.broker.SearchCached(ctx, q)
+	resp.Cached = hit
 	resp.TookMs = float64(time.Since(start).Microseconds()) / 1000
 	resp.Completeness = completenessJSON{
 		Complete:    res.Complete(),

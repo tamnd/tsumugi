@@ -39,6 +39,10 @@ type Broker struct {
 	// never drops shards never pays the scan.
 	staticOnce  sync.Once
 	shardStatic []float64
+
+	// cache is the optional result cache (doc 11). It is nil unless a deployment wires
+	// one, so a broker without a cache runs every query through the cascade unchanged.
+	cache *ResultCache
 }
 
 // NewBroker builds a broker over already-opened shards with a global cascade. It
@@ -161,6 +165,43 @@ func (b *Broker) Search(ctx context.Context, q Query) []Hit {
 // dispatched shard.
 func (b *Broker) SearchComplete(ctx context.Context, q Query) Results {
 	return b.SearchDegraded(ctx, q, DegradeNone)
+}
+
+// SetResultCache wires a result cache into the broker, the cache the cached search path
+// consults. A broker with no cache wired runs every query through the cascade; wiring a
+// cache is how a deployment turns it on. It is set once at construction, before the
+// broker serves, so it needs no synchronization of its own.
+func (b *Broker) SetResultCache(c *ResultCache) { b.cache = c }
+
+// ResultCache returns the broker's result cache, or nil if none is wired, so the publish
+// lifecycle can clear it on a collection change.
+func (b *Broker) ResultCache() *ResultCache { return b.cache }
+
+// SearchCached serves a query through the result cache when one is wired: a hit returns
+// the cached ranked top-k without re-running the cascade, and a miss runs the budgeted
+// search and caches the result. The bool reports whether the query was a cache hit.
+//
+// Only a complete, full-quality result is cached. A partial result (a shard dropped at
+// the deadline) or a degraded one (served at a lower rung under budget pressure) is
+// transient and lower quality, so caching it would serve a stale degraded answer to
+// later queries that had the budget to do better; the cache holds only results that ran
+// the whole cascade over every contributing shard. A hit always serves that good result
+// even when the current query's budget is tight, which is the point: the cache takes the
+// head of the distribution off the cascade entirely.
+//
+// With no cache wired this is SearchWithinBudget plus a false hit flag, so a caller can
+// use it uniformly whether or not a cache is configured.
+func (b *Broker) SearchCached(ctx context.Context, q Query) (Results, bool) {
+	if b.cache != nil {
+		if hits, total, ok := b.cache.Get(q); ok {
+			return Results{Hits: hits, ShardsTotal: total, ShardsOK: total, Degraded: DegradeNone}, true
+		}
+	}
+	res := b.SearchWithinBudget(ctx, q)
+	if b.cache != nil && res.Complete() && res.Degraded == DegradeNone {
+		b.cache.Put(q, res.Hits, res.ShardsTotal)
+	}
+	return res, false
 }
 
 // SearchWithinBudget runs the query at the degradation level the remaining deadline

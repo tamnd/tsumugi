@@ -178,6 +178,66 @@ func BenchmarkBrokerSearchDegraded(b *testing.B) {
 	}
 }
 
+// BenchmarkBrokerSearchCached measures the cached search path against the cold cascade
+// over the same sixteen-shard corpus, so the load the cache takes off the cascade can be
+// read directly. The miss case runs the whole cascade and stores the result; the hit case
+// is served from the cache, which is the head-of-distribution work the cache exists to
+// absorb. The hit should be far cheaper than the miss, because it returns the stored
+// ranked top-k without retrieving, fusing, or reranking anything.
+func BenchmarkBrokerSearchCached(b *testing.B) {
+	const n, parts = 50000, 16
+	docs := makeCorpus(n)
+	dir := b.TempDir()
+	model := trainModel(b)
+
+	size := n / parts
+	shards := make([]*Shard, parts)
+	for p := 0; p < parts; p++ {
+		path := filepath.Join(dir, fmt.Sprintf("s%d.tsumugi", p))
+		lo := p * size
+		buildShardFile(b, path, docs, lo, lo+size, uint32(lo), false)
+		sh, err := OpenShard(path, prodCascade(model))
+		if err != nil {
+			b.Fatalf("open shard %d: %v", p, err)
+		}
+		shards[p] = sh
+	}
+	br := NewBroker(shards, prodCascade(model))
+	defer func() { _ = br.Close() }()
+	br.SetResultCache(NewResultCache(1024))
+
+	ctx := context.Background()
+	q := Query{Text: "common document number", K: 10}
+
+	// The miss case never lets the cache warm, so every iteration pays the full cascade
+	// and the store; clearing before each run keeps it a miss.
+	b.Run("miss", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			br.ResultCache().Clear()
+			res, _ := br.SearchCached(ctx, q)
+			if len(res.Hits) == 0 {
+				b.Fatal("cached miss returned no hits")
+			}
+		}
+	})
+
+	// The hit case warms once, then every iteration serves from cache.
+	if _, _ = br.SearchCached(ctx, q); br.ResultCache().Len() == 0 {
+		b.Fatal("cache failed to warm")
+	}
+	b.Run("hit", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			res, hit := br.SearchCached(ctx, q)
+			if !hit {
+				b.Fatal("expected a cache hit")
+			}
+			if len(res.Hits) == 0 {
+				b.Fatal("cached hit returned no hits")
+			}
+		}
+	})
+}
+
 // prodCascade is the benchmark cascade at the canon production cut sizes, so the
 // latency measured is the latency the gate cares about, not an inflated wide cut.
 func prodCascade(model *rank.Model) *rank.Cascade {
