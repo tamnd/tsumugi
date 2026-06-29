@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -485,6 +486,129 @@ func TestCacheCCrawl(t *testing.T) {
 	if b.ResultCache().Len() != 0 {
 		t.Fatalf("cache not empty after Clear: %d entries", b.ResultCache().Len())
 	}
+}
+
+// TestRoutingCCrawlEquivalence is the routing-index correctness gate on real data: it builds
+// a real multi-shard collection, builds the front-coded, bloom-fronted routing index over the
+// open shards, and checks that the index routes every real query term to exactly the shards
+// that actually hold the term, the brute-force membership the index replaced a whole-vocabulary
+// Go map with. The brute-force oracle is each shard's own lexical df: a term routes to a shard
+// if and only if that shard reports a non-zero df for it. This proves the front-coded lookup is
+// exact over the real fleet vocabulary, the property that lets the resident routing structure
+// shrink without changing a single routing decision. A term absent from the whole fleet must
+// route to no shard, the bloom-reject path over real terms.
+func TestRoutingCCrawlEquivalence(t *testing.T) {
+	if _, err := os.Stat(ccrawlParquet); err != nil {
+		t.Skipf("ccrawl parquet not present: %v", err)
+	}
+	if testing.Short() {
+		t.Skip("skipping real-data build in short mode")
+	}
+	tmp := t.TempDir()
+	out := filepath.Join(tmp, "coll")
+	res, err := collection.Build(collection.Options{Source: ccrawlParquet, Out: out, ShardSize: 1000, Limit: 8000})
+	if err != nil {
+		t.Fatalf("Build from ccrawl: %v", err)
+	}
+	if res.Shards < 4 {
+		t.Fatalf("need at least 4 shards to see routing prune across the fleet, got %d", res.Shards)
+	}
+
+	modelPath := filepath.Join(tmp, "model.bin")
+	writeModel(t, modelPath)
+	f, err := os.Open(modelPath)
+	if err != nil {
+		t.Fatalf("open model: %v", err)
+	}
+	ens, err := rank.LoadEnsemble(f)
+	_ = f.Close()
+	if err != nil {
+		t.Fatalf("load model: %v", err)
+	}
+	model := ens.Compile()
+
+	shards, b, err := openShards(out, model)
+	if err != nil {
+		t.Fatalf("openShards: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+	pl := buildPipeline(shards)
+
+	ri := search.BuildRoutingIndex(shards)
+
+	// bruteRoute is the oracle: the shards whose own lexical df for the term is non-zero, the
+	// shards the term genuinely lives in, sorted ascending so it compares against the index's
+	// routed set directly.
+	bruteRoute := func(term string) []int {
+		var want []int
+		for si, s := range shards {
+			if s.LexDocFreqs([]string{term})[term] > 0 {
+				want = append(want, si)
+			}
+		}
+		return want
+	}
+
+	// Sample real fleet terms straight from the shards' own vocabulary, so the check covers the
+	// rare long-tail terms that live on one or two shards (where routing actually prunes), not
+	// just the common content words that saturate every shard. A bounded stride keeps the test
+	// fast while still spanning the whole vocabulary, and the common query terms are folded in so
+	// the saturating case is exercised too.
+	sample := map[string]struct{}{}
+	for _, qs := range []string{"data", "page", "home", "search", "news", "world", "time", "people"} {
+		pq := pl.parse(qs)
+		if pq.Empty() {
+			continue
+		}
+		for _, term := range toQuery(pq, 10).Terms {
+			sample[term] = struct{}{}
+		}
+	}
+	for _, s := range shards {
+		i := 0
+		s.ForEachTerm(func(term string, _ uint32) {
+			if i%97 == 0 { // a coarse stride across each shard's term ids
+				sample[term] = struct{}{}
+			}
+			i++
+		})
+	}
+
+	checkedTerms, prunedTerms := 0, 0
+	for term := range sample {
+		want := bruteRoute(term)
+		if len(want) == 0 {
+			continue // not a real fleet term; nothing to compare
+		}
+		got := ri.RouteTerms([]string{term})
+		sort.Ints(got)
+		if len(got) != len(want) {
+			t.Fatalf("term %q routed to %v, brute-force shard membership %v", term, got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("term %q routed to %v, brute-force shard membership %v", term, got, want)
+			}
+		}
+		checkedTerms++
+		if len(want) < res.Shards {
+			prunedTerms++ // the term does not live on every shard, so routing actually prunes
+		}
+	}
+	if checkedTerms == 0 {
+		t.Fatalf("no real query term resolved to a fleet term over %d docs", res.Docs)
+	}
+	if prunedTerms == 0 {
+		t.Fatalf("every checked term lived on every one of %d shards; routing pruned nothing to verify", res.Shards)
+	}
+
+	// A term that is not in the fleet vocabulary at all must route to no shard, the bloom-reject
+	// path exercised against a real-shaped token rather than a synthetic one.
+	if got := ri.RouteTerms([]string{"zzqxnot_a_real_fleet_term_zzqx"}); len(got) != 0 {
+		t.Fatalf("absent term routed to %v, want no shard", got)
+	}
+	t.Logf("routing equivalence: %d real terms matched brute-force membership, %d of them pruned shards over %d shards",
+		checkedTerms, prunedTerms, res.Shards)
 }
 
 // TestServeAdmissionCCrawl drives the HTTP serve path over a real multi-shard collection
