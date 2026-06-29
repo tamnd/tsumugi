@@ -32,17 +32,42 @@ import (
 // on a host with no dominant language (no page detected confidently, so nothing to agree
 // with) scores neutral, since absence of a reading is not evidence of a mismatch.
 func languageConsistency(docs []convert.Document, det *langid.Detector) []float64 {
+	lang, confident := detectLanguages(docs, det)
+	return languageConsistencyFrom(docs, lang, confident)
+}
+
+// detectLanguages runs the language identifier over each document body once, the single
+// detection pass the language signals share so a build does not read every body twice. It
+// returns the detected language code per document and whether the detection was confident,
+// recording the code only on a confident reading: an unsure page (a too-short or mixed
+// body) keeps the empty code and false, so it neither names its own language nor counts
+// toward its host's dominant language nor stores a guessed language id.
+func detectLanguages(docs []convert.Document, det *langid.Detector) (lang []string, confident []bool) {
+	lang = make([]string, len(docs))
+	confident = make([]bool, len(docs))
+	for i, d := range docs {
+		l, ok := det.DetectLang(d.Body)
+		if !ok {
+			continue
+		}
+		lang[i] = l
+		confident[i] = true
+	}
+	return lang, confident
+}
+
+// languageConsistencyFrom scores the per-document language-consistency signal from a
+// detection already computed by detectLanguages: the agreement between each page's
+// detected language and its host's dominant language. It is split from the detection so
+// the build runs the identifier once and feeds both this signal and the language-id column.
+func languageConsistencyFrom(docs []convert.Document, lang []string, confident []bool) []float64 {
 	n := len(docs)
 	out := make([]float64, n)
 	if n == 0 {
 		return out
 	}
 
-	// First pass: detect each page's content language once, recording the language only
-	// when the detection is confident, so an unsure reading neither names a page's
-	// language nor votes for its host's dominant language.
-	lang := make([]string, n)
-	confident := make([]bool, n)
+	// The host of each page, and the per-host vote among each host's confident detections.
 	hostOf := make([]string, n)
 	votes := map[string]map[string]int{}
 	for i, d := range docs {
@@ -51,18 +76,15 @@ func languageConsistency(docs []convert.Document, det *langid.Detector) []float6
 			h = analyze.HostOf(d.URL)
 		}
 		hostOf[i] = h
-		l, ok := det.DetectLang(d.Body)
-		if !ok {
+		if !confident[i] {
 			continue
 		}
-		lang[i] = l
-		confident[i] = true
 		hv := votes[h]
 		if hv == nil {
 			hv = map[string]int{}
 			votes[h] = hv
 		}
-		hv[l]++
+		hv[lang[i]]++
 	}
 
 	// The host-dominant language is the plurality winner among the host's confident
@@ -94,6 +116,23 @@ func languageConsistency(docs []convert.Document, det *langid.Detector) []float6
 			out[i] = 1
 		} else {
 			out[i] = 0
+		}
+	}
+	return out
+}
+
+// languageIDsFrom turns a detection into the categorical language-id column, one stable id
+// per document for the feature matrix. A confident detection stores langid.LanguageID of
+// its code; an unplaceable page stores zero, the unknown id, since storing a fabricated
+// language for a page the detector would not commit to is exactly the mislabel the
+// confidence floor exists to avoid. This replaces the latin-script ratio stand-in the
+// analyze stage wrote, so the query-time language match reads a real detected language
+// rather than a coarse script flag.
+func languageIDsFrom(lang []string, confident []bool) []uint32 {
+	out := make([]uint32, len(lang))
+	for i := range lang {
+		if confident[i] {
+			out[i] = uint32(langid.LanguageID(lang[i]))
 		}
 	}
 	return out

@@ -29,7 +29,7 @@ func writeShard(t *testing.T, path string, texts []string, nodeBase uint32) {
 func writeShardHash(t *testing.T, path string, texts []string, nodeBase uint32, hash uint64) {
 	t.Helper()
 	lb := lexical.NewBuilder(lexical.DefaultParams())
-	fb := feature.NewBuilder(feature.DefaultSchema(), 1)
+	fb := feature.NewBuilder(feature.DefaultSchema(), feature.SchemaVersion)
 	for i, txt := range texts {
 		lb.AddDoc(uint32(i), map[lexical.Field]string{lexical.FieldBody: txt})
 		fb.Set(uint32(i), feature.FeatInDegree, float64((i+1)*100))

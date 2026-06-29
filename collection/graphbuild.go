@@ -33,6 +33,7 @@ type graphSignals struct {
 	nearDup        []float64
 	outboundSpam   []float64
 	langConsist    []float64
+	langID         []uint32
 	staticRank     []float64
 }
 
@@ -54,6 +55,7 @@ func (s graphSignals) slice(lo, hi int) graphSignals {
 		nearDup:        s.nearDup[lo:hi],
 		outboundSpam:   s.outboundSpam[lo:hi],
 		langConsist:    s.langConsist[lo:hi],
+		langID:         s.langID[lo:hi],
 		staticRank:     s.staticRank[lo:hi],
 	}
 }
@@ -376,6 +378,10 @@ func globalSignals(docs []convert.Document, trustSeeds, spamSeeds []string) (gra
 	tr := streamTrustRank(g, trust, cfg)
 	sm := graph.SpamMass(pr, tr, trust)
 
+	// Detect each body's language once; the consistency signal and the categorical
+	// language-id column both read this one pass rather than running the identifier twice.
+	detLang, detConf := detectLanguages(docs, langid.New())
+
 	sig := graphSignals{
 		pageRank:       pr,
 		hostRank:       graph.HostRank(g, hostOf, cfg),
@@ -389,7 +395,8 @@ func globalSignals(docs []convert.Document, trustSeeds, spamSeeds []string) (gra
 		hostLinkDiv:    graph.HostLinkDiversity(g, hostOf),
 		nearDup:        nearDupPenalties(docs, pr),
 		outboundSpam:   graph.OutboundSpamRatio(g, sm, graph.DefaultSpamThreshold),
-		langConsist:    languageConsistency(docs, langid.New()),
+		langConsist:    languageConsistencyFrom(docs, detLang, detConf),
+		langID:         languageIDsFrom(detLang, detConf),
 	}
 	// The composite static rank is a thin blend of the raw columns above, computed
 	// last so it can read them. It supersedes the per-document static-rank prior the

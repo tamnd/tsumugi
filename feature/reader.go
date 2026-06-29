@@ -120,6 +120,10 @@ func (r *Region) Row(docID uint32) ([]byte, bool) {
 // dequant turns a column's stored level back into a real value.
 func dequant(c colLayout, q uint32) float64 {
 	switch c.Quant {
+	case QuantCategorical:
+		// The stored byte is the code, returned verbatim; the L2 reranker reads it as a
+		// categorical id, not a magnitude.
+		return float64(q)
 	case QuantLog:
 		return math.Exp(float64(c.p0)+float64(q)*float64(c.p1)) - float64(c.p2)
 	case QuantSigned:
