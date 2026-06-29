@@ -125,6 +125,59 @@ func BenchmarkAggregatorSearch(b *testing.B) {
 	}
 }
 
+// BenchmarkBrokerSearchDegraded measures each rung of the degradation ladder over the
+// same sixteen-shard corpus the other broker benchmarks use, so the budget each rung
+// recovers can be read against the full-quality path. The ladder is a budget tool, so
+// the point is that a higher rung is cheaper: shrinking L0 and dropping shards cut the
+// retrieval and fan-out work, which is what lets a query under pressure answer within
+// budget. The shard built is lexical and feature only, so the dense-drop rung shows no
+// gain here (there is no dense plane to drop); its win is measured where a vector region
+// exists, and the rung is correctness-tested in the search suite.
+func BenchmarkBrokerSearchDegraded(b *testing.B) {
+	const n, parts = 50000, 16
+	docs := makeCorpus(n)
+	dir := b.TempDir()
+	model := trainModel(b)
+
+	size := n / parts
+	shards := make([]*Shard, parts)
+	for p := 0; p < parts; p++ {
+		path := filepath.Join(dir, fmt.Sprintf("s%d.tsumugi", p))
+		lo := p * size
+		buildShardFile(b, path, docs, lo, lo+size, uint32(lo), false)
+		sh, err := OpenShard(path, prodCascade(model))
+		if err != nil {
+			b.Fatalf("open shard %d: %v", p, err)
+		}
+		shards[p] = sh
+	}
+	br := NewBroker(shards, prodCascade(model))
+	defer func() { _ = br.Close() }()
+
+	ctx := context.Background()
+	q := Query{Text: "common document number", K: 10}
+	levels := []struct {
+		name  string
+		level DegradeLevel
+	}{
+		{"none", DegradeNone},
+		{"shrink-l0", DegradeL0},
+		{"drop-dense", DegradeDense},
+		{"drop-shards", DegradeShards},
+		{"trim-l2", DegradeL2},
+	}
+	for _, lv := range levels {
+		b.Run(lv.name, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				res := br.SearchDegraded(ctx, q, lv.level)
+				if len(res.Hits) == 0 {
+					b.Fatal("degraded fan-out returned no hits")
+				}
+			}
+		})
+	}
+}
+
 // prodCascade is the benchmark cascade at the canon production cut sizes, so the
 // latency measured is the latency the gate cares about, not an inflated wide cut.
 func prodCascade(model *rank.Model) *rank.Cascade {

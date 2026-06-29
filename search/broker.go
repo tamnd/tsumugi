@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/tamnd/tsumugi/feature"
 	"github.com/tamnd/tsumugi/lexical"
@@ -32,6 +33,12 @@ type Broker struct {
 	cascade *rank.Cascade
 
 	maxConcurrency int
+
+	// shardStatic is the per-shard static-rank summary the shard-dropping degradation
+	// rung orders shards by, computed once on first use under staticOnce so a broker that
+	// never drops shards never pays the scan.
+	staticOnce  sync.Once
+	shardStatic []float64
 }
 
 // NewBroker builds a broker over already-opened shards with a global cascade. It
@@ -121,6 +128,14 @@ type Results struct {
 	Hits        []Hit
 	ShardsTotal int
 	ShardsOK    int
+
+	// Degraded is the rung of the degradation ladder the broker served this query at,
+	// DegradeNone for a full-quality result. It is the second of the two independent
+	// degradation facts a result carries: this one is the quality reduction the broker
+	// chose under budget pressure, while Complete reports whether a shard fell off the
+	// deadline regardless of the level. An operator reads it to see that a result was,
+	// say, lexical-only or missing the lowest-static-rank shards by design.
+	Degraded DegradeLevel
 }
 
 // Complete reports whether every contributing shard responded by the deadline, so the
@@ -145,6 +160,33 @@ func (b *Broker) Search(ctx context.Context, q Query) []Hit {
 // budget, because the collection stops at the deadline rather than waiting for every
 // dispatched shard.
 func (b *Broker) SearchComplete(ctx context.Context, q Query) Results {
+	return b.SearchDegraded(ctx, q, DegradeNone)
+}
+
+// SearchWithinBudget runs the query at the degradation level the remaining deadline
+// budget calls for, the policy half of the degradation order: a query entering with
+// most of its budget left runs at full quality, and one entering with little left
+// serves a cheaper, lower-quality result within budget rather than overrunning it. With
+// no deadline on the context it runs at full quality. The chosen level is reported in
+// the result's Degraded field so the reduction is observable.
+func (b *Broker) SearchWithinBudget(ctx context.Context, q Query) Results {
+	level := DegradeNone
+	if dl, ok := ctx.Deadline(); ok {
+		level = DegradeForBudget(time.Until(dl))
+	}
+	return b.SearchDegraded(ctx, q, level)
+}
+
+// SearchDegraded is SearchComplete at a chosen rung of the fixed degradation ladder
+// (doc 11, "The degradation order"). The levers fire in the spec's order: shrink the
+// per-shard L0, drop the dense plane to serve lexical-only, drop the lowest-static-rank
+// shards from the fan-out, and trim the broker L2 candidate count, each rung cumulative
+// over the ones below it. Every rung still ranks its smaller candidate set through the
+// full L1 and L2 stages, never skipping a stage, so a degraded result is a ranked
+// smaller set rather than an unranked one. The drop-a-slow-shard-at-the-deadline step
+// is orthogonal and automatic in the fan-out at any level, reported through Complete.
+func (b *Broker) SearchDegraded(ctx context.Context, q Query, level DegradeLevel) Results {
+	d := degradationFor(level)
 	// Analyze the query once at the broker and ship the term set to every shard, so the
 	// analysis chain runs one time per query rather than once per shard the fan-out
 	// visits. The shards score q.Terms directly; routing and the idf gather read the
@@ -152,7 +194,23 @@ func (b *Broker) SearchComplete(ctx context.Context, q Query) Results {
 	if q.Terms == nil {
 		q.Terms = q.lexTerms()
 	}
+	// Lever 1: shrink the per-shard L0 candidate width, pushed down to every shard's
+	// retrieval. Lever 2: drop the dense plane by clearing the dense query vector, so the
+	// shards skip the encode and dense recall and serve lexical-only.
+	if d.l0 > 0 {
+		q.L0 = d.l0
+	}
+	if d.dropDense {
+		q.Vector = nil
+	}
 	targets := b.routing.RouteTerms(q.Terms)
+	// Lever 3: drop the lowest-static-rank shards from the routed set before the gather
+	// and the fan-out, so the dropped shards cost nothing downstream. ShardsTotal then
+	// reflects the shards actually queried, so the completeness flag stays honest about
+	// deadline drops while the Degraded level reports the deliberate reduction.
+	if d.dropShardFrac > 0 {
+		targets = b.dropLowStatic(targets, d.dropShardFrac)
+	}
 	// Phase one of distributed exact idf: gather each query term's df across the routed
 	// shards and turn it into one collection-wide idf the fan-out scores every shard
 	// against. Without this each shard would use its local idf, and the merge would
@@ -199,12 +257,22 @@ func (b *Broker) SearchComplete(ctx context.Context, q Query) Results {
 		}
 		return s.l2Row(base, exts[si], id-s.nodeBase)
 	}
-	cands := b.cascade.Rank(localIDs(allLex), localIDs(allDense), l1feat, l2feat, q.K)
+	// Lever 4: trim the broker L2 candidate count. The cascade is read-only and shared
+	// across concurrent queries, so the trim is a per-query shallow copy that shrinks the
+	// L1 cut while sharing the immutable L1 and L2 models, never mutating the broker's
+	// cascade. The full L1 and L2 stages still run, over a smaller survivor set.
+	casc := b.cascade
+	if d.l1Keep > 0 {
+		v := *b.cascade
+		v.L1Keep = d.l1Keep
+		casc = &v
+	}
+	cands := casc.Rank(localIDs(allLex), localIDs(allDense), l1feat, l2feat, q.K)
 	hits := make([]Hit, len(cands))
 	for i, c := range cands {
 		hits[i] = Hit{DocID: c.DocID, Score: c.Score}
 	}
-	return Results{Hits: hits, ShardsTotal: len(targets), ShardsOK: ok}
+	return Results{Hits: hits, ShardsTotal: len(targets), ShardsOK: ok, Degraded: level}
 }
 
 // fanOut runs the routed shards' retrievals concurrently, bounded by the broker's

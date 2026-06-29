@@ -43,6 +43,13 @@ type Query struct {
 	// so every shard scores a term against the same df and N. It is nil on the
 	// single-shard path, where the shard's local idf is already the collection idf.
 	TermIDF map[string]float64
+
+	// L0, when positive, overrides the shard's default L0 candidate width per plane, the
+	// first rung of the broker's degradation ladder: under budget pressure the broker
+	// shrinks L0 so each shard retrieves and ranks a smaller candidate set precisely
+	// rather than skipping a stage (doc 11, "The degradation order"). It is zero on the
+	// full-quality path, where each shard uses its built-in L0.
+	L0 int
 }
 
 // lexTerms returns the analyzed lexical term set for the query: the broker's
