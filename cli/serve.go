@@ -228,6 +228,12 @@ type completenessJSON struct {
 	Complete    bool `json:"complete"`
 	ShardsTotal int  `json:"shards_total"`
 	ShardsOK    int  `json:"shards_ok"`
+	// Degraded names the rung of the degradation ladder the broker served the query at,
+	// "none" for a full-quality result, so a client and an operator can see that a result
+	// was, say, lexical-only or missing the lowest-static-rank shards by design. It is the
+	// quality-reduction half of the metadata, independent of the deadline-drop Complete
+	// reports (doc 11, "The degradation order").
+	Degraded string `json:"degraded"`
 }
 
 type hitJSON struct {
@@ -256,6 +262,7 @@ func (s *httpServer) search(w http.ResponseWriter, r *http.Request) {
 		resp.Hits = []hitJSON{}
 		// A query with nothing to route is trivially complete: no shard was dropped.
 		resp.Completeness.Complete = true
+		resp.Completeness.Degraded = search.DegradeNone.String()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 		return
@@ -269,12 +276,16 @@ func (s *httpServer) search(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 	}
 	start := time.Now()
-	res := s.broker.SearchComplete(ctx, q)
+	// Serve at the degradation level the remaining deadline budget calls for, so a
+	// request entering with little budget left answers within budget at a known lower
+	// quality rather than overrunning the per-request deadline (doc 11, degradation order).
+	res := s.broker.SearchWithinBudget(ctx, q)
 	resp.TookMs = float64(time.Since(start).Microseconds()) / 1000
 	resp.Completeness = completenessJSON{
 		Complete:    res.Complete(),
 		ShardsTotal: res.ShardsTotal,
 		ShardsOK:    res.ShardsOK,
+		Degraded:    res.Degraded.String(),
 	}
 	resp.Hits = make([]hitJSON, len(res.Hits))
 	for i, h := range res.Hits {

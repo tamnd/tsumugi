@@ -133,6 +133,30 @@ func newShard(r *tsumugi.Reader, cascade *rank.Cascade) (*Shard, error) {
 // DocCount is the number of documents in the shard.
 func (s *Shard) DocCount() uint32 { return s.docCount }
 
+// MaxStaticRank is the highest composite static rank among the shard's documents, the
+// per-shard static-rank summary the broker's degradation uses to order shards by how
+// much dropping them costs. The composite static rank is the query-independent prior
+// (doc 07), so the shard's maximum is the best a top-k winner it could hold would score
+// before any query signal, which is why a low maximum marks a shard unlikely to hold a
+// winner. A shard with no feature region carries no static-rank signal and reports zero.
+func (s *Shard) MaxStaticRank() float64 {
+	if s.feat == nil {
+		return 0
+	}
+	var max float64
+	first := true
+	for id := uint32(0); id < s.docCount; id++ {
+		v, ok := s.feat.Value(id, feature.FeatStaticRank)
+		if !ok {
+			continue
+		}
+		if first || v > max {
+			max, first = v, false
+		}
+	}
+	return max
+}
+
 // NodeBase is the global id of the shard's first document.
 func (s *Shard) NodeBase() uint32 { return s.nodeBase }
 
@@ -179,9 +203,13 @@ func (s *Shard) featureRow(localID uint32) []float64 {
 // while the broker gathers retrievals from many shards and runs one global rerank.
 func (s *Shard) retrieve(q Query) (lex, dense []scored, feats map[uint32][]float64) {
 	feats = make(map[uint32][]float64)
+	l0 := s.l0
+	if q.L0 > 0 {
+		l0 = q.L0
+	}
 	k := q.K
-	if k < s.l0 {
-		k = s.l0
+	if k < l0 {
+		k = l0
 	}
 	if s.lex != nil && len(q.lexTerms()) > 0 {
 		cands, err := s.lexSearch(q, k)
