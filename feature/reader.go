@@ -117,20 +117,11 @@ func (r *Region) Row(docID uint32) ([]byte, bool) {
 	return r.rows[base : base+r.stride], true
 }
 
-// dequant turns a column's stored level back into a real value.
+// dequant turns a column's stored level back into a real value. It routes through the
+// exported Dequant.Decode so the in-region reader and a footer-driven reader share one
+// formula and cannot drift.
 func dequant(c colLayout, q uint32) float64 {
-	switch c.Quant {
-	case QuantCategorical:
-		// The stored byte is the code, returned verbatim; the L2 reranker reads it as a
-		// categorical id, not a magnitude.
-		return float64(q)
-	case QuantLog:
-		return math.Exp(float64(c.p0)+float64(q)*float64(c.p1)) - float64(c.p2)
-	case QuantSigned:
-		return (float64(q) - math.Round(maxLevel(c.Width)/2)) * float64(c.p0)
-	default:
-		return float64(c.p0) + float64(q)*float64(c.p1)
-	}
+	return Dequant{Width: c.Width, Quant: c.Quant, P0: c.p0, P1: c.p1, P2: c.p2}.Decode(q)
 }
 
 // Value returns the dequantized value of one feature for one document.

@@ -386,14 +386,35 @@ func writeShard(path string, docs []convert.Document, sig graphSignals, base uin
 	w.SetStat(tsumugi.StatBodyTokenCount, bodyTokens)
 	w.SetStat(tsumugi.StatURLTokenCount, urlTokens)
 	w.SetStat(tsumugi.StatEdgeCount, float64(g.EdgeCount()))
+	// The remaining shard-level numbers the footer promises but the build left empty.
+	// node_min and node_max bracket the shard's global id range so the graph tooling can
+	// validate a cross-shard edge target without opening a region; avg_doc_len is the
+	// whole-document mean (title+body) the plain BM25 normalizer reads, distinct from the
+	// per-field averages above; term_count is the dictionary size for capacity planning.
+	if len(docs) > 0 {
+		w.SetStat(tsumugi.StatNodeMin, float64(base))
+		w.SetStat(tsumugi.StatNodeMax, float64(base)+float64(len(docs))-1)
+		w.SetStat(tsumugi.StatAvgDocLen, tokens/float64(len(docs)))
+	}
+	// Build the region bytes now so the feature dequant constants and the lexical term
+	// count can be read back into the footer before the regions are written.
+	lexBytes := lb.Build()
+	featBytes := fb.Build()
+	if lr, err := lexical.Open(lexBytes); err == nil {
+		w.SetStat(tsumugi.StatTermCount, float64(lr.TermCount()))
+	}
+	// Write the per-column feature dequant constants into the footer statistics, the
+	// container-level dequant block doc 03 names; the feature region still carries its
+	// own self-describing copy, and the two agree because both come from this one build.
+	feature.WriteDequantStats(w.SetStat, fb.Dequant())
 	// Record the analyzer the build tokenized with so a broker can verify in one
 	// comparison that it is about to query the shard with the same analyzer. The build
 	// runs the package-level lexical.Analyze, so the recorded hash is DefaultAnalyzer's.
 	w.SetAnalyzerHash(lexical.DefaultAnalyzer.Hash())
-	if err := w.AddRegion(tsumugi.RegionLexical, tsumugi.CodecZstd, 0, 0, lb.Build()); err != nil {
+	if err := w.AddRegion(tsumugi.RegionLexical, tsumugi.CodecZstd, 0, 0, lexBytes); err != nil {
 		return 0, err
 	}
-	if err := w.AddRegion(tsumugi.RegionFeature, tsumugi.CodecZstd, 0, 0, fb.Build()); err != nil {
+	if err := w.AddRegion(tsumugi.RegionFeature, tsumugi.CodecZstd, 0, 0, featBytes); err != nil {
 		return 0, err
 	}
 	if err := w.AddRegion(tsumugi.RegionForward, tsumugi.CodecZstd, 0, 0, fwd.Build()); err != nil {
