@@ -6,6 +6,7 @@ import (
 	"github.com/tamnd/tsumugi/analyze"
 	"github.com/tamnd/tsumugi/convert"
 	"github.com/tamnd/tsumugi/graph"
+	"github.com/tamnd/tsumugi/langid"
 	"github.com/tamnd/tsumugi/mph"
 )
 
@@ -31,6 +32,7 @@ type graphSignals struct {
 	hostLinkDiv    []float64
 	nearDup        []float64
 	outboundSpam   []float64
+	langConsist    []float64
 	staticRank     []float64
 }
 
@@ -51,6 +53,7 @@ func (s graphSignals) slice(lo, hi int) graphSignals {
 		hostLinkDiv:    s.hostLinkDiv[lo:hi],
 		nearDup:        s.nearDup[lo:hi],
 		outboundSpam:   s.outboundSpam[lo:hi],
+		langConsist:    s.langConsist[lo:hi],
 		staticRank:     s.staticRank[lo:hi],
 	}
 }
@@ -386,6 +389,7 @@ func globalSignals(docs []convert.Document, trustSeeds, spamSeeds []string) (gra
 		hostLinkDiv:    graph.HostLinkDiversity(g, hostOf),
 		nearDup:        nearDupPenalties(docs, pr),
 		outboundSpam:   graph.OutboundSpamRatio(g, sm, graph.DefaultSpamThreshold),
+		langConsist:    languageConsistency(docs, langid.New()),
 	}
 	// The composite static rank is a thin blend of the raw columns above, computed
 	// last so it can read them. It supersedes the per-document static-rank prior the
