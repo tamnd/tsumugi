@@ -1,6 +1,7 @@
 package collection
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -56,7 +57,7 @@ type Result struct {
 // cuts the ordered stream into shards and writes each one. The build assigns the dense
 // global document ids in that same order, the id space every later stage keys off.
 func Build(opts Options) (Result, error) {
-	return build(opts, 0, 0)
+	return build(opts, 0, 0, false)
 }
 
 // Add brings a later crawl into an existing collection without touching its shards.
@@ -72,10 +73,10 @@ func Add(opts Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	return build(opts, base, idx)
+	return build(opts, base, idx, true)
 }
 
-func build(opts Options, baseStart uint32, indexStart int) (Result, error) {
+func build(opts Options, baseStart uint32, indexStart int, recrawl bool) (Result, error) {
 	if opts.ShardSize <= 0 {
 		opts.ShardSize = DefaultShardSize
 	}
@@ -88,6 +89,30 @@ func build(opts Options, baseStart uint32, indexStart int) (Result, error) {
 	}
 	if len(docs) == 0 {
 		return Result{}, fmt.Errorf("collection: source %s yielded no documents", opts.Source)
+	}
+	// Cross-crawl dedup: an add brings a later crawl into an existing collection, so a
+	// page the collection already holds and this crawl re-fetched must not build a
+	// second copy. The intra-crawl dedupByIdentity in readSource folds duplicates
+	// within one crawl; this folds them across crawls, keying on the same canonical URL
+	// identity through the persisted membership directory. A collection built before the
+	// directory existed has none, so the dedup is skipped (the documents all build, the
+	// pre-directory behavior). The existing copy stays untouched because the shards are
+	// immutable; the re-fetch is the one dropped.
+	if recrawl {
+		rd, err := LoadRecrawlDir(opts.Out)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return Result{}, fmt.Errorf("load recrawl directory: %w", err)
+		}
+		if rd != nil {
+			docs, _ = dropRecrawled(docs, rd)
+			hosts = countHosts(docs)
+			// Every document the crawl carried was a re-fetch of a page the collection
+			// already holds, so there is nothing new to add. Leave the collection as it
+			// is rather than write empty shards or rebuild the index over no change.
+			if len(docs) == 0 {
+				return Result{Docs: 0}, nil
+			}
+		}
 	}
 	// Order by host then url: a host's pages share a shard and sit adjacent, the
 	// locality the delta and dictionary compression exploit. This is the host-
@@ -164,6 +189,14 @@ func build(opts Options, baseStart uint32, indexStart int) (Result, error) {
 	// the old and new shards, not just the slice this call wrote.
 	if err := WriteIndex(opts.Out, uint64(time.Now().Unix())); err != nil {
 		return Result{}, fmt.Errorf("write index: %w", err)
+	}
+	// Refresh the re-crawl membership directory so the next crawl can tell a page the
+	// collection already holds from a new one in a hash probe rather than a full shard
+	// scan. It is rebuilt over every shard in the directory, so an add's directory
+	// covers the union of the old and new shards, the same whole-directory coverage the
+	// index gets.
+	if err := WriteRecrawlDir(opts.Out); err != nil {
+		return Result{}, fmt.Errorf("write recrawl directory: %w", err)
 	}
 	return res, nil
 }
