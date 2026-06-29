@@ -58,7 +58,7 @@ func buildShardFile(t testing.TB, path string, docs []doc, lo, hi int, nodeBase 
 	t.Helper()
 	size := hi - lo
 	lb := lexical.NewBuilder(lexical.DefaultParams())
-	fb := feature.NewBuilder(feature.DefaultSchema(), 1)
+	fb := feature.NewBuilder(feature.DefaultSchema(), feature.SchemaVersion)
 	vb := vector.NewBuilder(vecDim).WithSeed(1).WithRerank(true)
 	var tokens float64
 	for i := 0; i < size; i++ {

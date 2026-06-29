@@ -276,7 +276,7 @@ func TestOnlineFeaturesReachModel(t *testing.T) {
 func buildTextShard(t testing.TB, path string, docs []textDoc) {
 	t.Helper()
 	lb := lexical.NewBuilder(lexical.DefaultParams())
-	fb := feature.NewBuilder(feature.DefaultSchema(), 1)
+	fb := feature.NewBuilder(feature.DefaultSchema(), feature.SchemaVersion)
 	fwdCols := []forward.Column{
 		{Name: "url", Type: forward.ColString},
 		{Name: "title", Type: forward.ColString},

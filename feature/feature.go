@@ -29,7 +29,11 @@ const regionVersion = 1
 // format. A change to DefaultSchema that reorders, adds, or retypes a column bumps
 // this so a shard or model built against the old layout is refused at load rather
 // than read with its columns silently misaligned.
-const SchemaVersion uint16 = 1
+//
+// Version 2 retyped FeatLanguage from a linear stand-in (a latin-script ratio) to a
+// categorical id holding the detected-language code, so a shard built against version 1
+// reads its language column under the wrong quantization and is refused.
+const SchemaVersion uint16 = 2
 
 // FeatureID is the stable identity of a signal, constant across schema versions
 // so a model trained against one schema can find its columns in a later one. A
@@ -55,7 +59,7 @@ const (
 	FeatBodyLen        FeatureID = 15
 	FeatURLFieldLen    FeatureID = 16
 	FeatAnchorFieldLen FeatureID = 17
-	FeatLanguage       FeatureID = 18
+	FeatLanguage       FeatureID = 18 // categorical detected-language id
 	FeatURLDepth       FeatureID = 19
 	FeatURLLen         FeatureID = 20
 	FeatHTTPS          FeatureID = 21
@@ -68,13 +72,16 @@ const (
 
 // Quant is a column's quantization scheme. Linear suits bounded, roughly uniform
 // signals; log suits heavy-tailed ones like PageRank and the lengths; signed
-// suits zero-centered differences.
+// suits zero-centered differences; categorical suits a small set of unordered codes
+// like a language id, where the stored byte is the code itself and the scaling
+// schemes would smear distinct ids into each other.
 type Quant uint8
 
 const (
-	QuantLinear Quant = 0
-	QuantLog    Quant = 1
-	QuantSigned Quant = 2
+	QuantLinear      Quant = 0
+	QuantLog         Quant = 1
+	QuantSigned      Quant = 2
+	QuantCategorical Quant = 3
 )
 
 // epsLog keeps log quantization defined at zero, since log(0) is undefined and
@@ -113,7 +120,7 @@ func DefaultSchema() []Column {
 		{FeatBodyLen, 1, QuantLog},
 		{FeatURLFieldLen, 1, QuantLinear},
 		{FeatAnchorFieldLen, 1, QuantLinear},
-		{FeatLanguage, 1, QuantLinear},
+		{FeatLanguage, 1, QuantCategorical},
 		{FeatURLDepth, 1, QuantLinear},
 		{FeatURLLen, 1, QuantLinear},
 		{FeatHTTPS, 1, QuantLinear},

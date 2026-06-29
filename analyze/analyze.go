@@ -40,7 +40,6 @@ func Document(d convert.Document) Analysis {
 
 	depth, ulen, https, urlTokens := urlFeatures(d.URL)
 	quality := contentQuality(d.Body)
-	latin := latinRatio(d.Body)
 	boiler := boilerplateRatio(d.Body)
 
 	// A simple static rank: reward content, penalize depth, the prior every web
@@ -65,8 +64,11 @@ func Document(d convert.Document) Analysis {
 		feature.FeatHTTPS:          boolFeat(https),
 		feature.FeatContentQuality: quality,
 		feature.FeatBoilerplate:    boiler,
-		feature.FeatLanguage:       latin,
 	}
+	// FeatLanguage is no longer derived here. It holds the detected-language id, which
+	// the build fills over the whole collection from one language-identifier pass (the
+	// same pass the language-consistency signal reads), so the per-document analyze stage
+	// leaves it unset, the same way it leaves the link-graph columns at zero.
 	return Analysis{Title: title, Features: feats}
 }
 
@@ -243,28 +245,6 @@ func alnumCount(rs []rune) int {
 		}
 	}
 	return n
-}
-
-// latinRatio is one when the body is mostly latin-script letters and zero when it is
-// mostly another script, a stand-in language signal until a real detector lands.
-func latinRatio(body string) float64 {
-	var letters, latin int
-	for _, r := range body {
-		if !unicode.IsLetter(r) {
-			continue
-		}
-		letters++
-		if r < 0x250 {
-			latin++
-		}
-	}
-	if letters == 0 {
-		return 0
-	}
-	if float64(latin)/float64(letters) > 0.5 {
-		return 1
-	}
-	return 0
 }
 
 func boolFeat(b bool) float64 {

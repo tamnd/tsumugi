@@ -59,6 +59,77 @@ func TestRoundTripLog(t *testing.T) {
 	}
 }
 
+// TestRoundTripCategorical checks a categorical column returns each stored code
+// exactly, with no scaling smear: an id in must read the same id out. This is the
+// property the linear and log schemes cannot give a code set, where 7 and 8 are
+// different languages, not a value 7/255 apart.
+func TestRoundTripCategorical(t *testing.T) {
+	b := NewBuilder([]Column{{FeatLanguage, 1, QuantCategorical}}, 1)
+	const n = 256
+	for d := 0; d < n; d++ {
+		b.Set(uint32(d), FeatLanguage, float64(d)) // every byte value, 0..255
+	}
+	r, err := Open(b.Build())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	for d := 0; d < n; d++ {
+		got, ok := r.Value(uint32(d), FeatLanguage)
+		if !ok {
+			t.Fatalf("value %d missing", d)
+		}
+		if got != float64(d) {
+			t.Fatalf("d=%d got=%v want=%d, categorical id was not preserved exactly", d, got, d)
+		}
+	}
+	// An unset document reads the zero id, the unknown language, not a fabricated one.
+	b2 := NewBuilder([]Column{{FeatLanguage, 1, QuantCategorical}}, 1)
+	b2.Set(5, FeatLanguage, 9)
+	r2, err := Open(b2.Build())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if got, _ := r2.Value(0, FeatLanguage); got != 0 {
+		t.Fatalf("unset doc language id = %v, want 0 (unknown)", got)
+	}
+	if got, _ := r2.Value(5, FeatLanguage); got != 9 {
+		t.Fatalf("set doc language id = %v, want 9", got)
+	}
+}
+
+// TestCategoricalColumnInDefaultSchema pins that the language column rides the default
+// schema as a categorical column, so a build round-trips a real language id rather than
+// the old latin-ratio stand-in, and an out-of-range id folds to the byte ceiling rather
+// than wrapping into another language's id.
+func TestCategoricalColumnInDefaultSchema(t *testing.T) {
+	var lang Column
+	found := false
+	for _, c := range DefaultSchema() {
+		if c.ID == FeatLanguage {
+			lang, found = c, true
+		}
+	}
+	if !found {
+		t.Fatal("FeatLanguage missing from the default schema")
+	}
+	if lang.Quant != QuantCategorical {
+		t.Fatalf("FeatLanguage quant = %d, want categorical %d", lang.Quant, QuantCategorical)
+	}
+	b := NewBuilder(DefaultSchema(), SchemaVersion)
+	b.Set(0, FeatLanguage, 3)
+	b.Set(1, FeatLanguage, 300) // past a one-byte column
+	r, err := Open(b.Build())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if got, _ := r.Value(0, FeatLanguage); got != 3 {
+		t.Fatalf("language id = %v, want 3", got)
+	}
+	if got, _ := r.Value(1, FeatLanguage); got != 255 {
+		t.Fatalf("over-range id = %v, want the byte ceiling 255", got)
+	}
+}
+
 // TestRankCorrelation is the build's own acceptance check for a column: the
 // Spearman rank correlation between the full-precision values and their
 // dequantized forms must be very high, since ranking only cares about order.

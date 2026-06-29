@@ -261,6 +261,10 @@ func writeShard(path string, docs []convert.Document, sig graphSignals, base uin
 		fb.Set(id, feature.FeatHostLinkDiv, sig.hostLinkDiv[i])
 		fb.Set(id, feature.FeatNearDup, sig.nearDup[i])
 		fb.Set(id, feature.FeatOutboundSpam, sig.outboundSpam[i])
+		// The detected-language id supersedes the latin-script ratio stand-in the analyze
+		// stage wrote into FeatLanguage; it is the real language the identifier read over
+		// the body, computed once over the whole collection alongside the consistency signal.
+		fb.Set(id, feature.FeatLanguage, float64(sig.langID[i]))
 		// The composite static rank supersedes the per-document prior the analyze
 		// stage wrote into FeatStaticRank above; it is the blend over the whole
 		// collection's signals that orders the postings.

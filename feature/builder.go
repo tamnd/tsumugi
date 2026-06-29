@@ -74,6 +74,10 @@ func (b *Builder) docCount() uint32 {
 func quantParams(c Column, min, max float64) (p0, p1, p2 float32) {
 	lvl := maxLevel(c.Width)
 	switch c.Quant {
+	case QuantCategorical:
+		// A categorical column stores the code verbatim, so it has no range to fit and
+		// needs no params; the observed min and max are ignored.
+		return 0, 0, 0
 	case QuantLog:
 		lmin := math.Log(min + epsLog)
 		lmax := math.Log(max + epsLog)
@@ -104,6 +108,10 @@ func quantize(c Column, p0, p1, p2 float32, v float64) uint32 {
 	lvl := maxLevel(c.Width)
 	var q float64
 	switch c.Quant {
+	case QuantCategorical:
+		// The stored byte is the code itself, rounded to an integer and clamped to the
+		// column width below; an id past the width is folded to the largest the byte holds.
+		q = math.Round(v)
 	case QuantLog:
 		q = math.Round((math.Log(v+float64(p2)) - float64(p0)) / float64(p1))
 	case QuantSigned:

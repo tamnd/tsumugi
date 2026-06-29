@@ -24,8 +24,10 @@ func TestDocumentTitleAndFeatures(t *testing.T) {
 	if got := a.Features[feature.FeatURLDepth]; got != 3 {
 		t.Errorf("url depth = %v, want 3 path segments", got)
 	}
-	if got := a.Features[feature.FeatLanguage]; got != 1 {
-		t.Errorf("language = %v, want 1 for latin text", got)
+	// FeatLanguage is no longer derived per document here; it holds the detected-language
+	// id the build fills over the whole collection, so the analyze stage leaves it unset.
+	if _, ok := a.Features[feature.FeatLanguage]; ok {
+		t.Errorf("language feature set in analyze, want it filled by the build's detection pass")
 	}
 	if got := a.Features[feature.FeatDocLen]; got <= 0 {
 		t.Errorf("doc len = %v, want a positive token count", got)

@@ -36,6 +36,39 @@ const (
 	Unknown = ""
 )
 
+// languageIDs assigns each language code a stable small integer, the categorical id the
+// feature matrix stores for a document's detected language. The zero id is the unknown
+// language, what an unplaceable page or a low-confidence detection records, so a column
+// read of zero means "no committed language" rather than a real one. The assignment is
+// fixed and append-only: a new language takes the next free id and an existing code never
+// renumbers, so a model trained against one assignment still finds a document's language
+// under a later one, the same stability the FeatureID space keeps.
+var languageIDs = map[string]uint16{
+	Unknown:    0,
+	English:    1,
+	Spanish:    2,
+	French:     3,
+	German:     4,
+	Italian:    5,
+	Portuguese: 6,
+	Dutch:      7,
+	Chinese:    8,
+	Japanese:   9,
+	Korean:     10,
+	Russian:    11,
+	Arabic:     12,
+	Hebrew:     13,
+	Hindi:      14,
+	Thai:       15,
+	Greek:      16,
+}
+
+// LanguageID returns the stable categorical id for a language code, the value a build
+// stores in a document's language feature column. An unrecognized or empty code maps to
+// zero, the unknown id, so a caller never records a fabricated id for a language the model
+// does not know.
+func LanguageID(lang string) uint16 { return languageIDs[lang] }
+
 // scriptDefault maps a resolved script to the language the caller routes on when the
 // script vote is decisive. The CJK and other non-Latin scripts skip the trigram model
 // entirely because the script already names the language closely enough for analysis.
