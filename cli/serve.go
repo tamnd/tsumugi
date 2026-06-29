@@ -211,9 +211,23 @@ type searchResponse struct {
 	// chain. Corrected is true when spell correction auto-substituted a term, and
 	// Suggestion carries the did-you-mean rendering when one was offered rather than
 	// applied, so a caller can show "showing results for" or "did you mean".
+	// Completeness tells the client whether the top-k is over every contributing shard
+	// or a subset, so a partial answer (a shard dropped at the deadline) is reported as
+	// a degraded result rather than passed off as complete.
+	Completeness completenessJSON `json:"completeness"`
+
 	Lang       string `json:"lang,omitempty"`
 	Corrected  bool   `json:"corrected,omitempty"`
 	Suggestion string `json:"suggestion,omitempty"`
+}
+
+// completenessJSON is the response's completeness indicator: complete is true when
+// every contributing shard responded by the deadline, and the two counts let a client
+// see the fraction reached (doc 11, "Failure modes and partial results").
+type completenessJSON struct {
+	Complete    bool `json:"complete"`
+	ShardsTotal int  `json:"shards_total"`
+	ShardsOK    int  `json:"shards_ok"`
 }
 
 type hitJSON struct {
@@ -240,6 +254,8 @@ func (s *httpServer) search(w http.ResponseWriter, r *http.Request) {
 	}
 	if pq.Empty() {
 		resp.Hits = []hitJSON{}
+		// A query with nothing to route is trivially complete: no shard was dropped.
+		resp.Completeness.Complete = true
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 		return
@@ -253,10 +269,15 @@ func (s *httpServer) search(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 	}
 	start := time.Now()
-	hits := s.broker.Search(ctx, q)
-	resp.Hits = make([]hitJSON, len(hits))
+	res := s.broker.SearchComplete(ctx, q)
 	resp.TookMs = float64(time.Since(start).Microseconds()) / 1000
-	for i, h := range hits {
+	resp.Completeness = completenessJSON{
+		Complete:    res.Complete(),
+		ShardsTotal: res.ShardsTotal,
+		ShardsOK:    res.ShardsOK,
+	}
+	resp.Hits = make([]hitJSON, len(res.Hits))
+	for i, h := range res.Hits {
 		resp.Hits[i] = hitJSON{DocID: h.DocID, Score: h.Score}
 	}
 	w.Header().Set("Content-Type", "application/json")

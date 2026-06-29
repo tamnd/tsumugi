@@ -55,7 +55,20 @@ func TestServeCCrawlPipeline(t *testing.T) {
 		if pq.Empty() {
 			continue
 		}
+		// With the full per-request deadline every contributing shard responds, so the
+		// fan-out over real shards is complete: the count reached equals the count routed,
+		// and the back-compatible Search returns the same top-k the completeness path does.
+		sc := broker.SearchComplete(t.Context(), toQuery(pq, 10))
+		if !sc.Complete() {
+			t.Fatalf("query %q flagged partial over real shards: %d of %d reached", q, sc.ShardsOK, sc.ShardsTotal)
+		}
+		if sc.ShardsOK < 1 {
+			t.Fatalf("query %q reached no shard", q)
+		}
 		hits := broker.Search(t.Context(), toQuery(pq, 10))
+		if len(hits) != len(sc.Hits) {
+			t.Fatalf("query %q: Search returned %d hits, SearchComplete %d", q, len(hits), len(sc.Hits))
+		}
 		total += len(hits)
 		// Every returned global id must fall inside the collection's id space, the proof
 		// the fan-out shifted local ids into the global space by each shard's node base.
