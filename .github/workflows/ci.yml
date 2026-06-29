@@ -42,7 +42,12 @@ jobs:
       - name: build
         run: go build ./...
       - name: test
-        run: go test -race -count=1 -coverprofile=coverage.out ./...
+        # The race detector instruments every memory access, so the vector package's
+        # HNSW build over a few thousand vectors runs minutes slower than untraced and
+        # has overrun the default 10m per-package timeout on a loaded runner. Give the
+        # raced suite headroom rather than thinning the test that needs that many nodes
+        # to strand a cluster for the repair gate to exercise.
+        run: go test -race -count=1 -timeout 25m -coverprofile=coverage.out ./...
       - name: coverage summary
         if: matrix.os == 'ubuntu-latest'
         run: go tool cover -func=coverage.out | tail -1
