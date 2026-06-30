@@ -116,7 +116,7 @@ func TestServeSearch(t *testing.T) {
 		t.Fatalf("shards = %d, want 2", broker.NumShards())
 	}
 
-	srv := &httpServer{broker: broker, pipeline: pl, timeout: 0}
+	srv := &httpServer{backend: broker, pipeline: pl, timeout: 0}
 	ts := httptest.NewServer(http.HandlerFunc(srv.search))
 	defer ts.Close()
 

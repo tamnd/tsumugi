@@ -91,3 +91,37 @@ func BenchmarkAggregatorOverRemotes(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkRemoteVocab measures streaming a broker's whole vocabulary over /vocab, the cost a
+// head node pays once at startup per peer to build its fleet-wide corrector. It is off the
+// serving path, so it does not count against the 10ms query budget, but it bounds how long a
+// head takes to come up over a large fleet.
+func BenchmarkRemoteVocab(b *testing.B) {
+	const n, parts = 4000, 4
+	docs := remoteRankCorpus(n)
+	dir := b.TempDir()
+	model := trainModel(b)
+	broker, shards := buildBrokerFromDocs(b, dir, "s", docs, parts, model)
+	defer func() {
+		for _, sh := range shards {
+			_ = sh.Close()
+		}
+	}()
+	srv := httptest.NewServer(NewSearcherHandler(broker))
+	defer srv.Close()
+	rs, err := NewRemoteSearcher(context.Background(), srv.URL)
+	if err != nil {
+		b.Fatalf("dial remote: %v", err)
+	}
+	ctx := context.Background()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		n := 0
+		if err := rs.Vocab(ctx, func(string, uint32) { n++ }); err != nil {
+			b.Fatalf("vocab: %v", err)
+		}
+		if n == 0 {
+			b.Fatal("empty vocabulary")
+		}
+	}
+}

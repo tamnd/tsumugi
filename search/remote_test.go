@@ -281,3 +281,117 @@ func TestRemoteSearcherDroppedSubtree(t *testing.T) {
 		t.Fatal("aggregator dropped the live child's hits along with the dead one's")
 	}
 }
+
+// TestRemoteVocabMatchesLocal checks the /vocab stream reproduces the broker's own merged
+// vocabulary exactly: every term the broker enumerates locally with ForEachTerm comes back over
+// the wire with the same document frequency, and nothing extra. This is what lets a head node
+// build the same corrector dictionary from a peer it would build from the peer's local shards.
+func TestRemoteVocabMatchesLocal(t *testing.T) {
+	const n, parts = 80, 2
+	docs := dfCorpus(n)
+	dir := t.TempDir()
+	model := trainModel(t)
+
+	broker, shards := buildBrokerFromDocs(t, dir, "s", docs, parts, model)
+	defer func() {
+		for _, sh := range shards {
+			_ = sh.Close()
+		}
+	}()
+
+	want := map[string]uint32{}
+	broker.ForEachTerm(func(term string, df uint32) { want[term] = df })
+	if len(want) == 0 {
+		t.Fatal("broker has no vocabulary to compare")
+	}
+
+	rs := serveSearcher(t, broker)
+	got := map[string]uint32{}
+	if err := rs.Vocab(context.Background(), func(term string, df uint32) { got[term] = df }); err != nil {
+		t.Fatalf("vocab: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("vocab streamed %d terms, broker has %d", len(got), len(want))
+	}
+	for term, df := range want {
+		if got[term] != df {
+			t.Fatalf("term %q df over wire = %d, local = %d", term, got[term], df)
+		}
+	}
+}
+
+// TestRemoteVectorDimMatchesLocal checks the dense dimension rides the /meta snapshot: a broker
+// over shards that carry a vector region reports the same dimension over the wire that its own
+// VectorDim reports, so a head node builds its dense encoder at the width every leaf can read.
+// A broker with no vector region reports the dense plane off, so the head leaves its encoder off.
+func TestRemoteVectorDimMatchesLocal(t *testing.T) {
+	const n = 120
+	docs := makeCorpus(n)
+	model := trainModel(t)
+
+	t.Run("with vector region", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "v.tsumugi")
+		buildShardFile(t, path, docs, 0, n, 0, true)
+		sh, err := OpenShard(path, newTestCascade(model))
+		if err != nil {
+			t.Fatalf("open shard: %v", err)
+		}
+		defer func() { _ = sh.Close() }()
+		broker := NewBroker([]*Shard{sh}, newTestCascade(model))
+
+		wantDim, wantOK := broker.VectorDim()
+		if !wantOK {
+			t.Fatal("broker over a vector shard reports no dense plane")
+		}
+		rs := serveSearcher(t, broker)
+		gotDim, gotOK := rs.VectorDim()
+		if gotOK != wantOK || gotDim != wantDim {
+			t.Fatalf("remote VectorDim = (%d,%t), local = (%d,%t)", gotDim, gotOK, wantDim, wantOK)
+		}
+	})
+
+	t.Run("without vector region", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "p.tsumugi")
+		buildShardFile(t, path, docs, 0, n, 0, false)
+		sh, err := OpenShard(path, newTestCascade(model))
+		if err != nil {
+			t.Fatalf("open shard: %v", err)
+		}
+		defer func() { _ = sh.Close() }()
+		broker := NewBroker([]*Shard{sh}, newTestCascade(model))
+
+		rs := serveSearcher(t, broker)
+		if dim, ok := rs.VectorDim(); ok {
+			t.Fatalf("remote reported a dense plane (dim %d) for a broker with no vector region", dim)
+		}
+	})
+}
+
+// TestRemoteVocabAbsent checks a node that does not serve a vocabulary, a bare aggregator whose
+// terms live on its remote children, answers /vocab with an error rather than an empty stream,
+// so a head dialing it knows to gather vocabulary from that node's children instead of taking
+// absent for empty.
+func TestRemoteVocabAbsent(t *testing.T) {
+	const n, parts = 40, 2
+	docs := dfCorpus(n)
+	dir := t.TempDir()
+	model := trainModel(t)
+
+	broker, shards := buildBrokerFromDocs(t, dir, "s", docs, parts, model)
+	defer func() {
+		for _, sh := range shards {
+			_ = sh.Close()
+		}
+	}()
+
+	// An aggregator over a remote child has no ForEachTerm of its own, so a RemoteSearcher dialed
+	// at an aggregator's handler gets a 404 on /vocab.
+	agg := NewAggregator([]Searcher{serveSearcher(t, broker)})
+	rs := serveSearcher(t, agg)
+	err := rs.Vocab(context.Background(), func(string, uint32) {})
+	if err == nil {
+		t.Fatal("vocab on a node without a vocabulary returned no error")
+	}
+}

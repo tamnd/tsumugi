@@ -34,6 +34,7 @@ func newServeCmd() *cobra.Command {
 		cacheSize      int
 		maxInFlight    int
 		reloadInterval time.Duration
+		peers          []string
 	)
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -46,61 +47,10 @@ func newServeCmd() *cobra.Command {
 			"result a single index over every shard would give.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if dir == "" {
-				return fmt.Errorf("a shard directory is required: pass --dir")
+			if len(peers) > 0 {
+				return runHead(cmd, peers, addr, timeout, cacheSize, maxInFlight)
 			}
-			if modelP == "" {
-				return fmt.Errorf("a ranking model is required: pass --model")
-			}
-			broker, pl, rl, err := loadServe(dir, modelP)
-			if err != nil {
-				return err
-			}
-			defer func() { _ = broker.Close() }()
-
-			// Wire a result cache when one is sized, so the head of the heavy-tailed query
-			// distribution serves from cache without re-running the cascade. A size of zero
-			// leaves the broker cacheless, running every query through the cascade.
-			if cacheSize > 0 {
-				broker.SetResultCache(search.NewResultCache(cacheSize))
-			}
-
-			// Bound the in-flight searches so the broker degrades by rejecting rather than
-			// collapsing under unbounded concurrency. A request that cannot get a slot is
-			// answered 503 fast rather than queued into latency it would miss its deadline in.
-			// A zero capacity disables the gate, leaving the broker unbounded.
-			adm := search.NewAdmission(maxInFlight)
-			srv := &httpServer{broker: broker, pipeline: pl, timeout: timeout, admission: adm, reloader: rl}
-			mux := http.NewServeMux()
-			mux.HandleFunc("/search", srv.search)
-			mux.HandleFunc("/healthz", srv.health)
-			// The admin endpoints publish and retire shards on the running broker, the freshness
-			// half doc 11 needs. /admin/reload syncs the whole served set to the directory;
-			// /admin/publish and /admin/retire name one shard for explicit control.
-			mux.HandleFunc("/admin/reload", srv.reload)
-			mux.HandleFunc("/admin/publish", srv.publish)
-			mux.HandleFunc("/admin/retire", srv.retire)
-
-			// Expose the broker as one node of a serving tree that spans machines: an aggregator on
-			// a head node dials these routes to fan a query across this broker as a remote child, so
-			// a deployment reaches past one machine's shards by adding leaf nodes rather than growing
-			// one box (doc 11, "The serving topology", across hosts). The RPC routes live under /rpc/
-			// so the machine-to-machine wire is kept separate from the human /search above, which
-			// understands a raw query string and returns the took-ms-and-completeness envelope; the
-			// /rpc/search wire carries an already-analyzed query and returns the bare Results an
-			// aggregator merges.
-			mux.Handle("/rpc/", http.StripPrefix("/rpc", search.NewSearcherHandler(broker)))
-
-			// An optional poll picks up shards dropped into or removed from the directory without
-			// an admin call, so a deployment can publish by writing a file. A zero interval leaves
-			// the served set fixed until an admin call, the pre-slice behavior.
-			if reloadInterval > 0 {
-				go pollReload(cmd.Context(), rl, reloadInterval, cmd.OutOrStdout())
-			}
-
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "serving %d shards (%d docs) on %s\n",
-				broker.NumShards(), broker.Stats().DocCount, addr)
-			return serveHTTP(cmd.Context(), addr, mux, adm, timeout)
+			return runLeaf(cmd, dir, modelP, addr, timeout, cacheSize, maxInFlight, reloadInterval)
 		},
 	}
 	cmd.Flags().StringVar(&dir, "dir", "", "directory of .tsumugi shards to serve")
@@ -110,7 +60,117 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().IntVar(&cacheSize, "cache", 0, "result cache capacity in entries (0 disables the cache)")
 	cmd.Flags().IntVar(&maxInFlight, "max-inflight", 0, "maximum concurrent in-flight searches (0 disables admission control)")
 	cmd.Flags().DurationVar(&reloadInterval, "reload-interval", 0, "poll the shard directory at this interval to publish and retire shards (0 disables polling)")
+	cmd.Flags().StringArrayVar(&peers, "peer", nil, "base URL of a leaf node to serve through (repeatable); when set, this process runs as a head node over its peers instead of opening local shards")
 	return cmd
+}
+
+// runLeaf serves a directory of local shards: it opens the collection, wires a broker, and
+// answers queries over its own shards while also exposing the broker over /rpc/ so a head node
+// can fan across it. This is the standalone mode and the leaf-node mode of a fleet at once,
+// since a leaf is just a broker that a head happens to dial.
+func runLeaf(cmd *cobra.Command, dir, modelP, addr string, timeout time.Duration, cacheSize, maxInFlight int, reloadInterval time.Duration) error {
+	if dir == "" {
+		return fmt.Errorf("a shard directory is required: pass --dir")
+	}
+	if modelP == "" {
+		return fmt.Errorf("a ranking model is required: pass --model")
+	}
+	broker, pl, rl, err := loadServe(dir, modelP)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = broker.Close() }()
+
+	// Wire a result cache when one is sized, so the head of the heavy-tailed query
+	// distribution serves from cache without re-running the cascade. A size of zero
+	// leaves the broker cacheless, running every query through the cascade.
+	if cacheSize > 0 {
+		broker.SetResultCache(search.NewResultCache(cacheSize))
+	}
+
+	adm := search.NewAdmission(maxInFlight)
+	srv := &httpServer{backend: broker, pipeline: pl, timeout: timeout, admission: adm, reloader: rl}
+	mux := http.NewServeMux()
+	srv.routes(mux)
+	// The admin endpoints publish and retire shards on the running broker, the freshness
+	// half doc 11 needs. /admin/reload syncs the whole served set to the directory;
+	// /admin/publish and /admin/retire name one shard for explicit control. They are wired
+	// only in leaf mode, where a reloader owns the directory; a head node holds no shards to
+	// publish, so it leaves them off (adminGuard answers 404).
+	mux.HandleFunc("/admin/reload", srv.reload)
+	mux.HandleFunc("/admin/publish", srv.publish)
+	mux.HandleFunc("/admin/retire", srv.retire)
+
+	// Expose the broker as one node of a serving tree that spans machines: an aggregator on
+	// a head node dials these routes to fan a query across this broker as a remote child, so
+	// a deployment reaches past one machine's shards by adding leaf nodes rather than growing
+	// one box (doc 11, "The serving topology", across hosts). The RPC routes live under /rpc/
+	// so the machine-to-machine wire is kept separate from the human /search above, which
+	// understands a raw query string and returns the took-ms-and-completeness envelope; the
+	// /rpc/search wire carries an already-analyzed query and returns the bare Results an
+	// aggregator merges.
+	mux.Handle("/rpc/", http.StripPrefix("/rpc", search.NewSearcherHandler(broker)))
+
+	// An optional poll picks up shards dropped into or removed from the directory without
+	// an admin call, so a deployment can publish by writing a file. A zero interval leaves
+	// the served set fixed until an admin call, the pre-slice behavior.
+	if reloadInterval > 0 {
+		go pollReload(cmd.Context(), rl, reloadInterval, cmd.OutOrStdout())
+	}
+
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "serving %d shards (%d docs) on %s\n",
+		broker.NumShards(), broker.Stats().DocCount, addr)
+	return serveHTTP(cmd.Context(), addr, mux, adm, timeout)
+}
+
+// runHead serves through a fleet of leaf nodes rather than local shards: it dials each peer,
+// fans across them with an aggregator, and runs the query-understanding pipeline and the result
+// cache at the head, so the head reproduces over the fleet what a single broker does over its
+// shards. The head holds no shards and no model, so it takes neither --dir nor --model; it
+// builds its corrector from the peers' vocabularies and its dense encoder from their agreed
+// dimension, both pulled over the wire. It also re-exposes the aggregator over /rpc/ so a head
+// can sit beneath another head, nesting the tree to any depth (doc 11, "The serving topology").
+func runHead(cmd *cobra.Command, peers []string, addr string, timeout time.Duration, cacheSize, maxInFlight int) error {
+	ctx := cmd.Context()
+	remotes := make([]*search.RemoteSearcher, 0, len(peers))
+	children := make([]search.Searcher, 0, len(peers))
+	for _, p := range peers {
+		rs, err := search.NewRemoteSearcher(ctx, p)
+		if err != nil {
+			return fmt.Errorf("dial peer %s: %w", p, err)
+		}
+		remotes = append(remotes, rs)
+		children = append(children, rs)
+	}
+	agg := search.NewAggregator(children)
+
+	pl, verr := buildHeadPipeline(ctx, remotes)
+	for _, e := range verr {
+		// A peer that could not stream its vocabulary leaves a working corrector built from the
+		// peers that could, so log the gap rather than fail to start: the head still serves, with a
+		// corrector missing only the unreachable peer's terms.
+		_, _ = fmt.Fprintf(cmd.OutOrStderr(), "head: vocab: %v\n", e)
+	}
+
+	// The head's backend is the aggregator wrapped in a result cache, the head-of-tree cache
+	// (slice 67): a hit serves the merged full-quality result without re-fanning across the
+	// fleet, a miss runs the complete fan-out and caches it. A zero cache size leaves the head
+	// cacheless, fanning every query.
+	cache := search.NewResultCache(cacheSize)
+	backend := search.NewCachedSearcher(agg, cache)
+
+	adm := search.NewAdmission(maxInFlight)
+	srv := &httpServer{backend: backend, pipeline: pl, timeout: timeout, admission: adm}
+	mux := http.NewServeMux()
+	srv.routes(mux)
+	// Re-expose the aggregator over /rpc/ so this head can be a child of another head. The
+	// SearchComplete the parent calls fans the complete query across this head's peers, the same
+	// way a broker answers it over shards, so the tree nests across machines to any depth.
+	mux.Handle("/rpc/", http.StripPrefix("/rpc", search.NewSearcherHandler(agg)))
+
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "serving %d peers (%d shards, %d docs) on %s\n",
+		len(peers), backend.NumShards(), backend.Stats().DocCount, addr)
+	return serveHTTP(cmd.Context(), addr, mux, adm, timeout)
 }
 
 // serveHTTP runs the broker's HTTP server until the context is cancelled, then drains the
@@ -287,11 +347,23 @@ func newCascade(model *rank.Model) *rank.Cascade {
 	return rank.NewCascade(&rank.Linear{RetrievalWeight: 1}, model)
 }
 
-// httpServer answers search requests over a broker with a per-request deadline. It runs
-// each raw query through the query-understanding pipeline once, at the broker, before
-// fanning the parsed query out to the shards, the analyze-once rule the pipeline owns.
+// searchBackend is the part of a serving node the HTTP handlers talk to: run a cached query,
+// report the served shard count, and report the fleet statistics. A leaf node's backend is a
+// *search.Broker over local shards; a head node's backend is a *search.CachedSearcher over an
+// aggregator across remote leaves. Both satisfy this interface, so the handlers serve a query
+// the same way whether the shards are on this machine or fanned across the fleet, and the only
+// thing that changes between leaf and head mode is which backend is wired in.
+type searchBackend interface {
+	SearchCached(ctx context.Context, q search.Query) (search.Results, bool)
+	NumShards() int
+	Stats() search.GlobalStats
+}
+
+// httpServer answers search requests over a backend with a per-request deadline. It runs
+// each raw query through the query-understanding pipeline once, at this node, before
+// fanning the parsed query out, the analyze-once rule the pipeline owns.
 type httpServer struct {
-	broker   *search.Broker
+	backend  searchBackend
 	pipeline *pipeline
 	timeout  time.Duration
 
@@ -302,9 +374,18 @@ type httpServer struct {
 	admission *search.Admission
 
 	// reloader publishes and retires shards on the broker for the admin endpoints. It is nil
-	// only in tests that construct the server directly without one; the serve command always
-	// wires it.
+	// in head mode and in tests that construct the server directly without one; the leaf serve
+	// path always wires it.
 	reloader *reloader
+}
+
+// routes mounts the query and health endpoints both leaf and head nodes serve: /search runs a
+// raw query through the pipeline and the backend, and /healthz reports the served shard and
+// document counts and the admission load. The admin and /rpc/ routes differ between the two
+// modes, so the caller mounts those itself after calling routes.
+func (s *httpServer) routes(mux *http.ServeMux) {
+	mux.HandleFunc("/search", s.search)
+	mux.HandleFunc("/healthz", s.health)
 }
 
 type searchResponse struct {
@@ -376,7 +457,7 @@ func (s *httpServer) search(w http.ResponseWriter, r *http.Request) {
 	// single parsed result to the shards, so a shard never re-runs the analysis chain.
 	pq := s.pipeline.parse(r.URL.Query().Get("q"))
 	resp := searchResponse{
-		Shards:     s.broker.NumShards(),
+		Shards:     s.backend.NumShards(),
 		Lang:       pq.Lang,
 		Corrected:  pq.Corrected,
 		Suggestion: pq.Suggestion,
@@ -404,7 +485,7 @@ func (s *httpServer) search(w http.ResponseWriter, r *http.Request) {
 	// for, so a request entering with little budget left answers within budget at a known
 	// lower quality rather than overrunning the per-request deadline (doc 11, degradation
 	// order); a hit serves the cached full-quality result regardless of the current budget.
-	res, hit := s.broker.SearchCached(ctx, q)
+	res, hit := s.backend.SearchCached(ctx, q)
 	resp.Cached = hit
 	resp.TookMs = float64(time.Since(start).Microseconds()) / 1000
 	resp.Completeness = completenessJSON{
@@ -455,7 +536,7 @@ func (s *httpServer) reload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pub, ret, err := s.reloader.sync()
-	resp := reloadResponse{Published: pub, Retired: ret, Shards: s.broker.NumShards(), Docs: s.broker.Stats().DocCount}
+	resp := reloadResponse{Published: pub, Retired: ret, Shards: s.backend.NumShards(), Docs: s.backend.Stats().DocCount}
 	if err != nil {
 		resp.Error = err.Error()
 	}
@@ -475,10 +556,10 @@ func (s *httpServer) publish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.reloader.publish(name); err != nil {
-		writeJSON(w, reloadResponse{Shards: s.broker.NumShards(), Docs: s.broker.Stats().DocCount, Error: err.Error()})
+		writeJSON(w, reloadResponse{Shards: s.backend.NumShards(), Docs: s.backend.Stats().DocCount, Error: err.Error()})
 		return
 	}
-	writeJSON(w, reloadResponse{Published: 1, Shards: s.broker.NumShards(), Docs: s.broker.Stats().DocCount})
+	writeJSON(w, reloadResponse{Published: 1, Shards: s.backend.NumShards(), Docs: s.backend.Stats().DocCount})
 }
 
 // retire removes one named shard from the served set, the mirror of publish. A name that
@@ -496,7 +577,7 @@ func (s *httpServer) retire(w http.ResponseWriter, r *http.Request) {
 	if s.reloader.retire(name) {
 		n = 1
 	}
-	writeJSON(w, reloadResponse{Retired: n, Shards: s.broker.NumShards(), Docs: s.broker.Stats().DocCount})
+	writeJSON(w, reloadResponse{Retired: n, Shards: s.backend.NumShards(), Docs: s.backend.Stats().DocCount})
 }
 
 // adminGuard rejects an admin request that has no reloader wired (404, the endpoint is not
@@ -549,8 +630,8 @@ func (s *httpServer) health(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"status": "ok",
-		"shards": s.broker.NumShards(),
-		"docs":   s.broker.Stats().DocCount,
+		"shards": s.backend.NumShards(),
+		"docs":   s.backend.Stats().DocCount,
 		// in_flight against capacity is the load metric an operator watches to see when the
 		// broker is near capacity and shedding load (doc 11, "Metrics"). capacity is zero
 		// when admission control is disabled.

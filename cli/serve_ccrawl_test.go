@@ -185,6 +185,108 @@ func TestAggregatorCCrawl(t *testing.T) {
 	}
 }
 
+// TestServeHeadCCrawlMatchesMonolith is the head-node correctness proof on real data: a head
+// node serving through two leaf nodes over the RPC seam returns, for every real query term, the
+// same ranked top-k a single broker over every shard returns. It builds a real multi-shard
+// collection from the crawl export, splits the shards across two leaves stood up behind RPC
+// servers, dials them as a head, and drives the head's HTTP /search the command serves. The head
+// builds its corrector and dense plane from the peers' vocabularies pulled over the wire, not
+// from any local shard, so a bit-exact match against the monolith proves both the distributed
+// fan-out and the fleet-pipeline wiring on real text where a term's documents spread unevenly
+// across the shards the two leaves hold.
+func TestServeHeadCCrawlMatchesMonolith(t *testing.T) {
+	if _, err := os.Stat(ccrawlParquet); err != nil {
+		t.Skipf("ccrawl parquet not present: %v", err)
+	}
+	if testing.Short() {
+		t.Skip("skipping real-data build in short mode")
+	}
+	tmp := t.TempDir()
+	out := filepath.Join(tmp, "coll")
+	res, err := collection.Build(collection.Options{Source: ccrawlParquet, Out: out, ShardSize: 1000, Limit: 8000})
+	if err != nil {
+		t.Fatalf("Build from ccrawl: %v", err)
+	}
+	if res.Shards < 4 {
+		t.Fatalf("need at least 4 shards to split across two leaves, got %d", res.Shards)
+	}
+
+	modelPath := filepath.Join(tmp, "model.bin")
+	writeModel(t, modelPath)
+	model, err := loadModel(modelPath)
+	if err != nil {
+		t.Fatalf("load model: %v", err)
+	}
+
+	// The all-shards broker owns the file mappings and is the one closed; the two leaf brokers
+	// reference the same read-only shards without closing them again, the same sharing the
+	// in-process aggregator test relies on.
+	shards, _, all, err := openShards(out, model)
+	if err != nil {
+		t.Fatalf("openShards: %v", err)
+	}
+	defer func() { _ = all.Close() }()
+	monoPipe := buildPipeline(shards)
+	monoSrv := &httpServer{backend: all, pipeline: monoPipe, timeout: 0}
+
+	half := len(shards) / 2
+	leaf0 := search.NewBroker(shards[:half], newCascade(model))
+	leaf1 := search.NewBroker(shards[half:], newCascade(model))
+	headSrv, cleanup := headOverLeaves(t, []*search.Broker{leaf0, leaf1})
+	defer cleanup()
+
+	// The head must report the same fleet shape the monolith does: it sums the leaves' shard and
+	// document counts and folds their statistics, so a head over the split fleet sees the same
+	// corpus a single broker over every shard sees. This is what makes the idf and field averages
+	// the head pushes down the monolith's, the exactness TestAggregatorCCrawlDocFreqsExact proves
+	// for the in-process tree, here over the wire.
+	if headSrv.backend.NumShards() != all.NumShards() {
+		t.Fatalf("head NumShards = %d, mono = %d", headSrv.backend.NumShards(), all.NumShards())
+	}
+	if hs, ms := headSrv.backend.Stats(), all.Stats(); hs.DocCount != ms.DocCount || hs.TokenCount != ms.TokenCount {
+		t.Fatalf("head stats {docs %d tokens %g} != mono {docs %d tokens %g}", hs.DocCount, hs.TokenCount, ms.DocCount, ms.TokenCount)
+	}
+
+	queries := []string{"data", "page", "home", "search", "news", "world", "time", "people"}
+	matched := 0
+	for _, q := range queries {
+		want := getSearchOn(t, monoSrv, "?q="+q+"&k=10")
+		got := getSearchOn(t, headSrv, "?q="+q+"&k=10")
+		if len(want.Hits) == 0 {
+			continue
+		}
+		if !got.Completeness.Complete || got.Shards != want.Shards {
+			t.Fatalf("query %q: head completeness %+v shards %d, mono shards %d", q, got.Completeness, got.Shards, want.Shards)
+		}
+		if len(got.Hits) != len(want.Hits) {
+			t.Fatalf("query %q: head %d hits, mono %d", q, len(got.Hits), len(want.Hits))
+		}
+		// The head must reproduce the monolith's score at every rank: a head computing idf and field
+		// averages from the leaves' folded statistics scores each ranked document exactly as a single
+		// broker over every shard would. Real text often ties many documents on one score, and at a
+		// tie the choice of which tied documents fill the top-k is not pinned across a different fan-out,
+		// so this asserts the score sequence rather than the doc identity; the bit-exact doc-level match
+		// on distinct scores is proven synthetically in TestAggregatorOverRemotesMatchesMonolith. When a
+		// query's top-k does carry distinct scores, the doc-id set within each score also has to agree.
+		for i := range want.Hits {
+			if got.Hits[i].Score != want.Hits[i].Score {
+				t.Fatalf("query %q rank %d: head score %v, mono %v", q, i, got.Hits[i].Score, want.Hits[i].Score)
+			}
+		}
+		if distinctScores(want.Hits) {
+			if gh, wh := tieGroups(got.Hits), tieGroups(want.Hits); !equalTieGroups(gh, wh) {
+				t.Fatalf("query %q: head and mono disagree on which docs hold a score\n head=%v\n mono=%v", q, gh, wh)
+			}
+		}
+		matched++
+	}
+	if matched == 0 {
+		t.Fatalf("no real query returned hits to compare over %d real docs", res.Docs)
+	}
+	t.Logf("head over 2 leaves reproduced the monolith's score sequence and fleet shape on %d real queries over %d shards, %d docs",
+		matched, len(shards), res.Docs)
+}
+
 // TestAggregatorCCrawlDocFreqsExact is the cross-broker exact-idf proof on real data: an
 // aggregator over two brokers that split the real shards gathers the same fleet-wide df and
 // document count a single broker over every shard reports, so the idf the aggregator pushes
@@ -647,7 +749,7 @@ func TestServeAdmissionCCrawl(t *testing.T) {
 
 	const capacity = 4
 	adm := search.NewAdmission(capacity)
-	srv := &httpServer{broker: broker, pipeline: pl, timeout: 0, admission: adm}
+	srv := &httpServer{backend: broker, pipeline: pl, timeout: 0, admission: adm}
 	ts := httptest.NewServer(http.HandlerFunc(srv.search))
 	defer ts.Close()
 
