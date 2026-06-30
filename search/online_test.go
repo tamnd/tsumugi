@@ -49,6 +49,30 @@ func buildForward(t testing.TB, docs []textDoc) *forward.Region {
 	return r
 }
 
+// buildForwardDict builds a forward region the way the collection build does, with
+// the body under the shared-dictionary zstd codec, so a read decodes a frame the
+// same way serving does. The caller closes the returned region.
+func buildForwardDict(t testing.TB, docs []textDoc) *forward.Region {
+	t.Helper()
+	cols := []forward.Column{
+		{Name: "url", Type: forward.ColString, Codec: forward.CodecZstdDict},
+		{Name: "title", Type: forward.ColString, Codec: forward.CodecZstdDict},
+		{Name: "body", Type: forward.ColString, Codec: forward.CodecZstdDict, Flags: forward.FlagBlob},
+	}
+	fb := forward.NewBuilder(cols)
+	for i, d := range docs {
+		id := uint32(i)
+		fb.Set(id, "url", []byte(d.url))
+		fb.Set(id, "title", []byte(d.title))
+		fb.Set(id, "body", []byte(d.body))
+	}
+	r, err := forward.Open(fb.Build())
+	if err != nil {
+		t.Fatalf("open forward: %v", err)
+	}
+	return r
+}
+
 // extract builds an extractor over the docs and returns the online feature vector of
 // one document, the shape every mechanism test reads.
 func extract(t testing.TB, q Query, docs []textDoc, idf map[string]float64, avgBody float64, id uint32) []float64 {
@@ -454,6 +478,35 @@ func BenchmarkOnlineExtract(b *testing.B) {
 		b.Skipf("too few real docs: %d", len(docs))
 	}
 	fwd := buildForward(b, docs)
+	q := Query{Text: docs[0].title}
+	idf := map[string]float64{}
+	for _, t := range lexical.Analyze(q.Text) {
+		idf[t] = 1.0
+	}
+	e := newOnlineExtractor(q, fwd, nil, idf, [3]float64{fBody: 200})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = e.features(uint32(i % len(docs)))
+	}
+}
+
+// BenchmarkOnlineExtractDict measures the online scan over a forward region whose
+// body is stored under the production CodecZstdDict codec, so the per-survivor cost
+// includes the body decode the serving path actually pays. BenchmarkOnlineExtract
+// above stores the body raw (CodecNone) and so aliases the region without a decode,
+// which hides the decompression the L2 stage is dominated by; this benchmark is the
+// one that reflects production and the one the decode-buffer reuse moves.
+func BenchmarkOnlineExtractDict(b *testing.B) {
+	if _, err := os.Stat(ccrawlParquet); err != nil {
+		b.Skipf("ccrawl sample not present: %v", err)
+	}
+	docs := readRealDocs(b, 600)
+	if len(docs) < 50 {
+		b.Skipf("too few real docs: %d", len(docs))
+	}
+	fwd := buildForwardDict(b, docs)
+	defer fwd.Close()
 	q := Query{Text: docs[0].title}
 	idf := map[string]float64{}
 	for _, t := range lexical.Analyze(q.Text) {

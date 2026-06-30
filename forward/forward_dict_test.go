@@ -83,6 +83,79 @@ func TestCodecZstdNoDict(t *testing.T) {
 	}
 }
 
+// TestColumnIntoMatchesColumn checks the buffer-reusing read returns exactly what
+// Column returns, for every codec and an unset cell, when called with a nil buffer,
+// a reused buffer, and an oversized buffer. This is the L2 path's read, so any drift
+// from Column would feed the ranker different feature text than a display read shows.
+func TestColumnIntoMatchesColumn(t *testing.T) {
+	bodies := [][]byte{
+		[]byte("the quick brown fox jumps over the lazy dog, repeated repeated repeated content"),
+		nil, // unset cell
+		[]byte("a different body of comparable length, with its own repeated repeated repeated tail"),
+		[]byte(""), // explicitly empty
+	}
+	for _, cod := range []uint8{CodecNone, CodecZstd, CodecZstdDict} {
+		b := NewBuilder([]Column{{Name: "body", Type: ColString, Codec: cod}})
+		for i, v := range bodies {
+			if v != nil {
+				b.Set(uint32(i), "body", v)
+			}
+		}
+		r, err := Open(b.Build())
+		if err != nil {
+			t.Fatalf("codec %d: open: %v", cod, err)
+		}
+		var scratch []byte
+		for i := range bodies {
+			want, wok := r.Column("body", uint32(i))
+			// nil scratch, then the carried scratch, both must match Column.
+			got, keep, gok := r.ColumnInto("body", uint32(i), scratch)
+			if gok != wok || string(got) != string(want) {
+				t.Fatalf("codec %d doc %d: ColumnInto %q/%v != Column %q/%v", cod, i, got, gok, want, wok)
+			}
+			scratch = keep
+		}
+		// An unknown column and an out-of-range docID fail the same way as Column.
+		if _, _, ok := r.ColumnInto("nope", 0, scratch); ok {
+			t.Fatalf("codec %d: ColumnInto on unknown column reported ok", cod)
+		}
+		if _, _, ok := r.ColumnInto("body", uint32(len(bodies)), scratch); ok {
+			t.Fatalf("codec %d: ColumnInto past the last doc reported ok", cod)
+		}
+		r.Close()
+	}
+}
+
+// TestColumnIntoReuseDoesNotCorrupt reads many compressed values through one reused
+// buffer and checks each read is correct at the moment it is read, the contract the
+// L2 scan relies on: the returned slice is valid until the next reuse, and reuse
+// never bleeds a previous value into a shorter one.
+func TestColumnIntoReuseDoesNotCorrupt(t *testing.T) {
+	vals := [][]byte{
+		[]byte("a long value padded out so its decode buffer grows wide, repeated repeated repeated repeated"),
+		[]byte("short one"),
+		[]byte("medium length value, repeated repeated"),
+		[]byte("x"),
+	}
+	b := NewBuilder([]Column{{Name: "body", Type: ColString, Codec: CodecZstdDict}})
+	for i, v := range vals {
+		b.Set(uint32(i), "body", v)
+	}
+	r, err := Open(b.Build())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer r.Close()
+	var scratch []byte
+	for i, v := range vals {
+		got, keep, ok := r.ColumnInto("body", uint32(i), scratch)
+		if !ok || string(got) != string(v) {
+			t.Fatalf("doc %d through reused buffer: got %q want %q", i, got, v)
+		}
+		scratch = keep // carry the grown buffer, including after the widest value
+	}
+}
+
 // TestCloseIdempotent checks Close is safe to call twice and on a region with no
 // compressed columns.
 func TestCloseIdempotent(t *testing.T) {
