@@ -536,20 +536,7 @@ func (b *Broker) SearchDegraded(ctx context.Context, q Query, level DegradeLevel
 	if q.AvgFieldLen != nil {
 		avgField = *q.AvgFieldLen
 	}
-	exts := make([]*onlineExtractor, len(st.shards))
 	l1feat := func(id uint32) []float64 { return feats[id] }
-	l2feat := func(id uint32) []float64 {
-		base := feats[id]
-		si, ok := owner[id]
-		if !ok {
-			return base
-		}
-		s := st.shards[si]
-		if exts[si] == nil {
-			exts[si] = s.newOnline(q, q.TermIDF, avgField)
-		}
-		return s.l2Row(base, exts[si], id-s.nodeBase)
-	}
 	// Lever 4: trim the broker L2 candidate count. The cascade is read-only and shared
 	// across concurrent queries, so the trim is a per-query shallow copy that shrinks the
 	// L1 cut while sharing the immutable L1 and L2 models, never mutating the broker's
@@ -560,12 +547,100 @@ func (b *Broker) SearchDegraded(ctx context.Context, q Query, level DegradeLevel
 		v.L1Keep = d.l1Keep
 		casc = &v
 	}
-	cands := casc.Rank(localIDs(allLex), localIDs(allDense), l1feat, l2feat, q.K)
+	// The cascade is split at the L2 boundary so the broker can extract the survivors'
+	// online feature rows in parallel between the L1 cut and the model scoring. The
+	// per-stage breakdown found this extraction (a zstd body decode and a field scan per
+	// survivor) is the dominant cost of the cascade, and the ~L1Keep survivors decode
+	// independently, so fanning the extraction across workers divides its wall time by
+	// the core count while the cheap serial scoring pass is unchanged.
+	survivors := casc.Survivors(localIDs(allLex), localIDs(allDense), l1feat)
+	rows := b.extractRows(survivors, feats, owner, st, q, avgField)
+	cands := casc.ScoreRows(survivors, rows, q.K)
 	hits := make([]Hit, len(cands))
 	for i, c := range cands {
 		hits[i] = Hit{DocID: c.DocID, Score: c.Score}
 	}
 	return Results{Hits: hits, ShardsTotal: len(targets), ShardsOK: ok, Degraded: level}
+}
+
+// extractRows builds the full L2 feature row for each survivor, the matrix row
+// gathered from its owning shard followed by the online query-dependent features
+// extracted from that shard's text, returning rows aligned with survivors. It is the
+// parallel half of the broker rerank: the survivors decode independently, so the
+// extraction fans across workers, each writing a disjoint slice of rows so the result
+// is identical to a serial pass regardless of scheduling.
+//
+// The online extractor holds per-query scratch it reuses across the survivors it
+// scores and is documented to serve one query on one goroutine, so each worker builds
+// its own extractor per shard it touches rather than sharing one across goroutines.
+// The feature row an extractor produces depends only on the query, the shard's
+// regions, and the document, never on which survivors it scored before, so a
+// per-worker extractor yields the same row a single shared one would, which is what
+// makes the parallel extraction byte-for-byte equal to the serial l2feat it replaces.
+// A survivor whose owner is unknown (no shard claimed it, the matrix-only fallback)
+// takes its gathered matrix row unchanged, exactly as the serial path returned base.
+func (b *Broker) extractRows(survivors []rank.Candidate, feats map[uint32][]float64, owner map[uint32]int, st *brokerState, q Query, avgField [3]float64) [][]float64 {
+	rows := make([][]float64, len(survivors))
+	if len(survivors) == 0 {
+		return rows
+	}
+	extractOne := func(exts map[int]*onlineExtractor, id uint32) []float64 {
+		base := feats[id]
+		si, ok := owner[id]
+		if !ok {
+			return base
+		}
+		s := st.shards[si]
+		ext := exts[si]
+		if ext == nil {
+			ext = s.newOnline(q, q.TermIDF, avgField)
+			exts[si] = ext
+		}
+		return s.l2Row(base, ext, id-s.nodeBase)
+	}
+
+	workers := b.maxConcurrency
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(survivors) {
+		workers = len(survivors)
+	}
+	// A single worker is the serial path, which avoids the goroutine and channel cost
+	// for the small survivor sets a selective query leaves.
+	if workers == 1 {
+		exts := make(map[int]*onlineExtractor)
+		for i, cd := range survivors {
+			rows[i] = extractOne(exts, cd.DocID)
+		}
+		return rows
+	}
+
+	// Partition the survivors into contiguous chunks, one per worker, so each worker
+	// writes a disjoint range of rows and no two goroutines touch the same index. The
+	// last chunk takes the remainder.
+	var wg sync.WaitGroup
+	chunk := (len(survivors) + workers - 1) / workers
+	for w := 0; w < workers; w++ {
+		lo := w * chunk
+		if lo >= len(survivors) {
+			break
+		}
+		hi := lo + chunk
+		if hi > len(survivors) {
+			hi = len(survivors)
+		}
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			exts := make(map[int]*onlineExtractor)
+			for i := lo; i < hi; i++ {
+				rows[i] = extractOne(exts, survivors[i].DocID)
+			}
+		}(lo, hi)
+	}
+	wg.Wait()
+	return rows
 }
 
 // fanOut runs the routed shards' retrievals concurrently, bounded by the broker's

@@ -53,10 +53,14 @@ func BenchmarkCascadeRerank(b *testing.B) {
 	}
 	feat := func(id uint32) []float64 { return rows[id] }
 	c := NewCascade(&Linear{Cols: []int{0}, Weights: []float64{1}, RetrievalWeight: 1}, m)
+	rerankRows := make([][]float64, len(cands))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = c.rerank(cands, feat, nDocs)
+		for j, cd := range cands {
+			rerankRows[j] = feat(cd.DocID)
+		}
+		_ = c.ScoreRows(cands, rerankRows, nDocs)
 	}
 }
 

@@ -93,26 +93,44 @@ func NewCascade(l1 *Linear, l2 *Model) *Cascade {
 // for, never the L0Max candidates l1feat scans. Passing the same func for both is
 // the matrix-only path, the behavior before online features existed.
 func (c *Cascade) Rank(lexical, dense []uint32, l1feat, l2feat FeatureFunc, k int) []Candidate {
+	survivors := c.Survivors(lexical, dense, l1feat)
+	rows := make([][]float64, len(survivors))
+	for i, cd := range survivors {
+		rows[i] = l2feat(cd.DocID)
+	}
+	return c.ScoreRows(survivors, rows, k)
+}
+
+// Survivors runs the cascade up to the L2 boundary: it fuses the lexical and dense
+// plane rankings, caps the fused set to L0Max, and cuts it to L1Keep with the linear
+// score, returning the survivor set the L2 model reranks. It is the half of Rank
+// before the expensive per-survivor L2 work, split out so a caller that extracts the
+// survivors' L2 feature rows in parallel can do so between the cut and the score (the
+// broker's parallel rerank). The survivor order is the L1 cut's, the alignment
+// ScoreRows expects its rows in.
+func (c *Cascade) Survivors(lexical, dense []uint32, l1feat FeatureFunc) []Candidate {
 	fused := RRF(c.K, lexical, dense)
 	if len(fused) > c.L0Max {
 		fused = fused[:c.L0Max]
 	}
-	kept := c.L1.Cut(fused, l1feat, c.L1Keep)
-	return c.rerank(kept, l2feat, k)
+	return c.L1.Cut(fused, l1feat, c.L1Keep)
 }
 
-// rerank scores each survivor with the L2 model and returns the top-k by the
-// ordinal score, ties to the smaller docID. It borrows one leaf bitvector from the
-// model's pool and reuses it across every survivor, returning it when the rerank is
-// done, so a query's whole rerank allocates no per-document scratch (doc 11, the
+// ScoreRows reranks the survivors whose L2 feature rows are already materialized,
+// rows[i] the feature vector of survivors[i], and returns the top-k by the model's
+// ordinal score, ties to the smaller docID. It is the half of Rank after the L2
+// feature extraction, split out so the extraction can run in parallel before it while
+// the scoring stays the serial pass it already was. It borrows one leaf bitvector
+// from the model's pool and reuses it across every survivor, returning it when the
+// rerank is done, so the scoring allocates no per-document scratch (doc 11, the
 // cascade's pooled buffers held for the query's lifetime).
-func (c *Cascade) rerank(cands []Candidate, feat FeatureFunc, k int) []Candidate {
-	scored := make([]Candidate, len(cands))
+func (c *Cascade) ScoreRows(survivors []Candidate, rows [][]float64, k int) []Candidate {
+	scored := make([]Candidate, len(survivors))
 	p := c.L2.leafScratch()
 	defer c.L2.putLeafScratch(p)
 	v := *p
-	for i, cd := range cands {
-		scored[i] = Candidate{DocID: cd.DocID, Score: c.L2.scoreInto(feat(cd.DocID), v)}
+	for i, cd := range survivors {
+		scored[i] = Candidate{DocID: cd.DocID, Score: c.L2.scoreInto(rows[i], v)}
 	}
 	sort.Slice(scored, func(i, j int) bool {
 		if scored[i].Score != scored[j].Score {
