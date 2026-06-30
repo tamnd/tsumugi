@@ -101,6 +101,28 @@ func buildGraph(docs []convert.Document, dir *mph.Dir) *graph.Region {
 // bytes graph.Open parses here, so the persisted artifact and the in-core region
 // are one graph in two forms.
 func buildGraphRegion(docs []convert.Document, dir *mph.Dir) (*graph.Region, []byte) {
+	region := buildGraphRegionBytes(docs, dir)
+	g, err := graph.Open(region)
+	if err != nil {
+		// The builder always produces a region graph.Open accepts; a failure here is
+		// a programming error in the graph package, not a data condition the build
+		// can recover from.
+		panic(err)
+	}
+	return g, region
+}
+
+// buildGraphRegionBytes builds and encodes the collection-wide graph out of core,
+// returning only the region bytes, the form the build persists as the cross-shard
+// graph artifact. It is buildGraphRegion without the in-core graph.Open: the M15
+// reorder computes the link signals off the per-shard graph regions, so the build no
+// longer opens the merged graph resident to rank over it; it only needs the encoded
+// bytes for the artifact, which the out-of-core StreamPageRank later streams from disk
+// one in-list at a time. The OOC builder streams the edges to sorted run files and
+// encodes both planes from a merge, never materializing the full forward and transpose
+// adjacency, which at two billion nodes would not fit; below the spill threshold it
+// stays entirely in RAM.
+func buildGraphRegionBytes(docs []convert.Document, dir *mph.Dir) []byte {
 	gb := graph.NewOOCBuilder(len(docs))
 	for i, d := range docs {
 		for _, tgt := range analyze.Links(d) {
@@ -115,14 +137,7 @@ func buildGraphRegion(docs []convert.Document, dir *mph.Dir) (*graph.Region, []b
 		// in-RAM path cannot fail. The build cannot proceed without its graph.
 		panic(err)
 	}
-	g, err := graph.Open(region)
-	if err != nil {
-		// The builder always produces a region graph.Open accepts; a failure here is
-		// a programming error in the graph package, not a data condition the build
-		// can recover from.
-		panic(err)
-	}
-	return g, region
+	return region
 }
 
 // groupings maps each document to a dense host id and a dense domain id, the
