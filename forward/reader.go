@@ -123,13 +123,51 @@ func (r *Region) Column(name string, docID uint32) ([]byte, bool) {
 	return r.colAt(ci, docID), true
 }
 
-// colAt slices a value from a column data block by docID, reading the two
-// bracketing offsets from the block's offset index. A CodecNone value aliases the
-// region; a compressed value is one zstd frame decoded into a fresh slice. An
-// empty value (start == end) reads back empty without a decode, so an unset cell
-// costs nothing. A frame that fails to decode, which the container CRC over the
-// region should already have caught, reads back empty rather than panicking.
+// ColumnInto is Column with a caller-supplied scratch buffer the decode reuses, so
+// a caller reading one column across many documents holds a single decode buffer
+// instead of allocating a fresh value per call. This is the L2 rerank path: an
+// extractor reads the body of every survivor of a query, and reusing the buffer
+// turns hundreds of per-survivor body allocations into one.
+//
+// It returns the value, the buffer to keep for the next call, and the Column bool.
+// The usage is to keep that second return as the scratch for the next read:
+//
+//	val, scratch, ok = r.ColumnInto(col, doc, scratch)
+//
+// The kept buffer is always caller-owned, never a region alias: a decoded value
+// decodes into the (possibly grown) scratch and the kept buffer is that scratch, so
+// reuse carries the capacity forward; a raw or empty value aliases the region and
+// the kept buffer is the unchanged scratch, so the caller never retains a region
+// alias and then decodes into it, which would write into the read-only region. The
+// returned value is valid only until the next call that reuses the same scratch.
+func (r *Region) ColumnInto(name string, docID uint32, scratch []byte) (value, keep []byte, ok bool) {
+	ci, ok := r.colIdx[name]
+	if !ok || docID >= r.rows {
+		return nil, scratch, false
+	}
+	value, keep = r.colAtInto(ci, docID, scratch)
+	return value, keep, true
+}
+
+// colAt slices a value from a column data block by docID. It decodes into a fresh
+// slice; colAtInto is the buffer-reusing form the L2 path calls.
 func (r *Region) colAt(ci int, docID uint32) []byte {
+	v, _ := r.colAtInto(ci, docID, nil)
+	return v
+}
+
+// colAtInto slices a value from a column data block by docID, reading the two
+// bracketing offsets from the block's offset index, decoding a compressed value
+// into scratch[:0]. It returns the value and the buffer the caller should keep as
+// scratch for the next call. A compressed value decodes into scratch, which grows
+// as needed, and the kept buffer is that grown buffer so reuse carries the capacity
+// forward. A CodecNone value, and an empty value of any codec (start == end), alias
+// the region without a decode; the kept buffer is then the unchanged scratch, never
+// the region alias, so a caller that keeps it and decodes into it next time never
+// writes into the read-only region. A frame that fails to decode, which the
+// container CRC over the region should already have caught, reads back empty rather
+// than panicking.
+func (r *Region) colAtInto(ci int, docID uint32, scratch []byte) (value, keep []byte) {
 	c := r.cols[ci]
 	block := r.b[c.dataOff : c.dataOff+c.dataLen]
 	start := codec.Uint32(block[int(docID)*4:])
@@ -137,13 +175,13 @@ func (r *Region) colAt(ci int, docID uint32) []byte {
 	base := (int(r.rows) + 1) * 4
 	frame := block[base+int(start) : base+int(end)]
 	if c.Codec == CodecNone || len(frame) == 0 {
-		return frame
+		return frame, scratch
 	}
-	out, err := r.dec.DecodeAll(frame, nil)
+	out, err := r.dec.DecodeAll(frame, scratch[:0])
 	if err != nil {
-		return nil
+		return nil, scratch
 	}
-	return out
+	return out, out
 }
 
 // Row returns every column value for one document, keyed by column name. It is
