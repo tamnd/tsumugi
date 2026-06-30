@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -35,6 +36,7 @@ func newServeCmd() *cobra.Command {
 		maxInFlight    int
 		reloadInterval time.Duration
 		peers          []string
+		hedgeDelay     time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -48,7 +50,7 @@ func newServeCmd() *cobra.Command {
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if len(peers) > 0 {
-				return runHead(cmd, peers, addr, timeout, cacheSize, maxInFlight)
+				return runHead(cmd, peers, addr, timeout, cacheSize, maxInFlight, hedgeDelay)
 			}
 			return runLeaf(cmd, dir, modelP, addr, timeout, cacheSize, maxInFlight, reloadInterval)
 		},
@@ -60,7 +62,8 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().IntVar(&cacheSize, "cache", 0, "result cache capacity in entries (0 disables the cache)")
 	cmd.Flags().IntVar(&maxInFlight, "max-inflight", 0, "maximum concurrent in-flight searches (0 disables admission control)")
 	cmd.Flags().DurationVar(&reloadInterval, "reload-interval", 0, "poll the shard directory at this interval to publish and retire shards (0 disables polling)")
-	cmd.Flags().StringArrayVar(&peers, "peer", nil, "base URL of a leaf node to serve through (repeatable); when set, this process runs as a head node over its peers instead of opening local shards")
+	cmd.Flags().StringArrayVar(&peers, "peer", nil, "base URL of a leaf node to serve through (repeatable); when set, this process runs as a head node over its peers instead of opening local shards. A comma-separated list of URLs names a set of equivalent replicas of one leaf that the head hedges across for tail latency")
+	cmd.Flags().DurationVar(&hedgeDelay, "hedge-delay", 5*time.Millisecond, "how long to wait for a replica before sending the query to the next one too (only applies to a --peer group that lists multiple replicas)")
 	return cmd
 }
 
@@ -130,17 +133,42 @@ func runLeaf(cmd *cobra.Command, dir, modelP, addr string, timeout time.Duration
 // builds its corrector from the peers' vocabularies and its dense encoder from their agreed
 // dimension, both pulled over the wire. It also re-exposes the aggregator over /rpc/ so a head
 // can sit beneath another head, nesting the tree to any depth (doc 11, "The serving topology").
-func runHead(cmd *cobra.Command, peers []string, addr string, timeout time.Duration, cacheSize, maxInFlight int) error {
+//
+// A --peer value that lists several comma-separated URLs names a set of equivalent replicas of
+// one leaf: the head dials all of them, makes them one child through a HedgedSearcher, and so
+// hides any single replica's tail latency behind a faster sibling, while the pipeline is built
+// from the first replica of each group since the replicas are equivalent and share a vocabulary.
+func runHead(cmd *cobra.Command, peers []string, addr string, timeout time.Duration, cacheSize, maxInFlight int, hedgeDelay time.Duration) error {
 	ctx := cmd.Context()
 	remotes := make([]*search.RemoteSearcher, 0, len(peers))
 	children := make([]search.Searcher, 0, len(peers))
 	for _, p := range peers {
-		rs, err := search.NewRemoteSearcher(ctx, p)
-		if err != nil {
-			return fmt.Errorf("dial peer %s: %w", p, err)
+		urls := splitReplicas(p)
+		if len(urls) == 0 {
+			return fmt.Errorf("empty --peer value")
 		}
-		remotes = append(remotes, rs)
-		children = append(children, rs)
+		reps := make([]search.Searcher, 0, len(urls))
+		var first *search.RemoteSearcher
+		for _, u := range urls {
+			rs, err := search.NewRemoteSearcher(ctx, u)
+			if err != nil {
+				return fmt.Errorf("dial peer %s: %w", u, err)
+			}
+			reps = append(reps, rs)
+			if first == nil {
+				first = rs
+			}
+		}
+		// The pipeline reads one vocabulary per leaf, and the replicas of a leaf share it, so feed
+		// the corrector from the first replica of each group.
+		remotes = append(remotes, first)
+		if len(reps) == 1 {
+			// One replica is nothing to hedge across, so wire the plain RemoteSearcher and pay none
+			// of the hedging machinery, the single-replica leaf unchanged from before.
+			children = append(children, reps[0])
+		} else {
+			children = append(children, search.NewHedgedSearcher(reps, hedgeDelay))
+		}
 	}
 	agg := search.NewAggregator(children)
 
@@ -171,6 +199,19 @@ func runHead(cmd *cobra.Command, peers []string, addr string, timeout time.Durat
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "serving %d peers (%d shards, %d docs) on %s\n",
 		len(peers), backend.NumShards(), backend.Stats().DocCount, addr)
 	return serveHTTP(cmd.Context(), addr, mux, adm, timeout)
+}
+
+// splitReplicas splits one --peer value into its replica URLs on commas, trimming spaces and
+// dropping empty entries, so "a, b ,c" names three replicas of one leaf and a bare "a" names one.
+func splitReplicas(peer string) []string {
+	parts := strings.Split(peer, ",")
+	urls := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if u := strings.TrimSpace(p); u != "" {
+			urls = append(urls, u)
+		}
+	}
+	return urls
 }
 
 // serveHTTP runs the broker's HTTP server until the context is cancelled, then drains the
