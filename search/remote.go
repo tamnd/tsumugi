@@ -100,12 +100,29 @@ func NewSearcherHandler(s Searcher) http.Handler {
 		if !postOnly(w, r) {
 			return
 		}
-		var q Query
-		if err := json.NewDecoder(r.Body).Decode(&q); err != nil {
+		// The query and the result are the per-query hot-path messages, so they ride whichever
+		// wire codec the client chose: the request's Content-Type picks the codec the handler
+		// decodes the query with and answers the result in, so a binary client gets a binary
+		// answer and a JSON client gets JSON, both off one handler. An unknown or missing type
+		// falls back to JSON, the default wire (wire.go).
+		codec := codecForContentType(r.Header.Get("Content-Type"))
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read query: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		q, err := codec.decodeQuery(body)
+		if err != nil {
 			http.Error(w, "decode query: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		writeRemoteJSON(w, s.SearchComplete(r.Context(), q))
+		out, err := codec.encodeResults(s.SearchComplete(r.Context(), q))
+		if err != nil {
+			http.Error(w, "encode results: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", codec.contentType())
+		_, _ = w.Write(out)
 	})
 	mux.HandleFunc("/docfreqs", func(w http.ResponseWriter, r *http.Request) {
 		if !postOnly(w, r) {
@@ -164,6 +181,13 @@ type RemoteSearcher struct {
 	client  *http.Client
 	baseURL string
 
+	// codec is the wire codec the per-query /search call encodes the query with and decodes the
+	// result with. It defaults to the JSON codec, so a RemoteSearcher built with no codec option
+	// speaks the wire remote.go always spoke; WithBinaryWire swaps it for the dense binary codec.
+	// The metadata, document-frequency, and vocabulary calls stay JSON regardless, since they run
+	// off the per-query path where the density does not pay (wire.go).
+	codec wireCodec
+
 	// meta is the snapshot the static methods answer from, set at construction and replaced by
 	// Refresh. It is read without a lock because it is fetched before the searcher is handed to
 	// an aggregator and refreshed only by the owner between query waves, not concurrently with
@@ -185,6 +209,17 @@ func WithHTTPClient(c *http.Client) RemoteOption {
 	}
 }
 
+// WithBinaryWire switches the RemoteSearcher's per-query /search call to the dense binary wire
+// codec instead of the default JSON: the query goes out and the result comes back in the compact
+// binary form (wire.go), which writes a dense vector and the top-k scores as their raw bytes
+// rather than as decimal text. The handler reads the request's content type and answers in the
+// same codec, so a binary RemoteSearcher and a JSON one can both dial one handler. A deployment
+// turns this on at both ends of a hop it controls; the off-hot-path metadata and vocabulary
+// calls stay JSON either way.
+func WithBinaryWire() RemoteOption {
+	return func(rs *RemoteSearcher) { rs.codec = binaryCodec{} }
+}
+
 // NewRemoteSearcher dials a peer exposed by NewSearcherHandler and returns a Searcher that
 // forwards to it. It fetches the peer's metadata once here so NumShards, NumDocs, and Stats
 // answer locally, and it fails construction if the peer is unreachable so a tree is not built
@@ -192,7 +227,7 @@ func WithHTTPClient(c *http.Client) RemoteOption {
 // is handled at query time by SearchComplete reporting its whole subtree missed. The context
 // bounds only the metadata fetch, not the searcher's lifetime.
 func NewRemoteSearcher(ctx context.Context, baseURL string, opts ...RemoteOption) (*RemoteSearcher, error) {
-	rs := &RemoteSearcher{client: http.DefaultClient, baseURL: strings.TrimRight(baseURL, "/")}
+	rs := &RemoteSearcher{client: http.DefaultClient, baseURL: strings.TrimRight(baseURL, "/"), codec: jsonCodec{}}
 	for _, o := range opts {
 		o(rs)
 	}
@@ -286,8 +321,21 @@ func (rs *RemoteSearcher) DocFreqs(ctx context.Context, terms []string) map[stri
 // This is the cross-machine form of the broker's own deadline drop, the honest upper bound on
 // what was missed (doc 11, "Failure modes and partial results", composed across hosts).
 func (rs *RemoteSearcher) SearchComplete(ctx context.Context, q Query) Results {
-	var res Results
-	if err := rs.postJSON(ctx, "/search", q, &res); err != nil {
+	body, err := rs.codec.encodeQuery(q)
+	if err != nil {
+		return Results{ShardsTotal: rs.meta.NumShards}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rs.baseURL+"/search", bytes.NewReader(body))
+	if err != nil {
+		return Results{ShardsTotal: rs.meta.NumShards}
+	}
+	req.Header.Set("Content-Type", rs.codec.contentType())
+	respBody, err := rs.doRaw(req)
+	if err != nil {
+		return Results{ShardsTotal: rs.meta.NumShards}
+	}
+	res, err := rs.codec.decodeResults(respBody)
+	if err != nil {
 		return Results{ShardsTotal: rs.meta.NumShards}
 	}
 	return res
@@ -312,6 +360,23 @@ func (rs *RemoteSearcher) postJSON(ctx context.Context, path string, body, out a
 	}
 	req.Header.Set("Content-Type", "application/json")
 	return rs.do(req, out)
+}
+
+// doRaw runs a request and returns the whole response body, the codec-agnostic path the
+// per-query /search call takes: the body may be JSON or the dense binary form, so the caller
+// hands it to the wire codec rather than to a JSON decoder. A non-200 is an error carrying the
+// status and a bounded snippet of the body, the same shape do reports.
+func (rs *RemoteSearcher) doRaw(req *http.Request) ([]byte, error) {
+	resp, err := rs.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("%s: %s: %s", req.URL.Path, resp.Status, bytes.TrimSpace(body))
+	}
+	return io.ReadAll(resp.Body)
 }
 
 func (rs *RemoteSearcher) do(req *http.Request, out any) error {

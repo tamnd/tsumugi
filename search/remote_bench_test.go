@@ -38,6 +38,87 @@ func BenchmarkRemoteSearch(b *testing.B) {
 	}
 }
 
+// BenchmarkRemoteSearchBinary is BenchmarkRemoteSearch over the dense binary wire: the same
+// loopback round trip, but the query and the result ride the compact binary codec instead of
+// JSON, so the pair brackets the per-hop cost of each wire. The binary form moves fewer bytes and
+// skips the decimal-text float formatting, so this is where the codec's size win shows up as time.
+func BenchmarkRemoteSearchBinary(b *testing.B) {
+	const n, parts = 2000, 4
+	docs := remoteRankCorpus(n)
+	dir := b.TempDir()
+	model := trainModel(b)
+	broker, shards := buildBrokerFromDocs(b, dir, "s", docs, parts, model)
+	defer func() {
+		for _, sh := range shards {
+			_ = sh.Close()
+		}
+	}()
+	srv := httptest.NewServer(NewSearcherHandler(broker))
+	defer srv.Close()
+	rs, err := NewRemoteSearcher(context.Background(), srv.URL, WithBinaryWire())
+	if err != nil {
+		b.Fatalf("dial remote: %v", err)
+	}
+	q := Query{Terms: []string{"common"}, K: 10}
+	ctx := context.Background()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if res := rs.SearchComplete(ctx, q); len(res.Hits) == 0 {
+			b.Fatal("no hits")
+		}
+	}
+}
+
+// BenchmarkWireCodec measures the encode-plus-decode cost of each codec on the two hot-path
+// messages off the wire, isolating the serialization from the transport: a query with a dense
+// vector and a deep top-k result, the shapes where the codecs differ most. The binary codec
+// writes raw bytes where JSON formats and parses decimal text, so this is the per-query CPU the
+// codec choice trades alongside the bytes on the wire.
+func BenchmarkWireCodec(b *testing.B) {
+	vec := make([]float32, 256)
+	for i := range vec {
+		vec[i] = float32(i)*0.013 - 1.7
+	}
+	q := Query{Terms: []string{"alpha", "beta", "gamma"}, Vector: vec, K: 100}
+	hits := make([]Hit, 1000)
+	for i := range hits {
+		hits[i] = Hit{DocID: uint32(1_000_000 + i), Score: 12.3456789 - float64(i)*0.001}
+	}
+	res := Results{Hits: hits, ShardsTotal: 100, ShardsOK: 100}
+
+	codecs := []struct {
+		name string
+		c    wireCodec
+	}{
+		{"json", jsonCodec{}},
+		{"binary", binaryCodec{}},
+	}
+	for _, tc := range codecs {
+		b.Run(tc.name+"/query", func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				buf, err := tc.c.encodeQuery(q)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if _, err := tc.c.decodeQuery(buf); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+		b.Run(tc.name+"/results", func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				buf, err := tc.c.encodeResults(res)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if _, err := tc.c.decodeResults(buf); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 // BenchmarkAggregatorOverRemotes measures a full distributed query: an aggregator gathering
 // df across two remote brokers, pushing the shared idf and field averages down, fanning the
 // search out over the wire, and merging. It is the wall-clock a head node spends per query

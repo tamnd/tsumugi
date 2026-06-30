@@ -81,65 +81,77 @@ func TestAggregatorOverRemotesCCrawl(t *testing.T) {
 	defer srv0.Close()
 	defer srv1.Close()
 	ctx := context.Background()
-	rs0, err := search.NewRemoteSearcher(ctx, srv0.URL+"/rpc")
-	if err != nil {
-		t.Fatalf("dial b0: %v", err)
-	}
-	rs1, err := search.NewRemoteSearcher(ctx, srv1.URL+"/rpc")
-	if err != nil {
-		t.Fatalf("dial b1: %v", err)
-	}
-	agg := search.NewAggregator([]search.Searcher{rs0, rs1})
-
-	// The fold over the remote children's stats lands on the monolith's fleet average, the
-	// length-normalization denominator the aggregator pushes back down across the wire.
-	if math.Abs(agg.Stats().AvgFieldLen[1]-mono.Stats().AvgFieldLen[1]) > 1e-6 {
-		t.Fatalf("folded fleet body avg %v != monolith %v", agg.Stats().AvgFieldLen[1], mono.Stats().AvgFieldLen[1])
-	}
 
 	queries := []string{"data", "page", "home", "search", "news", "world", "time", "people", "free", "online"}
-	compared, nonTrivial := 0, 0
-	for _, qs := range queries {
-		pq := pl.parse(qs)
-		if pq.Empty() {
-			continue
+
+	// reproduce dials the two leaf brokers with the given wire options, fans an aggregator across
+	// them, and checks the aggregator reproduces the monolith document for document and score for
+	// score over the real queries. It runs once over the JSON wire and once over the binary wire,
+	// so the dense codec is held to the same exactness on real crawl data as the default: a codec
+	// that lost or rounded a score would fail here on the same float-tolerance gate.
+	reproduce := func(t *testing.T, label string, opts ...search.RemoteOption) {
+		rs0, err := search.NewRemoteSearcher(ctx, srv0.URL+"/rpc", opts...)
+		if err != nil {
+			t.Fatalf("dial b0: %v", err)
 		}
-		q := toQuery(pq, 20)
-		if len(q.Terms) == 0 {
-			continue
+		rs1, err := search.NewRemoteSearcher(ctx, srv1.URL+"/rpc", opts...)
+		if err != nil {
+			t.Fatalf("dial b1: %v", err)
 		}
-		want := mono.SearchComplete(ctx, q)
-		got := agg.SearchComplete(ctx, q)
-		if !got.Complete() {
-			t.Fatalf("query %q over remotes was not complete: %d/%d", qs, got.ShardsOK, got.ShardsTotal)
+		agg := search.NewAggregator([]search.Searcher{rs0, rs1})
+
+		// The fold over the remote children's stats lands on the monolith's fleet average, the
+		// length-normalization denominator the aggregator pushes back down across the wire.
+		if math.Abs(agg.Stats().AvgFieldLen[1]-mono.Stats().AvgFieldLen[1]) > 1e-6 {
+			t.Fatalf("folded fleet body avg %v != monolith %v", agg.Stats().AvgFieldLen[1], mono.Stats().AvgFieldLen[1])
 		}
-		if len(got.Hits) != len(want.Hits) {
-			t.Fatalf("query %q: remote tree returned %d hits, monolith %d", qs, len(got.Hits), len(want.Hits))
-		}
-		for i := range want.Hits {
-			if got.Hits[i].DocID != want.Hits[i].DocID {
-				t.Fatalf("query %q rank %d: remote tree doc %d, monolith doc %d", qs, i, got.Hits[i].DocID, want.Hits[i].DocID)
+
+		compared, nonTrivial := 0, 0
+		for _, qs := range queries {
+			pq := pl.parse(qs)
+			if pq.Empty() {
+				continue
 			}
-			if d := math.Abs(got.Hits[i].Score - want.Hits[i].Score); d > 1e-6 {
-				t.Fatalf("query %q rank %d doc %d: remote tree score %v, monolith %v, diff %v", qs, i, got.Hits[i].DocID, got.Hits[i].Score, want.Hits[i].Score, d)
+			q := toQuery(pq, 20)
+			if len(q.Terms) == 0 {
+				continue
+			}
+			want := mono.SearchComplete(ctx, q)
+			got := agg.SearchComplete(ctx, q)
+			if !got.Complete() {
+				t.Fatalf("query %q over remotes was not complete: %d/%d", qs, got.ShardsOK, got.ShardsTotal)
+			}
+			if len(got.Hits) != len(want.Hits) {
+				t.Fatalf("query %q: remote tree returned %d hits, monolith %d", qs, len(got.Hits), len(want.Hits))
+			}
+			for i := range want.Hits {
+				if got.Hits[i].DocID != want.Hits[i].DocID {
+					t.Fatalf("query %q rank %d: remote tree doc %d, monolith doc %d", qs, i, got.Hits[i].DocID, want.Hits[i].DocID)
+				}
+				if d := math.Abs(got.Hits[i].Score - want.Hits[i].Score); d > 1e-6 {
+					t.Fatalf("query %q rank %d doc %d: remote tree score %v, monolith %v, diff %v", qs, i, got.Hits[i].DocID, got.Hits[i].Score, want.Hits[i].Score, d)
+				}
+			}
+			if len(want.Hits) > 0 {
+				compared++
+			}
+			for i := 1; i < len(want.Hits); i++ {
+				if want.Hits[i].Score != want.Hits[0].Score {
+					nonTrivial++
+					break
+				}
 			}
 		}
-		if len(want.Hits) > 0 {
-			compared++
+		if compared == 0 {
+			t.Fatalf("no real query returned hits over %d docs; nothing was compared", res.Docs)
 		}
-		for i := 1; i < len(want.Hits); i++ {
-			if want.Hits[i].Score != want.Hits[0].Score {
-				nonTrivial++
-				break
-			}
+		if nonTrivial == 0 {
+			t.Fatalf("every query's top-k collapsed to one score; the reproduction is vacuous")
 		}
+		t.Logf("%s wire: %d shards across 2 remote brokers, %d docs, %d queries reproduced the monolith exactly, %d with a non-trivial ranked top-k",
+			label, res.Shards, res.Docs, compared, nonTrivial)
 	}
-	if compared == 0 {
-		t.Fatalf("no real query returned hits over %d docs; nothing was compared", res.Docs)
-	}
-	if nonTrivial == 0 {
-		t.Fatalf("every query's top-k collapsed to one score; the reproduction is vacuous")
-	}
-	t.Logf("distributed serving over real data: %d shards across 2 remote brokers, %d docs, %d queries reproduced the monolith exactly, %d with a non-trivial ranked top-k",
-		res.Shards, res.Docs, compared, nonTrivial)
+
+	t.Run("json", func(t *testing.T) { reproduce(t, "json") })
+	t.Run("binary", func(t *testing.T) { reproduce(t, "binary", search.WithBinaryWire()) })
 }

@@ -60,11 +60,11 @@ func remoteRankCorpus(n int) []doc {
 // remote tests run over: a real broker on one side, a RemoteSearcher on the other, with a
 // real HTTP round trip between them, so the test exercises the encode, the transport, and the
 // decode rather than a mock.
-func serveSearcher(t *testing.T, s Searcher) *RemoteSearcher {
+func serveSearcher(t *testing.T, s Searcher, opts ...RemoteOption) *RemoteSearcher {
 	t.Helper()
 	srv := httptest.NewServer(NewSearcherHandler(s))
 	t.Cleanup(srv.Close)
-	rs, err := NewRemoteSearcher(context.Background(), srv.URL)
+	rs, err := NewRemoteSearcher(context.Background(), srv.URL, opts...)
 	if err != nil {
 		t.Fatalf("dial remote: %v", err)
 	}
