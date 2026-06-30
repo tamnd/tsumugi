@@ -185,17 +185,28 @@ func resolveSeeds(curated []string, dir *mph.Dir) []int {
 // anti-trust vector is uniform and the filter is inert, so a fresh build with no
 // curated lists seeds purely from inverse PageRank.
 func trustSeedSet(g *graph.Region, dir *mph.Dir, curated []string, anti []float64, cfg graph.PRConfig) []int {
+	n := g.NodeCount()
+	if n == 0 {
+		return resolveSeeds(curated, dir)
+	}
+	return selectTrustSeeds(curated, dir, streamInversePageRank(g, cfg), anti, n)
+}
+
+// selectTrustSeeds is the trust-seed selection rule of trustSeedSet with the inverse
+// PageRank and node count passed in rather than computed from a resident graph, so the
+// merged build path feeds it the in-core inverse rank and the sharded path feeds it the
+// cross-shard inverse rank flattened to the same document index space. Both share one
+// rule: the curated list as the spine, extended with the top inverse-PageRank candidates,
+// dropping any whose anti-trust score is more than twice the uniform baseline.
+func selectTrustSeeds(curated []string, dir *mph.Dir, inv, anti []float64, n int) []int {
 	seeds := resolveSeeds(curated, dir)
 	seen := map[int]bool{}
 	for _, s := range seeds {
 		seen[s] = true
 	}
-
-	n := g.NodeCount()
 	if n == 0 {
 		return seeds
 	}
-	inv := streamInversePageRank(g, cfg)
 	cand := topKIndices(inv, inversePageRankCandidates)
 	drop := 2.0 / float64(n) // twice the uniform anti-trust baseline
 	for _, v := range cand {
