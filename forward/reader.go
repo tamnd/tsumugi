@@ -149,6 +149,26 @@ func (r *Region) ColumnInto(name string, docID uint32, scratch []byte) (value, k
 	return value, keep, true
 }
 
+// ColumnPrefixInto is ColumnInto for a reader that needs only a leading window of a
+// large value, the L2 body scan that reads at most a fixed rune cap. minBytes is the
+// least number of decoded bytes the caller needs (the rune cap times the max bytes a
+// rune takes, so the window always holds enough complete runes); the read decodes
+// only the blocks that window spans rather than the whole value. It applies only to a
+// CodecZstdDictBlocked column; for every other codec the window is not expressible in
+// the stored layout, so it falls back to the full ColumnInto decode and minBytes is
+// ignored, which keeps the caller uniform across codecs and across an old region whose
+// body column predates the blocked codec. The value, kept buffer, and bool follow the
+// same contract as ColumnInto: the kept buffer is always caller-owned, and the value
+// is valid only until the next call that reuses the scratch.
+func (r *Region) ColumnPrefixInto(name string, docID uint32, minBytes int, scratch []byte) (value, keep []byte, ok bool) {
+	ci, ok := r.colIdx[name]
+	if !ok || docID >= r.rows {
+		return nil, scratch, false
+	}
+	value, keep = r.colPrefixInto(ci, docID, minBytes, scratch)
+	return value, keep, true
+}
+
 // colAt slices a value from a column data block by docID. It decodes into a fresh
 // slice; colAtInto is the buffer-reusing form the L2 path calls.
 func (r *Region) colAt(ci int, docID uint32) []byte {
@@ -177,9 +197,72 @@ func (r *Region) colAtInto(ci int, docID uint32, scratch []byte) (value, keep []
 	if c.Codec == CodecNone || len(frame) == 0 {
 		return frame, scratch
 	}
+	if c.Codec == CodecZstdDictBlocked {
+		return r.decodeBlocked(frame, -1, scratch)
+	}
 	out, err := r.dec.DecodeAll(frame, scratch[:0])
 	if err != nil {
 		return nil, scratch
+	}
+	return out, out
+}
+
+// colPrefixInto decodes a leading window of a value, the windowed form of colAtInto.
+// For a CodecZstdDictBlocked column it decodes only the blocks needed to reach
+// minBytes decoded bytes (or every block, for a value shorter than the window),
+// concatenating them into scratch exactly as the full decode would, so the returned
+// prefix is byte-for-byte the start of the full value. For any other codec the window
+// is not expressible, so it returns the full value through colAtInto. A minBytes below
+// zero means decode the whole value.
+func (r *Region) colPrefixInto(ci int, docID uint32, minBytes int, scratch []byte) (value, keep []byte) {
+	c := r.cols[ci]
+	if c.Codec != CodecZstdDictBlocked {
+		return r.colAtInto(ci, docID, scratch)
+	}
+	block := r.b[c.dataOff : c.dataOff+c.dataLen]
+	start := codec.Uint32(block[int(docID)*4:])
+	end := codec.Uint32(block[int(docID+1)*4:])
+	base := (int(r.rows) + 1) * 4
+	frame := block[base+int(start) : base+int(end)]
+	if len(frame) == 0 {
+		return frame, scratch
+	}
+	return r.decodeBlocked(frame, minBytes, scratch)
+}
+
+// decodeBlocked decodes a CodecZstdDictBlocked value: a uint32 block count, one
+// uint32 cumulative end offset per block, then the block frames. It decodes blocks in
+// order, appending each into out so the concatenation reproduces the value, and stops
+// once out holds minBytes decoded bytes; a negative minBytes decodes every block. The
+// kept buffer is out, the (grown) scratch, always caller-owned. A malformed header or
+// a frame that fails to decode, which the container CRC should already have caught,
+// reads back empty rather than panicking, matching colAtInto's defensive decode.
+func (r *Region) decodeBlocked(frame []byte, minBytes int, scratch []byte) (value, keep []byte) {
+	if len(frame) < 4 {
+		return nil, scratch
+	}
+	nblocks := int(codec.Uint32(frame))
+	framesBase := 4 + nblocks*4
+	if framesBase > len(frame) {
+		return nil, scratch
+	}
+	out := scratch[:0]
+	var prev uint32
+	for k := 0; k < nblocks; k++ {
+		end := codec.Uint32(frame[4+k*4:])
+		if int(prev) > int(end) || framesBase+int(end) > len(frame) {
+			return nil, scratch
+		}
+		bf := frame[framesBase+int(prev) : framesBase+int(end)]
+		prev = end
+		var err error
+		out, err = r.dec.DecodeAll(bf, out)
+		if err != nil {
+			return nil, scratch
+		}
+		if minBytes >= 0 && len(out) >= minBytes {
+			break
+		}
 	}
 	return out, out
 }

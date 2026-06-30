@@ -110,14 +110,19 @@ const (
 // page is the leading content; scanning the whole of a multi-hundred-kilobyte page
 // for every survivor would blow the L2 budget for no ranking gain. The cap bounds
 // the per-candidate scan to a fixed window, so the tokenization cost is the survivor
-// count times that window, not the corpus's longest document. It does not bound the
-// decode: ColumnInto decompresses the full body frame before the scan caps it, so an
-// oversized document still pays full decompression. Bounding that too needs a
-// block-structured body codec that decodes only the leading window, the follow-up
-// for corpora with large bodies; on the ccrawl markdown sample (bodies a few KB) the
-// decode and the scan are the same order, so the cap is the honest bound there.
-// Title and url are short and read in full.
+// count times that window, not the corpus's longest document. The body column is
+// stored CodecZstdDictBlocked, so the scan reads it through ColumnPrefixInto, which
+// decodes only the blocks the window spans rather than the whole body frame; a query
+// for a leading window of a multi-hundred-kilobyte page decompresses its first blocks,
+// not all of it, which bounds the decode the cap could not. The byte budget passed
+// down is the rune cap times utf8.UTFMax so the window always holds at least
+// maxBodyScanRunes complete runes. Title and url are short and read in full.
 const maxBodyScanRunes = 10000
+
+// maxBodyScanBytes is the decoded-byte budget for the body window: the rune cap times
+// the most bytes a rune takes, so decoding to it always yields at least maxBodyScanRunes
+// complete runes for the scan to walk, whatever the body's encoding.
+const maxBodyScanBytes = maxBodyScanRunes * utf8.UTFMax
 
 // newOnlineExtractor analyzes the query once and binds the regions the online
 // features read. idfOf is the per-term idf the broker pushed down, or nil to fall
@@ -304,11 +309,20 @@ func (e *onlineExtractor) scanField(localID uint32, col string, f int) (tf []int
 		e.streamBuf[f] = stream
 		return tf, stream, 0
 	}
-	b, keep, ok := e.fwd.ColumnInto(col, localID, e.fieldBuf[f])
+	// The body reads only its leading window, so it decodes through ColumnPrefixInto,
+	// which inflates just the blocks that window spans; title and url are short and
+	// read whole through ColumnInto.
+	var b, keep []byte
+	var ok bool
+	if f == fBody {
+		b, keep, ok = e.fwd.ColumnPrefixInto(col, localID, maxBodyScanBytes, e.fieldBuf[f])
+	} else {
+		b, keep, ok = e.fwd.ColumnInto(col, localID, e.fieldBuf[f])
+	}
 	if ok {
 		// Keep the decode buffer so the next survivor's scan reuses its capacity.
 		// The codec is fixed per column: the body decodes into this buffer every
-		// time, so retaining it removes the per-survivor body allocation. ColumnInto
+		// time, so retaining it removes the per-survivor body allocation. The reader
 		// hands back a caller-owned buffer here, never a region alias, so decoding
 		// into it next time can never write into the read-only region.
 		e.fieldBuf[f] = keep
