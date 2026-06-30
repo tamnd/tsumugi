@@ -44,6 +44,18 @@ type Query struct {
 	// single-shard path, where the shard's local idf is already the collection idf.
 	TermIDF map[string]float64
 
+	// AvgFieldLen, when set, overrides the per-field average lengths the broker
+	// normalizes BM25F by during the global rerank, the fleet-wide averages an
+	// aggregator pushes down so every broker beneath it normalizes a field's length
+	// against the same denominator. It is the length-normalization counterpart to
+	// TermIDF: idf makes a term's weight comparable across brokers, AvgFieldLen makes a
+	// field's length normalization comparable, and together they make a partitioned
+	// deployment's L2 scores land on one scale so the aggregator's merge stays exact (doc
+	// 11, "Exactness up the tree", the partitioned-GlobalStats case). It is nil on the
+	// single-broker path, where the broker's own fleet averages are already the
+	// collection averages, and the field order is the online extractor's: title, body, url.
+	AvgFieldLen *[3]float64
+
 	// L0, when positive, overrides the shard's default L0 candidate width per plane, the
 	// first rung of the broker's degradation ladder: under budget pressure the broker
 	// shrinks L0 so each shard retrieves and ranks a smaller candidate set precisely

@@ -16,12 +16,15 @@ type recordingSearcher struct {
 	shards  int
 	docs    uint64
 	df      map[string]uint32
+	stats   GlobalStats
 	gotIDF  map[string]float64
+	gotAvg  *[3]float64
 	gotTerm []string
 }
 
-func (r *recordingSearcher) NumShards() int  { return r.shards }
-func (r *recordingSearcher) NumDocs() uint64 { return r.docs }
+func (r *recordingSearcher) NumShards() int     { return r.shards }
+func (r *recordingSearcher) NumDocs() uint64    { return r.docs }
+func (r *recordingSearcher) Stats() GlobalStats { return r.stats }
 func (r *recordingSearcher) DocFreqs(_ context.Context, terms []string) map[string]uint32 {
 	out := make(map[string]uint32)
 	for _, t := range terms {
@@ -33,6 +36,7 @@ func (r *recordingSearcher) DocFreqs(_ context.Context, terms []string) map[stri
 }
 func (r *recordingSearcher) SearchComplete(_ context.Context, q Query) Results {
 	r.gotIDF = q.TermIDF
+	r.gotAvg = q.AvgFieldLen
 	r.gotTerm = q.Terms
 	return Results{ShardsTotal: r.shards, ShardsOK: r.shards}
 }
