@@ -48,6 +48,43 @@ func StreamGroupRank(shards []*Region, groupOfGlobal func(uint64) int, cfg PRCon
 	ns := len(shards)
 	out := make([][]float64, ns)
 
+	groups, m, inEdges, outW := crossGroupGraph(shards, groupOfGlobal)
+	if m == 0 {
+		return out
+	}
+
+	gr := weightedPageRank(m, inEdges, outW, cfg)
+
+	// Scatter: each page inherits its group's rank, written into the page's own shard, the
+	// one cheap pass doc 07 calls for. The implicit per-shard layout falls out of writing
+	// out[si][d] directly.
+	for si, s := range shards {
+		if s == nil {
+			continue
+		}
+		gs := groups[si]
+		v := make([]float64, len(gs))
+		for d := range gs {
+			v[d] = gr[gs[d]]
+		}
+		out[si] = v
+	}
+	return out
+}
+
+// crossGroupGraph projects the page graph across a shard set onto the contracted group graph,
+// the shared cross-shard projection both StreamGroupRank and CrossHostLinkDiversity run before
+// they reduce the group graph (the one to a weighted PageRank, the other to per-host entropy).
+// It is the cross-shard twin of signals.go's projectGroups: it compacts the group ids to a
+// dense range registering every page's group first, projects the page edges onto the group
+// graph accumulating inter-group edge weights while dropping intra-group edges, and returns the
+// per-shard cached dense group ids, the group count, and the weighted in-edges and out-weights
+// in a deterministic edge order. It never materializes the merged page graph; an edge's two
+// endpoints map to their group through the corpus-stable global id, the intra target through the
+// shard's own cached group and the far target through the group closure on its global id.
+func crossGroupGraph(shards []*Region, groupOfGlobal func(uint64) int) (groups [][]int, m int, inEdges [][]wedge, outW []float64) {
+	ns := len(shards)
+
 	// Compact the group ids to a dense range. Register every page's group first, in a full
 	// pass over every shard's nodes, so an isolated group (a host with pages but no links
 	// that cross its own boundary) is still a node in the group graph and still inherits a
@@ -65,7 +102,7 @@ func StreamGroupRank(shards []*Region, groupOfGlobal func(uint64) int, cfg PRCon
 	// Cache each shard's per-node dense group id while registering, so the projection and the
 	// scatter do not call groupOfGlobal again (it is a user closure, and the cache also pins
 	// the dense id a page scatters to even if its group is otherwise only seen via a far edge).
-	groups := make([][]int, ns)
+	groups = make([][]int, ns)
 	for si, s := range shards {
 		if s == nil {
 			continue
@@ -77,9 +114,9 @@ func StreamGroupRank(shards []*Region, groupOfGlobal func(uint64) int, cfg PRCon
 		}
 		groups[si] = gs
 	}
-	m := len(idOf)
+	m = len(idOf)
 	if m == 0 {
-		return out
+		return groups, 0, nil, nil
 	}
 
 	// Project the page edges onto the group graph, accumulating inter-group edge weights and
@@ -114,10 +151,10 @@ func StreamGroupRank(shards []*Region, groupOfGlobal func(uint64) int, cfg PRCon
 		})
 	}
 
-	// Build the contracted graph in a fixed key order so the rank is deterministic: a map
-	// range would feed weightedPageRank its in-edges in a different float summation order each
-	// run, which drifts the result in the last bits and across platforms. The group graph is
-	// tiny, so sorting its edges costs nothing.
+	// Build the contracted graph in a fixed key order so the result is deterministic: a map
+	// range would feed the reducer its in-edges in a different float summation order each run,
+	// which drifts the result in the last bits and across platforms. The group graph is tiny,
+	// so sorting its edges costs nothing.
 	keys := make([]key, 0, len(w))
 	for k := range w {
 		keys = append(keys, k)
@@ -128,29 +165,12 @@ func StreamGroupRank(shards []*Region, groupOfGlobal func(uint64) int, cfg PRCon
 		}
 		return keys[i].u < keys[j].u
 	})
-	inEdges := make([][]wedge, m)
-	outW := make([]float64, m)
+	inEdges = make([][]wedge, m)
+	outW = make([]float64, m)
 	for _, k := range keys {
 		weight := w[k]
 		inEdges[k.v] = append(inEdges[k.v], wedge{u: k.u, w: weight})
 		outW[k.u] += weight
 	}
-
-	gr := weightedPageRank(m, inEdges, outW, cfg)
-
-	// Scatter: each page inherits its group's rank, written into the page's own shard, the
-	// one cheap pass doc 07 calls for. The implicit per-shard layout falls out of writing
-	// out[si][d] directly.
-	for si, s := range shards {
-		if s == nil {
-			continue
-		}
-		gs := groups[si]
-		v := make([]float64, len(gs))
-		for d := range gs {
-			v[d] = gr[gs[d]]
-		}
-		out[si] = v
-	}
-	return out
+	return groups, m, inEdges, outW
 }
