@@ -351,7 +351,12 @@ func writeShard(path string, docs []convert.Document, sig graphSignals, base uin
 	for i, c := range cols {
 		fwdCols[i] = forward.Column{Name: c.Name, Type: forward.ColString, Codec: forward.CodecZstdDict}
 		if c.Blob {
+			// A blob column, the body, is read by a leading window in the L2 scan, so it
+			// is stored block-structured: a windowed read decodes only the blocks the scan
+			// reaches instead of the whole body, which bounds the L2 body-decompression
+			// tail that sets the serving p99 on a large-body corpus.
 			fwdCols[i].Flags = forward.FlagBlob
+			fwdCols[i].Codec = forward.CodecZstdDictBlocked
 		}
 		// doc_id is a 32-byte sha256, effectively random and incompressible, and the
 		// recrawl and compact paths scan it as raw bytes; storing it uncompressed

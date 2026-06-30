@@ -520,6 +520,160 @@ func BenchmarkOnlineExtractDict(b *testing.B) {
 	}
 }
 
+// buildForwardBlocked is buildForwardDict with the body stored block-structured
+// (CodecZstdDictBlocked), the production serving codec, so a test can compare the
+// windowed body read against the full CodecZstdDict read on the same documents.
+func buildForwardBlocked(t testing.TB, docs []textDoc) *forward.Region {
+	t.Helper()
+	cols := []forward.Column{
+		{Name: "url", Type: forward.ColString, Codec: forward.CodecZstdDict},
+		{Name: "title", Type: forward.ColString, Codec: forward.CodecZstdDict},
+		{Name: "body", Type: forward.ColString, Codec: forward.CodecZstdDictBlocked, Flags: forward.FlagBlob},
+	}
+	fb := forward.NewBuilder(cols)
+	for i, d := range docs {
+		id := uint32(i)
+		fb.Set(id, "url", []byte(d.url))
+		fb.Set(id, "title", []byte(d.title))
+		fb.Set(id, "body", []byte(d.body))
+	}
+	r, err := forward.Open(fb.Build())
+	if err != nil {
+		t.Fatalf("open forward: %v", err)
+	}
+	return r
+}
+
+// largeBodyDocs returns the documents whose body exceeds one block, the tail the
+// windowed body decode bounds. On the ccrawl sample these are a few percent of the
+// corpus but they carry the L2 decode tail that sets the serving p99, so a benchmark
+// over them is the one that shows the windowed codec's effect rather than drowning it
+// in the small-body majority a single block already covers.
+func largeBodyDocs(docs []textDoc, minBytes int) []textDoc {
+	var out []textDoc
+	for _, d := range docs {
+		if len(d.body) > minBytes {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// TestOnlineFeaturesBlockedMatchDict is the windowed-read correctness gate on real
+// data: the online feature vector of every document must be identical whether the body
+// is stored CodecZstdDict and read whole or CodecZstdDictBlocked and read by the
+// leading window. The body features the L2 stage draws all come from the first
+// maxBodyScanRunes runes, so the windowed decode that stops after the blocks covering
+// that window must feed the ranker the same row the full decode does; a drift here
+// would change a served score. It runs over the ccrawl sample, which includes bodies
+// past the block size, so the multi-block window path is actually exercised.
+func TestOnlineFeaturesBlockedMatchDict(t *testing.T) {
+	if _, err := os.Stat(ccrawlParquet); err != nil {
+		t.Skipf("ccrawl sample not present: %v", err)
+	}
+	docs := readRealDocs(t, 1500)
+	if len(docs) < 50 {
+		t.Skipf("too few real docs: %d", len(docs))
+	}
+	if len(largeBodyDocs(docs, bodyBlockBytesForTest)) == 0 {
+		t.Fatal("sample has no body past one block; the multi-block window path would not be exercised")
+	}
+	dictFwd := buildForwardDict(t, docs)
+	defer dictFwd.Close()
+	blkFwd := buildForwardBlocked(t, docs)
+	defer blkFwd.Close()
+
+	for qd := 0; qd < 8 && qd < len(docs); qd++ {
+		q := Query{Text: docs[qd].title}
+		idf := map[string]float64{}
+		for _, tok := range lexical.Analyze(q.Text) {
+			idf[tok] = 1.0
+		}
+		eDict := newOnlineExtractor(q, dictFwd, nil, idf, [3]float64{fBody: 200})
+		eBlk := newOnlineExtractor(q, blkFwd, nil, idf, [3]float64{fBody: 200})
+		for id := 0; id < len(docs); id++ {
+			a := eDict.features(uint32(id))
+			b := eBlk.features(uint32(id))
+			if len(a) != len(b) {
+				t.Fatalf("query %d doc %d: feature length %d != %d", qd, id, len(a), len(b))
+			}
+			for k := range a {
+				if a[k] != b[k] {
+					t.Fatalf("query %d doc %d feature %d: dict %v != blocked %v", qd, id, k, a[k], b[k])
+				}
+			}
+		}
+	}
+}
+
+// bodyBlockBytesForTest mirrors the forward package's block size for the test that
+// filters the large-body tail; it is the boundary above which a body spans more than
+// one block and the windowed read decodes fewer blocks than the full value.
+const bodyBlockBytesForTest = 16 << 10
+
+// BenchmarkOnlineExtractBlocked is BenchmarkOnlineExtractDict over a body stored
+// block-structured and read by the leading window. Compared head to head with the Dict
+// benchmark it shows the windowed decode's effect; over the whole sample the effect is
+// small because most bodies fit one block, so the tail benchmarks below isolate the
+// large bodies the codec exists for.
+func BenchmarkOnlineExtractBlocked(b *testing.B) {
+	if _, err := os.Stat(ccrawlParquet); err != nil {
+		b.Skipf("ccrawl sample not present: %v", err)
+	}
+	docs := readRealDocs(b, 600)
+	if len(docs) < 50 {
+		b.Skipf("too few real docs: %d", len(docs))
+	}
+	fwd := buildForwardBlocked(b, docs)
+	defer fwd.Close()
+	q := Query{Text: docs[0].title}
+	idf := map[string]float64{}
+	for _, t := range lexical.Analyze(q.Text) {
+		idf[t] = 1.0
+	}
+	e := newOnlineExtractor(q, fwd, nil, idf, [3]float64{fBody: 200})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = e.features(uint32(i % len(docs)))
+	}
+}
+
+// BenchmarkOnlineExtractDictLarge and BenchmarkOnlineExtractBlockedLarge score only the
+// large-body tail, the documents past one block, so the per-survivor decode the
+// windowed codec bounds is the dominant cost and the difference between the two is the
+// codec's effect on the L2 decode tail that sets the serving p99.
+func BenchmarkOnlineExtractDictLarge(b *testing.B) {
+	benchExtractLarge(b, buildForwardDict)
+}
+
+func BenchmarkOnlineExtractBlockedLarge(b *testing.B) {
+	benchExtractLarge(b, buildForwardBlocked)
+}
+
+func benchExtractLarge(b *testing.B, build func(testing.TB, []textDoc) *forward.Region) {
+	if _, err := os.Stat(ccrawlParquet); err != nil {
+		b.Skipf("ccrawl sample not present: %v", err)
+	}
+	docs := largeBodyDocs(readRealDocs(b, 4000), bodyBlockBytesForTest)
+	if len(docs) < 20 {
+		b.Skipf("too few large-body docs: %d", len(docs))
+	}
+	fwd := build(b, docs)
+	defer fwd.Close()
+	q := Query{Text: docs[0].title}
+	idf := map[string]float64{}
+	for _, t := range lexical.Analyze(q.Text) {
+		idf[t] = 1.0
+	}
+	e := newOnlineExtractor(q, fwd, nil, idf, [3]float64{fBody: 200})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = e.features(uint32(i % len(docs)))
+	}
+}
+
 // readRealDocs reads up to limit documents with non-empty bodies from the crawl
 // sample and reduces each to its url, a derived title, and its body.
 func readRealDocs(t testing.TB, limit int) []textDoc {

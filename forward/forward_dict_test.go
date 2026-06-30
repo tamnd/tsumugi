@@ -94,7 +94,7 @@ func TestColumnIntoMatchesColumn(t *testing.T) {
 		[]byte("a different body of comparable length, with its own repeated repeated repeated tail"),
 		[]byte(""), // explicitly empty
 	}
-	for _, cod := range []uint8{CodecNone, CodecZstd, CodecZstdDict} {
+	for _, cod := range []uint8{CodecNone, CodecZstd, CodecZstdDict, CodecZstdDictBlocked} {
 		b := NewBuilder([]Column{{Name: "body", Type: ColString, Codec: cod}})
 		for i, v := range bodies {
 			if v != nil {

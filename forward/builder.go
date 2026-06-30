@@ -70,7 +70,7 @@ func (b *Builder) Build() []byte {
 	dicts := make([][]byte, len(b.cols))
 	for ci := range b.cols {
 		switch b.cols[ci].Codec {
-		case CodecZstd, CodecZstdDict:
+		case CodecZstd, CodecZstdDict, CodecZstdDictBlocked:
 			blocks[ci], dicts[ci] = b.buildCompressed(ci, n)
 		default:
 			blocks[ci] = b.buildRaw(ci, n)
@@ -152,10 +152,12 @@ func (b *Builder) buildRaw(ci int, n uint32) []byte {
 // buildCompressed packs one column with each value stored as an independent zstd
 // frame. A CodecZstdDict column first derives a shared dictionary from its
 // non-empty values and encodes every frame against it; the derived dictionary is
-// returned so Build can append it to the region. An empty value stays a
+// returned so Build can append it to the region. A CodecZstdDictBlocked column does
+// the same but splits each value into bodyBlockBytes blocks behind a per-value
+// sub-index so a reader can decode a leading window. An empty value stays a
 // zero-length frame so the empty-value path reads back without a decode.
 func (b *Builder) buildCompressed(ci int, n uint32) (data, dict []byte) {
-	if b.cols[ci].Codec == CodecZstdDict {
+	if b.cols[ci].Codec == CodecZstdDict || b.cols[ci].Codec == CodecZstdDictBlocked {
 		var samples [][]byte
 		for d := uint32(0); d < n; d++ {
 			if row := b.rows[d]; row != nil && len(row[ci]) > 0 {
@@ -174,6 +176,7 @@ func (b *Builder) buildCompressed(ci int, n uint32) (data, dict []byte) {
 	enc, _ := zstd.NewWriter(nil, opts...)
 	defer func() { _ = enc.Close() }()
 
+	blocked := b.cols[ci].Codec == CodecZstdDictBlocked
 	offsets := make([]byte, (int(n)+1)*4)
 	var values []byte
 	var scratch []byte // reused frame buffer; values copies out of it each row
@@ -181,9 +184,14 @@ func (b *Builder) buildCompressed(ci int, n uint32) (data, dict []byte) {
 	for d := uint32(0); d < n; d++ {
 		codec.PutUint32(offsets[int(d)*4:], cur)
 		if row := b.rows[d]; row != nil && len(row[ci]) > 0 {
-			scratch = enc.EncodeAll(row[ci], scratch[:0])
-			values = append(values, scratch...)
-			cur += uint32(len(scratch))
+			before := len(values)
+			if blocked {
+				values, scratch = appendBlocked(values, enc, row[ci], scratch)
+			} else {
+				scratch = enc.EncodeAll(row[ci], scratch[:0])
+				values = append(values, scratch...)
+			}
+			cur += uint32(len(values) - before)
 		}
 	}
 	codec.PutUint32(offsets[int(n)*4:], cur)
@@ -191,4 +199,31 @@ func (b *Builder) buildCompressed(ci int, n uint32) (data, dict []byte) {
 	blk = append(blk, offsets...)
 	blk = append(blk, values...)
 	return blk, dict
+}
+
+// appendBlocked appends one CodecZstdDictBlocked value to dst: a uint32 block count,
+// then one uint32 cumulative end offset per block, then the block frames. Block k
+// covers source bytes [k*bodyBlockBytes, (k+1)*bodyBlockBytes), each compressed as an
+// independent frame against the column dictionary, so a reader decodes the blocks a
+// window spans and concatenating every block reproduces the value exactly. It returns
+// the grown dst and the reused frame scratch. The caller guarantees val is non-empty,
+// so there is always at least one block.
+func appendBlocked(dst []byte, enc *zstd.Encoder, val, scratch []byte) (out, scratchOut []byte) {
+	nblocks := (len(val) + bodyBlockBytes - 1) / bodyBlockBytes
+	dst = codec.AppendUint32(dst, uint32(nblocks))
+	idxAt := len(dst)
+	dst = append(dst, make([]byte, nblocks*4)...) // cumulative end offsets, filled below
+	var cur uint32
+	for k := 0; k < nblocks; k++ {
+		lo := k * bodyBlockBytes
+		hi := lo + bodyBlockBytes
+		if hi > len(val) {
+			hi = len(val)
+		}
+		scratch = enc.EncodeAll(val[lo:hi], scratch[:0])
+		dst = append(dst, scratch...)
+		cur += uint32(len(scratch))
+		codec.PutUint32(dst[idxAt+k*4:], cur)
+	}
+	return dst, scratch
 }

@@ -53,11 +53,32 @@ const (
 // a copy; a CodecZstd column stores each value as an independent zstd frame; a
 // CodecZstdDict column does the same against a shared dictionary embedded in the
 // region, so many small similar values share one context.
+//
+// CodecZstdDictBlocked is CodecZstdDict for large values that are read by a leading
+// window rather than whole: the value is split into fixed-size uncompressed blocks,
+// each an independent dictionary frame, behind a small per-value sub-index. A reader
+// that wants the whole value decodes every block and the result is byte-for-byte the
+// value CodecZstdDict would have stored; a reader that wants only a leading window
+// (the L2 body scan, which reads at most a fixed rune cap) decodes only the blocks
+// that window spans, so a long body costs the decode of its first blocks rather than
+// the whole frame. The lever the throughput-versus-latency curve needs: the p99 tail
+// is the body-decompression cost of the longest documents, and the window bounds it.
 const (
-	CodecNone     uint8 = 0
-	CodecZstd     uint8 = 1
-	CodecZstdDict uint8 = 2
+	CodecNone            uint8 = 0
+	CodecZstd            uint8 = 1
+	CodecZstdDict        uint8 = 2
+	CodecZstdDictBlocked uint8 = 3
 )
+
+// bodyBlockBytes is the uncompressed size of one block in a CodecZstdDictBlocked
+// column. A value at or under this size is a single block, identical in cost to a
+// CodecZstdDict frame; a larger value splits into this many bytes per block so a
+// windowed read decodes ceil(window/bodyBlockBytes) blocks instead of the whole
+// value. It trades a little compression ratio (each block loses cross-block context,
+// softened by the shared dictionary) for a bounded windowed decode, so it is sized to
+// the body scan window: a few blocks cover the cap, and only documents longer than
+// the cap pay for blocks they never decode under the full-value path.
+const bodyBlockBytes = 16 << 10
 
 // FlagBlob marks a large column, like the body, that a reader can skip when it
 // only wants the small display fields. Every column has O(1) random access here,
