@@ -111,7 +111,7 @@ func TestCompactMergesAndPreservesDocs(t *testing.T) {
 		t.Fatalf("pre-compact shards = %d, want 5", len(before))
 	}
 
-	res, err := Compact(out, 20)
+	res, err := Compact(out, 20, NoEpoch)
 	if err != nil {
 		t.Fatalf("Compact: %v", err)
 	}

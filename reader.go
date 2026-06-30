@@ -229,6 +229,18 @@ func (r *Reader) AnalyzerHash() (uint64, bool) {
 	return AnalyzerHashFromStat(v), true
 }
 
+// BuildConfigHash returns the recorded build_config_hash and whether it was present.
+// A shard built before the digest was recorded returns false, the unknown case a
+// caller treats as a skipped check rather than a mismatch. Like the analyzer hash it
+// is a full 64-bit value recovered from its lossless float64 bit pattern.
+func (r *Reader) BuildConfigHash() (uint64, bool) {
+	v, ok := r.Footer.Stats[StatBuildConfigHash]
+	if !ok {
+		return 0, false
+	}
+	return AnalyzerHashFromStat(v), true
+}
+
 // Close releases the mapping.
 func (r *Reader) Close() error {
 	if r.dec != nil {

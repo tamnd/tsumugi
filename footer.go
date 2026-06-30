@@ -69,6 +69,15 @@ const (
 	// preserves the bit pattern rather than the numeric value a plain stat would lose
 	// above 2^53.
 	StatAnalyzerHash = "analyzer_hash"
+	// StatBuildConfigHash records a 64-bit digest of the configuration the shard was
+	// built under: the container format version, the feature schema version, the
+	// routing index version, the analyzer hash, the shard size, and the curated trust
+	// and spam seed lists. Two shards built under the same configuration carry the same
+	// digest, so a reader can tell at a glance whether two shards are configuration-
+	// compatible and a reproducibility check can assert a rebuild used the same inputs.
+	// Like the analyzer hash it is a full 64-bit value carried losslessly through the
+	// float64 stats map by AnalyzerHashStat.
+	StatBuildConfigHash = "build_config_hash"
 )
 
 // AnalyzerHashStat encodes a 64-bit analyzer hash as the float64 with the identical
