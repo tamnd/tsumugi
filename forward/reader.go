@@ -3,6 +3,7 @@ package forward
 import (
 	"errors"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/tamnd/tsumugi/codec"
 )
 
@@ -10,14 +11,16 @@ import (
 // region or fail their header CRC.
 var ErrCorrupt = errors.New("forward: corrupt region")
 
-// Region is a parsed, read-only forward store. It holds sub-slices of the region
-// bytes and copies nothing: a value returned by Column aliases the region, so a
-// caller must not mutate it.
+// Region is a parsed, read-only forward store. A value from a CodecNone column
+// aliases the region bytes and must not be mutated; a value from a compressed
+// column is decoded into a fresh slice the caller owns. A Region that opened a
+// compressed column holds a zstd decoder and must be closed to release it.
 type Region struct {
 	b      []byte
 	cols   []colDesc
 	colIdx map[string]int
 	rows   uint32
+	dec    *zstd.Decoder // nil when every column is CodecNone
 }
 
 // Open parses a forward region from its bytes.
@@ -48,8 +51,13 @@ func Open(b []byte) (*Region, error) {
 		return nil, ErrCorrupt
 	}
 
-	// Every column's data block must fall inside the region.
-	for _, c := range cols {
+	// Every column's data block and dictionary must fall inside the region, and a
+	// compressed column registers its dictionary so frames decode against it. The
+	// decoder runs single-goroutine: a shard may hold tens of thousands of these,
+	// so the per-region cost stays one lightweight decoder, not a goroutine fan-out.
+	opts := []zstd.DOption{zstd.WithDecoderConcurrency(1)}
+	compressed := false
+	for ci, c := range cols {
 		if c.dataOff+c.dataLen > uint64(len(b)) {
 			return nil, ErrCorrupt
 		}
@@ -57,13 +65,39 @@ func Open(b []byte) (*Region, error) {
 		if c.dataLen < uint64(rows+1)*4 {
 			return nil, ErrCorrupt
 		}
+		if c.dictLen > 0 {
+			if c.dictOff+c.dictLen > uint64(len(b)) {
+				return nil, ErrCorrupt
+			}
+			opts = append(opts, zstd.WithDecoderDictRaw(dictID(ci), b[c.dictOff:c.dictOff+c.dictLen]))
+		}
+		if c.Codec != CodecNone {
+			compressed = true
+		}
 	}
 
 	idx := make(map[string]int, len(cols))
 	for i, c := range cols {
 		idx[c.Name] = i
 	}
-	return &Region{b: b, cols: cols, colIdx: idx, rows: rows}, nil
+	r := &Region{b: b, cols: cols, colIdx: idx, rows: rows}
+	if compressed {
+		dec, err := zstd.NewReader(nil, opts...)
+		if err != nil {
+			return nil, err
+		}
+		r.dec = dec
+	}
+	return r, nil
+}
+
+// Close releases the region's zstd decoder. It is safe to call on a Region with
+// no compressed columns and safe to call more than once.
+func (r *Region) Close() {
+	if r != nil && r.dec != nil {
+		r.dec.Close()
+		r.dec = nil
+	}
 }
 
 // Schema returns the column descriptors in storage order.
@@ -90,14 +124,26 @@ func (r *Region) Column(name string, docID uint32) ([]byte, bool) {
 }
 
 // colAt slices a value from a column data block by docID, reading the two
-// bracketing offsets from the block's offset index.
+// bracketing offsets from the block's offset index. A CodecNone value aliases the
+// region; a compressed value is one zstd frame decoded into a fresh slice. An
+// empty value (start == end) reads back empty without a decode, so an unset cell
+// costs nothing. A frame that fails to decode, which the container CRC over the
+// region should already have caught, reads back empty rather than panicking.
 func (r *Region) colAt(ci int, docID uint32) []byte {
 	c := r.cols[ci]
 	block := r.b[c.dataOff : c.dataOff+c.dataLen]
 	start := codec.Uint32(block[int(docID)*4:])
 	end := codec.Uint32(block[int(docID+1)*4:])
 	base := (int(r.rows) + 1) * 4
-	return block[base+int(start) : base+int(end)]
+	frame := block[base+int(start) : base+int(end)]
+	if c.Codec == CodecNone || len(frame) == 0 {
+		return frame
+	}
+	out, err := r.dec.DecodeAll(frame, nil)
+	if err != nil {
+		return nil
+	}
+	return out
 }
 
 // Row returns every column value for one document, keyed by column name. It is

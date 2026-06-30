@@ -146,6 +146,7 @@ func gatherDocs(infos []ShardInfo) ([]convert.Document, int, error) {
 			docs = append(docs, d)
 			hosts[d.Host] = struct{}{}
 		}
+		fwd.Close()
 		_ = r.Close()
 	}
 	return docs, len(hosts), nil
