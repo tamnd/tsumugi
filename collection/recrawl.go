@@ -101,6 +101,7 @@ func WriteRecrawlDir(dir string) error {
 			// the handle a recrawl uses to find the page it already holds.
 			ids = append(ids, info.NodeBase+id)
 		}
+		fwd.Close()
 		_ = r.Close()
 	}
 

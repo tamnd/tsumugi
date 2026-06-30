@@ -177,8 +177,13 @@ func (s *Shard) VectorDim() (int, bool) {
 	return s.vec.Dim(), true
 }
 
-// Close releases the shard's file mapping.
-func (s *Shard) Close() error { return s.r.Close() }
+// Close releases the shard's forward decoder and file mapping.
+func (s *Shard) Close() error {
+	if s.fwd != nil {
+		s.fwd.Close()
+	}
+	return s.r.Close()
+}
 
 // featureRow builds the L2 feature vector for a local document id by reading the
 // shard's feature matrix in schema order. A shard without a feature region scores

@@ -285,9 +285,18 @@ func writeShard(path string, docs []convert.Document, sig graphSignals, base uin
 	cols := docColumns()
 	fwdCols := make([]forward.Column, len(cols))
 	for i, c := range cols {
-		fwdCols[i] = forward.Column{Name: c.Name, Type: forward.ColString}
+		fwdCols[i] = forward.Column{Name: c.Name, Type: forward.ColString, Codec: forward.CodecZstdDict}
 		if c.Blob {
 			fwdCols[i].Flags = forward.FlagBlob
+		}
+		// doc_id is a 32-byte sha256, effectively random and incompressible, and the
+		// recrawl and compact paths scan it as raw bytes; storing it uncompressed
+		// keeps that scan zero-copy and wastes no frame overhead on noise. The text
+		// columns share a derived dictionary so many small similar values compress
+		// against one context, and the region is stored uncompressed in the container
+		// so opening a shard inflates no bodies, only the values a query reaches do.
+		if c.Name == "doc_id" {
+			fwdCols[i].Codec = forward.CodecNone
 		}
 	}
 	fwd := forward.NewBuilder(fwdCols)
@@ -417,7 +426,10 @@ func writeShard(path string, docs []convert.Document, sig graphSignals, base uin
 	if err := w.AddRegion(tsumugi.RegionFeature, tsumugi.CodecZstd, 0, 0, featBytes); err != nil {
 		return 0, err
 	}
-	if err := w.AddRegion(tsumugi.RegionForward, tsumugi.CodecZstd, 0, 0, fwd.Build()); err != nil {
+	// The forward region compresses per value internally now, so the container
+	// stores it uncompressed: a shard open mmaps the region and inflates only the
+	// values a query touches, instead of decompressing every body up front.
+	if err := w.AddRegion(tsumugi.RegionForward, tsumugi.CodecNone, 0, 0, fwd.Build()); err != nil {
 		return 0, err
 	}
 	if err := w.AddRegion(tsumugi.RegionGraph, tsumugi.CodecZstd, 0, 0, gregion); err != nil {
