@@ -184,7 +184,7 @@ func TestAdminReloadEndpoint(t *testing.T) {
 	}
 	defer func() { _ = broker.Close() }()
 
-	srv := &httpServer{broker: broker, pipeline: pl, admission: nil, reloader: rl}
+	srv := &httpServer{backend: broker, pipeline: pl, admission: nil, reloader: rl}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/reload", srv.reload)
 	mux.HandleFunc("/admin/publish", srv.publish)
@@ -226,7 +226,7 @@ func TestAdminReloadEndpoint(t *testing.T) {
 	}
 
 	// A server with no reloader wired returns 404 on the admin path.
-	bare := &httpServer{broker: broker, pipeline: pl}
+	bare := &httpServer{backend: broker, pipeline: pl}
 	bmux := http.NewServeMux()
 	bmux.HandleFunc("/admin/reload", bare.reload)
 	bts := httptest.NewServer(bmux)

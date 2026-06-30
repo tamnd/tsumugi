@@ -32,7 +32,7 @@ func TestPipelineCorrectsTypo(t *testing.T) {
 	}
 	defer func() { _ = broker.Close() }()
 
-	srv := &httpServer{broker: broker, pipeline: pl, timeout: 0}
+	srv := &httpServer{backend: broker, pipeline: pl, timeout: 0}
 	ts := httptest.NewServer(http.HandlerFunc(srv.search))
 	defer ts.Close()
 
@@ -61,7 +61,7 @@ func TestPipelineEmptyQuery(t *testing.T) {
 	}
 	defer func() { _ = broker.Close() }()
 
-	srv := &httpServer{broker: broker, pipeline: pl, timeout: 0}
+	srv := &httpServer{backend: broker, pipeline: pl, timeout: 0}
 	ts := httptest.NewServer(http.HandlerFunc(srv.search))
 	defer ts.Close()
 
@@ -98,7 +98,7 @@ func TestPipelineExpandsRecall(t *testing.T) {
 		t.Fatalf("retrieval terms %v missing the expansion of js", terms)
 	}
 
-	srv := &httpServer{broker: broker, pipeline: pl, timeout: 0}
+	srv := &httpServer{backend: broker, pipeline: pl, timeout: 0}
 	ts := httptest.NewServer(http.HandlerFunc(srv.search))
 	defer ts.Close()
 	got := getSearch(t, ts.URL+"?q=js&k=5")

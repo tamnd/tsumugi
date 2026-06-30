@@ -45,14 +45,50 @@ type metaResponse struct {
 	NumShards int         `json:"num_shards"`
 	NumDocs   uint64      `json:"num_docs"`
 	Stats     GlobalStats `json:"stats"`
+
+	// VectorDim and HasVector report the dense input dimension the subtree's shards agree on, so a
+	// head node building the dense query encoder produces a vector of the width every leaf can read.
+	// They ride the metadata snapshot because the dimension changes only when the fleet's vector
+	// region changes, as rarely as the shard counts do, so a head reads it once at construction
+	// alongside the rest. HasVector is false for a subtree with no dense plane, which leaves the
+	// head's encoder off rather than encoding into a width no leaf carries.
+	VectorDim int  `json:"vector_dim"`
+	HasVector bool `json:"has_vector"`
+}
+
+// vocabEntry is one term of a subtree's vocabulary on the /vocab stream: the term and its
+// document frequency summed across the subtree. The stream is newline-delimited JSON, one entry
+// per line, so a head node reads a broker's whole vocabulary without either end buffering it all
+// in memory, which matters because a broker's dictionary is large and the head merges many of
+// them into one fleet-wide corrector.
+type vocabEntry struct {
+	Term string `json:"t"`
+	DF   uint32 `json:"d"`
+}
+
+// vocabIterator is the optional capability a Searcher exposes to serve its vocabulary over
+// /vocab: a node that can enumerate its terms (a broker over shards) implements it, and a node
+// that cannot (a bare aggregator, whose vocabulary lives on its remote children) does not, so
+// the handler answers /vocab only where it can.
+type vocabIterator interface {
+	ForEachTerm(fn func(term string, df uint32))
+}
+
+// vectorDimer is the optional capability a Searcher exposes to report its dense dimension on
+// /meta, satisfied by a broker over shards that carry a vector region.
+type vectorDimer interface {
+	VectorDim() (int, bool)
 }
 
 // NewSearcherHandler exposes a local Searcher over HTTP as one node of a serving tree that
-// spans machines. It answers three routes, one per kind of call an aggregator makes on a
-// child: POST /search runs SearchComplete over a JSON query and returns the JSON Results,
-// POST /docfreqs sums the subtree's per-term document frequencies for a JSON term list, and
-// GET /meta returns the subtree's shard and document counts and its fleet statistics so a
-// client can answer NumShards, NumDocs, and Stats without a round trip. The handler is the
+// spans machines. It answers the calls an aggregator makes on a child: POST /search runs
+// SearchComplete over a JSON query and returns the JSON Results, POST /docfreqs sums the
+// subtree's per-term document frequencies for a JSON term list, and GET /meta returns the
+// subtree's shard and document counts, its fleet statistics, and its dense dimension so a
+// client answers NumShards, NumDocs, Stats, and VectorDim without a round trip. It also
+// answers GET /vocab, a newline-delimited stream of the subtree's terms and document
+// frequencies that a head node folds into a fleet-wide corrector; a node that holds no
+// vocabulary of its own answers 404 there. The handler is the
 // server half of the RemoteSearcher seam: wrap any Searcher, a broker over shards or an
 // aggregator over further nodes, and a parent aggregator on another machine fans across it
 // as if it were local. Each handler runs against the request's context, so a client that
@@ -90,7 +126,28 @@ func NewSearcherHandler(s Searcher) http.Handler {
 		writeRemoteJSON(w, df)
 	})
 	mux.HandleFunc("/meta", func(w http.ResponseWriter, r *http.Request) {
-		writeRemoteJSON(w, metaResponse{NumShards: s.NumShards(), NumDocs: s.NumDocs(), Stats: s.Stats()})
+		m := metaResponse{NumShards: s.NumShards(), NumDocs: s.NumDocs(), Stats: s.Stats()}
+		if vd, ok := s.(vectorDimer); ok {
+			m.VectorDim, m.HasVector = vd.VectorDim()
+		}
+		writeRemoteJSON(w, m)
+	})
+	mux.HandleFunc("/vocab", func(w http.ResponseWriter, r *http.Request) {
+		// /vocab streams the subtree's vocabulary as newline-delimited vocabEntry JSON so a head node
+		// builds its corrector from the fleet without either side holding the whole dictionary at once.
+		// A node that cannot enumerate its terms, a bare aggregator whose vocabulary lives on its remote
+		// children, answers 404 rather than an empty stream, so a head dialing it knows to gather vocab
+		// from that node's own children instead of mistaking absent for empty.
+		vi, ok := s.(vocabIterator)
+		if !ok {
+			http.Error(w, "this node does not serve a vocabulary", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		enc := json.NewEncoder(w)
+		vi.ForEachTerm(func(term string, df uint32) {
+			_ = enc.Encode(vocabEntry{Term: term, DF: df})
+		})
 	})
 	return mux
 }
@@ -169,6 +226,44 @@ func (rs *RemoteSearcher) NumDocs() uint64 { return rs.meta.NumDocs }
 // the deployment-wide field averages it pushes back down so a partitioned remote tree's L2
 // scores stay on one scale.
 func (rs *RemoteSearcher) Stats() GlobalStats { return rs.meta.Stats }
+
+// VectorDim reports the dense input dimension the peer's subtree agrees on and whether the dense
+// plane is on, from the cached snapshot, so a head node building the dense query encoder produces
+// a vector of the width every leaf beneath this peer can read. It is the remote counterpart to
+// Broker.VectorDim, read once with the rest of the metadata rather than per query.
+func (rs *RemoteSearcher) VectorDim() (int, bool) { return rs.meta.VectorDim, rs.meta.HasVector }
+
+// Vocab streams the peer's vocabulary, calling fn for each term with its document frequency summed
+// across the peer's subtree, so a head node feeds a fleet-wide corrector from this peer without
+// either end buffering the whole dictionary. A peer that does not serve a vocabulary (a bare
+// aggregator, answering 404) returns an error the head treats as "ask this peer's own children",
+// not as an empty vocabulary. The context bounds the stream the same as any other call.
+func (rs *RemoteSearcher) Vocab(ctx context.Context, fn func(term string, df uint32)) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rs.baseURL+"/vocab", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := rs.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("/vocab: %s: %s", resp.Status, bytes.TrimSpace(body))
+	}
+	dec := json.NewDecoder(resp.Body)
+	for {
+		var e vocabEntry
+		if err := dec.Decode(&e); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return fmt.Errorf("/vocab: decode: %w", err)
+		}
+		fn(e.Term, e.DF)
+	}
+}
 
 // DocFreqs asks the peer for each term's document frequency across its subtree. A failed call
 // returns nil, which only loosens the idf the parent computes rather than corrupting a score,

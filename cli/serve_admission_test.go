@@ -30,7 +30,7 @@ func newAdmissionServer(t *testing.T, capacity int) (*httptest.Server, *search.A
 	t.Cleanup(func() { _ = broker.Close() })
 
 	adm := search.NewAdmission(capacity)
-	srv := &httpServer{broker: broker, pipeline: pl, timeout: 0, admission: adm}
+	srv := &httpServer{backend: broker, pipeline: pl, timeout: 0, admission: adm}
 	ts := httptest.NewServer(http.HandlerFunc(srv.search))
 	t.Cleanup(ts.Close)
 	return ts, adm
