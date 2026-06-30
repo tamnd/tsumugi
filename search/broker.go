@@ -594,7 +594,14 @@ dispatch:
 		go func(si int) {
 			defer func() { <-sem }()
 			s := st.shards[si]
-			lex, dense, feats := s.retrieve(q)
+			lex, dense, feats, completed := s.retrieve(ctx, q)
+			if !completed {
+				// The deadline passed while this shard was retrieving, so it abandoned the
+				// rest of its planes. Drop it: not sending leaves it out of the merge and
+				// uncounted in ShardsOK, so the collection rolls it up as not responded, the
+				// same honest partial a shard the collection stopped waiting for produces.
+				return
+			}
 			base := s.nodeBase
 			gl := make([]scored, len(lex))
 			for j, c := range lex {
