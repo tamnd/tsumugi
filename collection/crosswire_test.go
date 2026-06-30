@@ -63,7 +63,7 @@ func writeCrossLinkedJSONL(t testing.TB, dir, name string) string {
 // the build calls, so the layout matches the shards on disk byte for byte, which is
 // what lets a test know which shard each endpoint of a link lands in and what global
 // id a source carries.
-func buildLayout(t *testing.T, src string) ([]convert.Document, []uint64, func([]byte) (uint32, bool)) {
+func buildLayout(t testing.TB, src string) ([]convert.Document, []uint64, func([]byte) (uint32, bool)) {
 	t.Helper()
 	docs, _, err := readSource(src, 0)
 	if err != nil {
@@ -88,7 +88,7 @@ func buildLayout(t *testing.T, src string) ([]convert.Document, []uint64, func([
 
 // loadShardGraphs opens every shard's graph region in shard (NodeBase) order, the
 // order RouteCrossEdges and StreamCrossPageRank index their results by.
-func loadShardGraphs(t *testing.T, out string) ([]*graph.Region, func()) {
+func loadShardGraphs(t testing.TB, out string) ([]*graph.Region, func()) {
 	t.Helper()
 	shards, err := List(out)
 	if err != nil {
