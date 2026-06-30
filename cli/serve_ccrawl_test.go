@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -698,4 +699,116 @@ func TestServeAdmissionCCrawl(t *testing.T) {
 		t.Fatalf("in-flight after the burst = %d, want 0 (leaked slot)", got)
 	}
 	t.Logf("admission under load: %d served, %d shed, capacity %d, %d workers", ok, busy, capacity, workers)
+}
+
+// TestIncrementalPublishCCrawl is the incremental-publish correctness gate on real data: it
+// builds a real multi-shard collection, then assembles one broker incrementally (open over a
+// small base subset, then publish the remaining real shards one at a time through the overlay
+// path) and a second broker over the whole set at once (the full-rebuild path), and checks
+// the two are indistinguishable through the public query API. It asserts identical shard and
+// document counts, fleet statistics that match to floating-point tolerance, and byte-for-byte
+// identical ranked results for a set of real query terms. This proves the overlay routing and
+// the folded statistics produce the same answers a full rescan would over the real fleet
+// vocabulary and its real length distribution, not just over a synthetic corpus, so a serve
+// process that ingests shards continuously serves exactly what a cold rebuild would.
+func TestIncrementalPublishCCrawl(t *testing.T) {
+	if _, err := os.Stat(ccrawlParquet); err != nil {
+		t.Skipf("ccrawl parquet not present: %v", err)
+	}
+	if testing.Short() {
+		t.Skip("skipping real-data build in short mode")
+	}
+	tmp := t.TempDir()
+	out := filepath.Join(tmp, "coll")
+	res, err := collection.Build(collection.Options{Source: ccrawlParquet, Out: out, ShardSize: 1000, Limit: 8000})
+	if err != nil {
+		t.Fatalf("Build from ccrawl: %v", err)
+	}
+	if res.Shards < 4 {
+		t.Fatalf("need at least 4 shards to publish a base plus a real overlay, got %d", res.Shards)
+	}
+
+	modelPath := filepath.Join(tmp, "model.bin")
+	writeModel(t, modelPath)
+	f, err := os.Open(modelPath)
+	if err != nil {
+		t.Fatalf("open model: %v", err)
+	}
+	ens, err := rank.LoadEnsemble(f)
+	_ = f.Close()
+	if err != nil {
+		t.Fatalf("load model: %v", err)
+	}
+	model := ens.Compile()
+
+	// The full broker from openShards owns the shard pointers and closes them; the incremental
+	// broker shares the same pointers and so must not be closed.
+	shards, _, full, err := openShards(out, model)
+	if err != nil {
+		t.Fatalf("openShards: %v", err)
+	}
+	defer func() { _ = full.Close() }()
+	pl := buildPipeline(shards)
+
+	// Open over the first two shards, then publish the rest one at a time. With a real fleet
+	// well past the overlay limit's floor this drives both the incremental append and at least
+	// one mid-stream compaction, the two arms the overlay path takes.
+	const base = 2
+	inc := search.NewBroker(shards[:base], newCascade(model))
+	for i := base; i < len(shards); i++ {
+		inc.Publish(shards[i])
+	}
+
+	if inc.NumShards() != full.NumShards() {
+		t.Fatalf("incremental NumShards = %d, full = %d", inc.NumShards(), full.NumShards())
+	}
+	if inc.NumDocs() != full.NumDocs() {
+		t.Fatalf("incremental NumDocs = %d, full = %d", inc.NumDocs(), full.NumDocs())
+	}
+
+	fg, ig := full.Stats(), inc.Stats()
+	if fg.DocCount != ig.DocCount {
+		t.Fatalf("DocCount: full %d, inc %d", fg.DocCount, ig.DocCount)
+	}
+	if math.Abs(fg.AvgDocLen-ig.AvgDocLen) > 1e-6 {
+		t.Fatalf("AvgDocLen: full %.9f, inc %.9f", fg.AvgDocLen, ig.AvgDocLen)
+	}
+	for fi := range fg.AvgFieldLen {
+		if math.Abs(fg.AvgFieldLen[fi]-ig.AvgFieldLen[fi]) > 1e-6 {
+			t.Fatalf("AvgFieldLen[%d]: full %.9f, inc %.9f", fi, fg.AvgFieldLen[fi], ig.AvgFieldLen[fi])
+		}
+	}
+
+	// Real query terms exercised end to end: the incremental and full brokers must return the
+	// same ranked top-k, the proof that the overlay routes the same shards and the folded
+	// statistics score them the same way over the real corpus.
+	queries := []string{"data", "page", "home", "search", "news", "world", "time", "people", "free", "online"}
+	ctx := context.Background()
+	matched := 0
+	for _, q := range queries {
+		pq := pl.parse(q)
+		if pq.Empty() {
+			continue
+		}
+		sq := toQuery(pq, 20)
+		fh := full.Search(ctx, sq)
+		ih := inc.Search(ctx, sq)
+		if len(fh) != len(ih) {
+			t.Fatalf("query %q: full returned %d hits, incremental %d", q, len(fh), len(ih))
+		}
+		for j := range fh {
+			if fh[j].DocID != ih[j].DocID || math.Abs(float64(fh[j].Score-ih[j].Score)) > 1e-6 {
+				t.Fatalf("query %q hit %d differs: full {%d %.6f}, inc {%d %.6f}",
+					q, j, fh[j].DocID, fh[j].Score, ih[j].DocID, ih[j].Score)
+			}
+		}
+		if len(fh) > 0 {
+			matched++
+		}
+	}
+	if matched == 0 {
+		t.Fatalf("no real query returned hits over %d docs; nothing was compared", res.Docs)
+	}
+	t.Logf("incremental publish over real data: %d shards, %d docs, %d queries compared identical",
+		res.Shards, res.Docs, matched)
 }

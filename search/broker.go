@@ -63,6 +63,23 @@ type brokerState struct {
 	routing *RoutingIndex
 	stats   GlobalStats
 
+	// baseN is the number of shards the routing index covers: shards[:baseN] are routed by
+	// the base index and shards[baseN:] by the overlay, the shards published since the last
+	// full rebuild (see incremental.go). A full build sets baseN to the whole set and leaves
+	// the overlay empty; an incremental publish appends to the overlay and leaves baseN
+	// where it was.
+	baseN int
+
+	// overlay holds the routing contributions of the shards published since the last full
+	// rebuild, each a front-coded dictionary over one shard's own terms, so a publish adds a
+	// shard for the cost of its own vocabulary rather than a rescan of the fleet.
+	overlay []overlayEntry
+
+	// sums are the raw fleet statistic accumulators stats is derived from, kept so a publish
+	// can fold one shard in and re-divide rather than rescanning every shard for the
+	// averages.
+	sums statSums
+
 	// shardStatic is the per-shard static-rank summary the shard-dropping degradation
 	// rung orders shards by, computed once on first use under staticOnce so a state whose
 	// queries never drop shards never pays the scan. It belongs to the snapshot because
@@ -75,7 +92,14 @@ type brokerState struct {
 // routing index and the fleet-wide statistics. It is the scan path a publish and a
 // retire rebuild through, fine because they are infrequent relative to queries.
 func newState(shards []*Shard) *brokerState {
-	return &brokerState{shards: shards, routing: BuildRoutingIndex(shards), stats: computeGlobalStats(shards)}
+	sums := computeStatSums(shards)
+	return &brokerState{
+		shards:  shards,
+		baseN:   len(shards),
+		routing: BuildRoutingIndex(shards),
+		sums:    sums,
+		stats:   sums.global(),
+	}
 }
 
 // NewBroker builds a broker over already-opened shards with a global cascade. It
@@ -99,7 +123,13 @@ func NewBrokerWith(shards []*Shard, cascade *rank.Cascade, routing *RoutingIndex
 		cascade:        cascade,
 		maxConcurrency: runtime.GOMAXPROCS(0),
 	}
-	b.state.Store(&brokerState{shards: shards, routing: routing, stats: stats})
+	b.state.Store(&brokerState{
+		shards:  shards,
+		baseN:   len(shards),
+		routing: routing,
+		sums:    sumsFromStats(stats),
+		stats:   stats,
+	})
 	return b
 }
 
@@ -117,10 +147,7 @@ func (b *Broker) loadState() *brokerState { return b.state.Load() }
 func (b *Broker) Publish(shard *Shard) {
 	b.publishMu.Lock()
 	cur := b.state.Load()
-	shards := make([]*Shard, len(cur.shards)+1)
-	copy(shards, cur.shards)
-	shards[len(cur.shards)] = shard
-	b.state.Store(newState(shards))
+	b.state.Store(cur.withShard(shard))
 	b.publishMu.Unlock()
 	b.invalidateCache()
 }
@@ -189,6 +216,16 @@ func (b *Broker) Stats() GlobalStats { return b.loadState().stats }
 
 // NumShards is the number of shards the broker currently serves.
 func (b *Broker) NumShards() int { return len(b.loadState().shards) }
+
+// RoutingBytes is the resident size of the broker's routing structures, the base front-coded
+// index plus the not-yet-folded overlay of per-shard dictionaries. It is the footprint a
+// scale measurement charges to routing, so a continuous ingest can watch the overlay's cost
+// grow between compactions and confirm a fold reclaims it, the property that keeps routing
+// memory bounded as the served set grows toward the 100k-shard target.
+func (b *Broker) RoutingBytes() int {
+	st := b.loadState()
+	return st.routing.sizeBytes() + st.overlaySize()
+}
 
 // Close releases every shard's file mapping, both the currently served set and the
 // shards retired during the broker's life that were kept mapped for in-flight queries.
@@ -356,7 +393,7 @@ func (b *Broker) SearchDegraded(ctx context.Context, q Query, level DegradeLevel
 	if d.dropDense {
 		q.Vector = nil
 	}
-	targets := st.routing.RouteTerms(q.Terms)
+	targets := st.routeTerms(q.Terms)
 	// Lever 3: drop the lowest-static-rank shards from the routed set before the gather
 	// and the fan-out, so the dropped shards cost nothing downstream. ShardsTotal then
 	// reflects the shards actually queried, so the completeness flag stays honest about
@@ -545,7 +582,7 @@ func (b *Broker) DocFreqs(ctx context.Context, terms []string) map[string]uint32
 		return nil
 	}
 	st := b.loadState()
-	return b.gatherDF(ctx, st, terms, st.routing.RouteTerms(terms))
+	return b.gatherDF(ctx, st, terms, st.routeTerms(terms))
 }
 
 // idfFromDF turns gathered per-term document frequencies into per-term idf against the
