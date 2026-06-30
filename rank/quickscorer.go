@@ -3,6 +3,7 @@ package rank
 import (
 	"math/bits"
 	"sort"
+	"sync"
 )
 
 // MaxLeaves is the leaf bound a tree must stay within for the single-word
@@ -40,7 +41,34 @@ type Model struct {
 	// was built without a stamp, the free Compile path that names no schema.
 	schemaVersion uint16
 	schemaHash    uint64
+
+	// scratch pools the per-document leaf bitvector the scorer sweeps, sized to the
+	// ensemble's tree count. Scoring a candidate allocates one numTrees-wide []uint64,
+	// and at the rerank's hundreds of survivors per query times thousands of queries a
+	// second that per-document allocation is the cascade's dominant garbage-collector
+	// pressure, so the model pools the buffer rather than allocating it fresh each
+	// score (doc 11, the cascade's buffer pooling). The pool is safe for the concurrent
+	// queries a shared model serves, and a borrowed buffer is reset before use so a
+	// reused one carries nothing from the score before it. The zero value is ready, so
+	// a model built by Compile or loaded from disk needs no further setup.
+	scratch sync.Pool
 }
+
+// leafScratch borrows a leaf bitvector sized to the ensemble, from the pool when one
+// is warm and freshly allocated when it is not. The caller must return it with
+// putLeafScratch once it is done reading it, the borrow-and-return discipline that
+// keeps the allocation rate low without ever handing two scorers the same buffer.
+func (m *Model) leafScratch() *[]uint64 {
+	if p, ok := m.scratch.Get().(*[]uint64); ok && len(*p) == m.numTrees {
+		return p
+	}
+	v := make([]uint64, m.numTrees)
+	return &v
+}
+
+// putLeafScratch returns a borrowed leaf bitvector to the pool for the next score to
+// reuse. It is safe to call from any goroutine, the pool serializing its own access.
+func (m *Model) putLeafScratch(p *[]uint64) { m.scratch.Put(p) }
 
 // NumTrees returns the ensemble size.
 func (m *Model) NumTrees() int { return m.numTrees }
@@ -123,7 +151,18 @@ func Compile(trees []*treeNode, numFeatures int) *Model {
 // the leaf values in tree order. The trees are summed in the same order as the
 // naive walk, so the result is bit-identical to it.
 func (m *Model) Score(doc []float64) float64 {
-	v := make([]uint64, m.numTrees)
+	p := m.leafScratch()
+	score := m.scoreInto(doc, *p)
+	m.putLeafScratch(p)
+	return score
+}
+
+// scoreInto is Score over a caller-supplied leaf bitvector, the form that lets a
+// query borrow one buffer and reuse it across every survivor it reranks rather than
+// borrowing per document. The buffer must be numTrees long; it is reset to all-leaves-
+// live at the top, so a buffer reused from a previous score starts clean. The result
+// is identical to Score, which is the per-call-borrow wrapper over this body.
+func (m *Model) scoreInto(doc []float64, v []uint64) float64 {
 	copy(v, m.allOnes)
 	for f := range m.nodes {
 		x := doc[f]

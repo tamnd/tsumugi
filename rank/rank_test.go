@@ -66,6 +66,38 @@ func TestQuickScorerMatchesNaive(t *testing.T) {
 	}
 }
 
+// TestScoreIntoBufferReuse is the pooling-safety gate: a single leaf bitvector
+// borrowed once and reused across a sequence of documents must produce exactly the
+// score each document gets from a fresh Score call, which copies a clean bitvector
+// itself. A buffer that carried a ruled-out leaf from the previous document would
+// drop a tree's score silently, so the check feeds a long enough run that any leaked
+// mask would surface, and reuses the same buffer the cascade's rerank holds for a
+// query's lifetime.
+func TestScoreIntoBufferReuse(t *testing.T) {
+	rng := rand.New(rand.NewSource(11))
+	const numFeatures = 30
+	for forest := 0; forest < 50; forest++ {
+		nTrees := 1 + rng.Intn(60)
+		maxLeaves := 2 + rng.Intn(MaxLeaves-1)
+		trees := make([]*treeNode, nTrees)
+		for i := range trees {
+			trees[i] = randomTree(rng, numFeatures, maxLeaves)
+		}
+		m := Compile(trees, numFeatures)
+		p := m.leafScratch()
+		v := *p
+		for q := 0; q < 100; q++ {
+			doc := randomDoc(rng, numFeatures)
+			want := m.Score(doc)       // fresh clean buffer each call
+			got := m.scoreInto(doc, v) // the buffer reused from the prior document
+			if got != want {
+				t.Fatalf("forest %d doc %d: reused-buffer score %v, fresh score %v", forest, q, got, want)
+			}
+		}
+		m.putLeafScratch(p)
+	}
+}
+
 // TestWorkedTree walks the worked example from the spec: three internal nodes, four
 // leaves, the document that must exit leaf 3, checked against the naive walk.
 func TestWorkedTree(t *testing.T) {

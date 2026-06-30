@@ -32,6 +32,34 @@ func BenchmarkL2Rerank(b *testing.B) {
 	}
 }
 
+// BenchmarkCascadeRerank times the rerank through the cascade, the path that
+// borrows one leaf bitvector per query and reuses it across all survivors rather
+// than per document. It is the allocation gate for doc 11's pooled buffers: a
+// whole query's rerank must allocate only the result slice, no per-document
+// scratch, so the per-op alloc count stays flat as the survivor set grows.
+func BenchmarkCascadeRerank(b *testing.B) {
+	rng := rand.New(rand.NewSource(1))
+	const numFeatures, nTrees, leaves, nDocs = 40, 500, 32, 200
+	trees := make([]*treeNode, nTrees)
+	for i := range trees {
+		trees[i] = randomTree(rng, numFeatures, leaves)
+	}
+	m := Compile(trees, numFeatures)
+	rows := make([][]float64, nDocs+1)
+	cands := make([]Candidate, nDocs)
+	for i := 0; i < nDocs; i++ {
+		rows[i+1] = randomDoc(rng, numFeatures)
+		cands[i] = Candidate{DocID: uint32(i + 1)}
+	}
+	feat := func(id uint32) []float64 { return rows[id] }
+	c := NewCascade(&Linear{Cols: []int{0}, Weights: []float64{1}, RetrievalWeight: 1}, m)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = c.rerank(cands, feat, nDocs)
+	}
+}
+
 // BenchmarkNaiveRerank is the cost baseline the QuickScorer form has to beat: the
 // same 200 documents over the same ensemble with the naive root-to-leaf walk.
 func BenchmarkNaiveRerank(b *testing.B) {
