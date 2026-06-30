@@ -9,6 +9,7 @@ import (
 
 	"github.com/tamnd/tsumugi"
 	"github.com/tamnd/tsumugi/feature"
+	"github.com/tamnd/tsumugi/forward"
 	"github.com/tamnd/tsumugi/lexical"
 	"github.com/tamnd/tsumugi/rank"
 	"github.com/tamnd/tsumugi/vector"
@@ -60,6 +61,15 @@ func buildShardFile(t testing.TB, path string, docs []doc, lo, hi int, nodeBase 
 	lb := lexical.NewBuilder(lexical.DefaultParams())
 	fb := feature.NewBuilder(feature.DefaultSchema(), feature.SchemaVersion)
 	vb := vector.NewBuilder(vecDim).WithSeed(1).WithRerank(true)
+	// The forward region carries the body text the online L2 features decode. Title and url
+	// are left empty, so the online body-BM25 is the only length-normalized online signal a
+	// length-sensitive model can key on; an offline-only model never reads the online columns,
+	// so writing them changes nothing for the existing exactness tests.
+	fwdb := forward.NewBuilder([]forward.Column{
+		{Name: "url", Type: forward.ColString},
+		{Name: "title", Type: forward.ColString},
+		{Name: "body", Type: forward.ColString, Flags: forward.FlagBlob},
+	})
 	var tokens float64
 	for i := 0; i < size; i++ {
 		d := docs[lo+i]
@@ -69,6 +79,7 @@ func buildShardFile(t testing.TB, path string, docs []doc, lo, hi int, nodeBase 
 		for id, v := range d.feats {
 			fb.Set(local, id, v)
 		}
+		fwdb.Set(local, "body", []byte(d.text))
 		if withVec {
 			vb.Add(d.vec)
 		}
@@ -86,6 +97,9 @@ func buildShardFile(t testing.TB, path string, docs []doc, lo, hi int, nodeBase 
 	}
 	if err := w.AddRegion(tsumugi.RegionFeature, tsumugi.CodecZstd, 0, 0, fb.Build()); err != nil {
 		t.Fatalf("add feature: %v", err)
+	}
+	if err := w.AddRegion(tsumugi.RegionForward, tsumugi.CodecZstd, 0, 0, fwdb.Build()); err != nil {
+		t.Fatalf("add forward: %v", err)
 	}
 	if withVec {
 		vregion, err := vb.Build()

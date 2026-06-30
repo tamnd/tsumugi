@@ -30,6 +30,13 @@ type Searcher interface {
 	// child can see. It is the cross-node half of the global idf the broker already
 	// computes across its own shards.
 	DocFreqs(ctx context.Context, terms []string) map[string]uint32
+	// Stats is the node's fleet-wide normalization statistics, the document and field
+	// average lengths and the counts they derive from, so a parent aggregator can fold its
+	// children's stats into the deployment-wide averages and push them back down when the
+	// children were built over separately-partitioned statistics. It is the
+	// length-normalization counterpart to DocFreqs: DocFreqs lets the aggregator unify idf,
+	// Stats lets it unify the BM25F length denominators (doc 11, the partitioned case).
+	Stats() GlobalStats
 }
 
 // Aggregator is the top tier of the serving topology: it holds no shards, it holds a set
@@ -64,8 +71,13 @@ type Aggregator struct {
 // its own shards, so the aggregator gathers the df across every child and pushes one shared
 // idf down at query time (see SearchComplete), which is what makes the merge exact even when
 // the brokers' vocabularies diverge. A deployment that partitions the rest of the statistics
-// across child groups is the case the spec hands a re-run of L2 at the aggregator, which this
-// merge does not yet do (see the package notes).
+// across child groups, where each child's average field lengths describe only its own slice,
+// is handled the same way: the aggregator folds the children's stats into the deployment-wide
+// field averages and pushes those down too, so a broker normalizes BM25F against the unified
+// denominators and its L2 scores land on the same scale as its siblings'. Because the L2 model
+// is pointwise this is exact, the score a broker computes against the unified stats is the
+// score the aggregator would have recomputed, so the merge stays a comparison of comparable
+// scores rather than a re-run of L2 (see SearchComplete).
 func NewAggregator(children []Searcher) *Aggregator {
 	return &Aggregator{children: children, maxConcurrency: runtime.GOMAXPROCS(0)}
 }
@@ -92,6 +104,23 @@ func (a *Aggregator) NumDocs() uint64 {
 		n += c.NumDocs()
 	}
 	return n
+}
+
+// Stats folds the children's fleet-wide statistics into one deployment-wide set of
+// normalization averages. The fold runs over the raw additive accumulators, not the
+// averages, so a token-weighted average comes out right no matter how unevenly the corpus is
+// split across children: a child holding ten million documents pulls the average toward its
+// lengths far harder than one holding ten thousand, the same average a single index over the
+// whole subtree would compute. It is the length-normalization counterpart to DocFreqs and
+// NumDocs, and it is what lets SearchComplete push one shared set of field averages down to
+// children built over separately-partitioned statistics so their L2 scores stay comparable
+// at the merge (doc 11, the partitioned-GlobalStats case).
+func (a *Aggregator) Stats() GlobalStats {
+	var sums statSums
+	for _, c := range a.children {
+		sums = sums.add(sumsFromStats(c.Stats()))
+	}
+	return sums.global()
 }
 
 // DocFreqs sums each term's document frequency across the whole subtree by gathering it
@@ -164,6 +193,23 @@ func (a *Aggregator) SearchComplete(ctx context.Context, q Query) Results {
 	// A query that already carries idf overrides or has no lexical terms skips the gather.
 	if len(q.Terms) > 0 && q.TermIDF == nil {
 		q.TermIDF = idfFromDF(a.DocFreqs(ctx, q.Terms), a.NumDocs())
+	}
+	// Phase two, the length-normalization counterpart to the idf push-down above: a broker
+	// normalizes BM25F by its own fleet average field lengths, which describe only the slice
+	// of the collection its shards hold when the deployment partitions the statistics across
+	// child groups. So the aggregator folds the children's stats into the deployment-wide
+	// field averages and pushes them down, and each broker normalizes against those instead of
+	// its own slice's, which puts every broker's BM25F on one denominator and so its L2 scores
+	// on one scale. This is what makes the cheap comparable-score merge exact for a partitioned
+	// deployment without re-running L2 at the aggregator: the L2 model is pointwise, a
+	// candidate's score is a function of its own feature row and the shared stats alone, so a
+	// broker scoring against the unified stats yields exactly the score the aggregator would
+	// have recomputed (doc 11, "Exactness up the tree", the partitioned-GlobalStats case). A
+	// single-broker deployment, or one whose children already share fleet stats, lands on the
+	// same averages it already had, so the push-down is a no-op there and costs only the fold.
+	if len(q.Terms) > 0 && q.AvgFieldLen == nil {
+		afl := a.Stats().AvgFieldLen
+		q.AvgFieldLen = &afl
 	}
 	results, _ := a.fanOut(ctx, q)
 

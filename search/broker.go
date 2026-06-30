@@ -433,6 +433,16 @@ func (b *Broker) SearchDegraded(ctx context.Context, q Query, level DegradeLevel
 	// its owning shard's per-query extractor, built once and reused across that
 	// shard's survivors. Online extraction runs only over the L1 survivors, the
 	// bounded set the spec's budget allots the per-candidate text work.
+	// The per-field average lengths the online BM25F normalizes by are the broker's own
+	// fleet averages, unless an aggregator above pushed down the deployment-wide averages
+	// for a partitioned collection, in which case the broker normalizes against those so
+	// its L2 scores land on the same scale as its sibling brokers' (doc 11, the
+	// partitioned-GlobalStats case). A single broker serving directly gets q.AvgFieldLen
+	// nil and uses its own averages, unchanged.
+	avgField := st.stats.AvgFieldLen
+	if q.AvgFieldLen != nil {
+		avgField = *q.AvgFieldLen
+	}
 	exts := make([]*onlineExtractor, len(st.shards))
 	l1feat := func(id uint32) []float64 { return feats[id] }
 	l2feat := func(id uint32) []float64 {
@@ -443,7 +453,7 @@ func (b *Broker) SearchDegraded(ctx context.Context, q Query, level DegradeLevel
 		}
 		s := st.shards[si]
 		if exts[si] == nil {
-			exts[si] = s.newOnline(q, q.TermIDF, st.stats.AvgFieldLen)
+			exts[si] = s.newOnline(q, q.TermIDF, avgField)
 		}
 		return s.l2Row(base, exts[si], id-s.nodeBase)
 	}
