@@ -2,6 +2,7 @@ package forward
 
 import (
 	"errors"
+	"unicode/utf8"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/tamnd/tsumugi/codec"
@@ -169,6 +170,27 @@ func (r *Region) ColumnPrefixInto(name string, docID uint32, minBytes int, scrat
 	return value, keep, true
 }
 
+// ColumnPrefixRunesInto is ColumnPrefixInto with the window measured in complete
+// UTF-8 runes rather than bytes, the form the L2 body scan actually wants: the scan
+// reads at most a fixed rune cap, and bounding the decode to that many runes rather
+// than to the cap times the worst-case four bytes a rune takes cuts the common
+// all-ASCII body, where a rune is one byte, from three blocks to one. minRunes is the
+// least number of complete runes the caller needs; the read decodes blocks until the
+// decoded prefix holds that many complete runes (a trailing byte sequence that only
+// begins a multibyte rune does not count, since the next block completes it), or every
+// block for a value shorter than the window. It applies only to a CodecZstdDictBlocked
+// column; for every other codec it falls back to the full ColumnInto decode, the same
+// uniform-caller contract ColumnPrefixInto keeps. The value, kept buffer, and bool
+// follow ColumnInto's contract.
+func (r *Region) ColumnPrefixRunesInto(name string, docID uint32, minRunes int, scratch []byte) (value, keep []byte, ok bool) {
+	ci, ok := r.colIdx[name]
+	if !ok || docID >= r.rows {
+		return nil, scratch, false
+	}
+	value, keep = r.colPrefixRunesInto(ci, docID, minRunes, scratch)
+	return value, keep, true
+}
+
 // colAt slices a value from a column data block by docID. It decodes into a fresh
 // slice; colAtInto is the buffer-reusing form the L2 path calls.
 func (r *Region) colAt(ci int, docID uint32) []byte {
@@ -230,14 +252,43 @@ func (r *Region) colPrefixInto(ci int, docID uint32, minBytes int, scratch []byt
 	return r.decodeBlocked(frame, minBytes, scratch)
 }
 
-// decodeBlocked decodes a CodecZstdDictBlocked value: a uint32 block count, one
+// colPrefixRunesInto is colPrefixInto with the window measured in complete runes, the
+// rune-aware form of the L2 body window. It decodes only the blocks needed to reach
+// minRunes complete runes (or every block for a value shorter than the window) and is a
+// CodecZstdDictBlocked-only path; any other codec returns the full value through
+// colAtInto. A minRunes below zero means decode the whole value.
+func (r *Region) colPrefixRunesInto(ci int, docID uint32, minRunes int, scratch []byte) (value, keep []byte) {
+	c := r.cols[ci]
+	if c.Codec != CodecZstdDictBlocked {
+		return r.colAtInto(ci, docID, scratch)
+	}
+	block := r.b[c.dataOff : c.dataOff+c.dataLen]
+	start := codec.Uint32(block[int(docID)*4:])
+	end := codec.Uint32(block[int(docID+1)*4:])
+	base := (int(r.rows) + 1) * 4
+	frame := block[base+int(start) : base+int(end)]
+	if len(frame) == 0 {
+		return frame, scratch
+	}
+	return r.decodeBlockedWindow(frame, -1, minRunes, scratch)
+}
+
+// decodeBlocked decodes a CodecZstdDictBlocked value to a byte window: see
+// decodeBlockedWindow. A negative minBytes decodes every block.
+func (r *Region) decodeBlocked(frame []byte, minBytes int, scratch []byte) (value, keep []byte) {
+	return r.decodeBlockedWindow(frame, minBytes, -1, scratch)
+}
+
+// decodeBlockedWindow decodes a CodecZstdDictBlocked value: a uint32 block count, one
 // uint32 cumulative end offset per block, then the block frames. It decodes blocks in
 // order, appending each into out so the concatenation reproduces the value, and stops
-// once out holds minBytes decoded bytes; a negative minBytes decodes every block. The
-// kept buffer is out, the (grown) scratch, always caller-owned. A malformed header or
-// a frame that fails to decode, which the container CRC should already have caught,
-// reads back empty rather than panicking, matching colAtInto's defensive decode.
-func (r *Region) decodeBlocked(frame []byte, minBytes int, scratch []byte) (value, keep []byte) {
+// once the window is satisfied. The window is a byte count (minBytes >= 0), a complete-
+// rune count (minRunes >= 0), or unbounded (both negative, decode every block); at most
+// one of minBytes and minRunes is active. The kept buffer is out, the (grown) scratch,
+// always caller-owned. A malformed header or a frame that fails to decode, which the
+// container CRC should already have caught, reads back empty rather than panicking,
+// matching colAtInto's defensive decode.
+func (r *Region) decodeBlockedWindow(frame []byte, minBytes, minRunes int, scratch []byte) (value, keep []byte) {
 	if len(frame) < 4 {
 		return nil, scratch
 	}
@@ -260,11 +311,44 @@ func (r *Region) decodeBlocked(frame []byte, minBytes int, scratch []byte) (valu
 		if err != nil {
 			return nil, scratch
 		}
+		// The window predicate can only save a later block, so it is never evaluated on
+		// the last block: a single-block value (the common small body) skips the rune
+		// count entirely rather than walking a window's worth of runes only to decode the
+		// block it already holds.
+		if k == nblocks-1 {
+			break
+		}
 		if minBytes >= 0 && len(out) >= minBytes {
+			break
+		}
+		if minRunes >= 0 && completeRunesAtLeast(out, minRunes) {
 			break
 		}
 	}
 	return out, out
+}
+
+// completeRunesAtLeast reports whether b holds at least n complete UTF-8 runes. It
+// counts an invalid byte as one rune, the replacement rune a range-over-string loop
+// yields for it, but does not count a trailing byte sequence that only begins a
+// multibyte rune: that sequence is completed by the next block, so counting it would
+// stop the windowed decode one rune short of what the scan reads from a full decode.
+// It stops as soon as it reaches n, so the cost is bounded by the rune target rather
+// than the buffer length.
+func completeRunesAtLeast(b []byte, n int) bool {
+	count := 0
+	for len(b) > 0 {
+		if count >= n {
+			return true
+		}
+		r, size := utf8.DecodeRune(b)
+		if r == utf8.RuneError && size == 1 && !utf8.FullRune(b) {
+			return false
+		}
+		count++
+		b = b[size:]
+	}
+	return count >= n
 }
 
 // Row returns every column value for one document, keyed by column name. It is

@@ -111,18 +111,15 @@ const (
 // for every survivor would blow the L2 budget for no ranking gain. The cap bounds
 // the per-candidate scan to a fixed window, so the tokenization cost is the survivor
 // count times that window, not the corpus's longest document. The body column is
-// stored CodecZstdDictBlocked, so the scan reads it through ColumnPrefixInto, which
-// decodes only the blocks the window spans rather than the whole body frame; a query
-// for a leading window of a multi-hundred-kilobyte page decompresses its first blocks,
-// not all of it, which bounds the decode the cap could not. The byte budget passed
-// down is the rune cap times utf8.UTFMax so the window always holds at least
-// maxBodyScanRunes complete runes. Title and url are short and read in full.
+// stored CodecZstdDictBlocked, so the scan reads it through ColumnPrefixRunesInto,
+// which decodes only the blocks needed to reach maxBodyScanRunes complete runes rather
+// than the whole body frame; a query for a leading window of a multi-hundred-kilobyte
+// page decompresses its first blocks, not all of it, which bounds the decode the cap
+// could not. The window is measured in runes, the same unit the scan stops on, so an
+// all-ASCII body (a rune per byte, the common case for markdown) decodes a single
+// block rather than the three a worst-case-four-bytes-per-rune byte budget would.
+// Title and url are short and read in full.
 const maxBodyScanRunes = 10000
-
-// maxBodyScanBytes is the decoded-byte budget for the body window: the rune cap times
-// the most bytes a rune takes, so decoding to it always yields at least maxBodyScanRunes
-// complete runes for the scan to walk, whatever the body's encoding.
-const maxBodyScanBytes = maxBodyScanRunes * utf8.UTFMax
 
 // newOnlineExtractor analyzes the query once and binds the regions the online
 // features read. idfOf is the per-term idf the broker pushed down, or nil to fall
@@ -309,13 +306,13 @@ func (e *onlineExtractor) scanField(localID uint32, col string, f int) (tf []int
 		e.streamBuf[f] = stream
 		return tf, stream, 0
 	}
-	// The body reads only its leading window, so it decodes through ColumnPrefixInto,
-	// which inflates just the blocks that window spans; title and url are short and
-	// read whole through ColumnInto.
+	// The body reads only its leading window, so it decodes through
+	// ColumnPrefixRunesInto, which inflates just the blocks needed to reach the rune
+	// cap the scan stops on; title and url are short and read whole through ColumnInto.
 	var b, keep []byte
 	var ok bool
 	if f == fBody {
-		b, keep, ok = e.fwd.ColumnPrefixInto(col, localID, maxBodyScanBytes, e.fieldBuf[f])
+		b, keep, ok = e.fwd.ColumnPrefixRunesInto(col, localID, maxBodyScanRunes, e.fieldBuf[f])
 	} else {
 		b, keep, ok = e.fwd.ColumnInto(col, localID, e.fieldBuf[f])
 	}
