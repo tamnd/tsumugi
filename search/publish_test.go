@@ -16,12 +16,22 @@ import (
 // independent files, the unit a publish adds and a retire removes, so a test can build a
 // broker over any subset and swap the rest in and out.
 func buildShardSet(t *testing.T, n, parts int) ([]*Shard, *rank.Model) {
+	shards, _, model := buildShardSetFiles(t, n, parts)
+	return shards, model
+}
+
+// buildShardSetFiles is buildShardSet that also returns each shard's file path, so a test
+// that churns the served set can reopen a retired shard's file as a fresh mapping the way a
+// real reload does, rather than republishing a *Shard pointer the broker may have already
+// reclaimed.
+func buildShardSetFiles(t *testing.T, n, parts int) ([]*Shard, []string, *rank.Model) {
 	t.Helper()
 	docs := makeCorpus(n)
 	dir := t.TempDir()
 	model := trainModel(t)
 	size := n / parts
 	shards := make([]*Shard, parts)
+	paths := make([]string, parts)
 	for p := 0; p < parts; p++ {
 		path := filepath.Join(dir, fmt.Sprintf("shard%d.tsumugi", p))
 		lo := p * size
@@ -31,8 +41,9 @@ func buildShardSet(t *testing.T, n, parts int) ([]*Shard, *rank.Model) {
 			t.Fatalf("open shard %d: %v", p, err)
 		}
 		shards[p] = sh
+		paths[p] = path
 	}
-	return shards, model
+	return shards, paths, model
 }
 
 // idRange is the half-open global id span a shard owns, used to check that a published
@@ -228,10 +239,13 @@ func TestRetireClearsCache(t *testing.T) {
 // retires swap the served set, and every query returns a consistent, complete result over
 // whatever set it loaded. Run under the race detector it checks the atomic snapshot swap
 // has no data race between a query reading the state and a publish or retire storing a new
-// one, and that a retired shard kept mapped until Close is never read after free.
+// one, and that a retired shard is reclaimed only after the last query that loaded it
+// finishes, never read after free. The writer reopens the churn shards from their files
+// each cycle, the way a real reload does, so a republish never reuses a mapping the reclaim
+// may already have unmapped.
 func TestConcurrentQueriesDuringSwap(t *testing.T) {
 	const n, parts = 200, 5
-	shards, model := buildShardSet(t, n, parts)
+	shards, paths, model := buildShardSetFiles(t, n, parts)
 
 	// Serve a stable core of the first three shards; churn the last two in and out.
 	core := parts - 2
@@ -240,6 +254,7 @@ func TestConcurrentQueriesDuringSwap(t *testing.T) {
 
 	coreLo := shards[0].NodeBase()
 	coreHi := shards[core-1].NodeBase() + shards[core-1].DocCount()
+	churnBase := shards[core].NodeBase()
 
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
@@ -270,15 +285,27 @@ func TestConcurrentQueriesDuringSwap(t *testing.T) {
 		}()
 	}
 
-	// Writer: repeatedly publish the two churn shards and retire them again, so the served
-	// set is constantly swapping under the readers.
+	// Writer: repeatedly open the two churn shards fresh, publish them, and retire them again,
+	// so the served set is constantly swapping under the readers and each retire leaves a
+	// mapping for the reclaim to release. Reopening each cycle mirrors a real reload: the old
+	// mapping is reclaimed and the new one is a distinct file mapping.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 200; i++ {
-			b.Publish(shards[core])
-			b.Publish(shards[core+1])
-			b.Retire(func(s *Shard) bool { return s.NodeBase() >= shards[core].NodeBase() })
+			c0, err := OpenShard(paths[core], newTestCascade(model))
+			if err != nil {
+				t.Errorf("reopen churn shard 0: %v", err)
+				break
+			}
+			c1, err := OpenShard(paths[core+1], newTestCascade(model))
+			if err != nil {
+				t.Errorf("reopen churn shard 1: %v", err)
+				break
+			}
+			b.Publish(c0)
+			b.Publish(c1)
+			b.Retire(func(s *Shard) bool { return s.NodeBase() >= churnBase })
 		}
 		close(stop)
 	}()
@@ -288,5 +315,10 @@ func TestConcurrentQueriesDuringSwap(t *testing.T) {
 	// The churn ends with both churn shards retired, so the steady state is the core set.
 	if got := b.NumShards(); got != core {
 		t.Fatalf("after churn NumShards = %d, want %d", got, core)
+	}
+	// Every churn shard opened during the run was retired, and with no query in flight the
+	// reclaim has released all of them, so the broker holds exactly the core mappings open.
+	if got := b.mappedShards(); got != core {
+		t.Fatalf("after churn mappedShards = %d, want %d (retired mappings not reclaimed)", got, core)
 	}
 }
