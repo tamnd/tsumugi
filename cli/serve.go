@@ -37,6 +37,7 @@ func newServeCmd() *cobra.Command {
 		reloadInterval time.Duration
 		peers          []string
 		hedgeDelay     time.Duration
+		binaryWire     bool
 	)
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -50,7 +51,7 @@ func newServeCmd() *cobra.Command {
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if len(peers) > 0 {
-				return runHead(cmd, peers, addr, timeout, cacheSize, maxInFlight, hedgeDelay)
+				return runHead(cmd, peers, addr, timeout, cacheSize, maxInFlight, hedgeDelay, binaryWire)
 			}
 			return runLeaf(cmd, dir, modelP, addr, timeout, cacheSize, maxInFlight, reloadInterval)
 		},
@@ -64,6 +65,7 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().DurationVar(&reloadInterval, "reload-interval", 0, "poll the shard directory at this interval to publish and retire shards (0 disables polling)")
 	cmd.Flags().StringArrayVar(&peers, "peer", nil, "base URL of a leaf node to serve through (repeatable); when set, this process runs as a head node over its peers instead of opening local shards. A comma-separated list of URLs names a set of equivalent replicas of one leaf that the head hedges across for tail latency")
 	cmd.Flags().DurationVar(&hedgeDelay, "hedge-delay", 5*time.Millisecond, "how long to wait for a replica before sending the query to the next one too (only applies to a --peer group that lists multiple replicas)")
+	cmd.Flags().BoolVar(&binaryWire, "binary-wire", false, "dial peers with the dense binary RPC wire instead of JSON (head mode; the peers' handlers understand both, so this is safe to set only at the head)")
 	return cmd
 }
 
@@ -138,8 +140,16 @@ func runLeaf(cmd *cobra.Command, dir, modelP, addr string, timeout time.Duration
 // one leaf: the head dials all of them, makes them one child through a HedgedSearcher, and so
 // hides any single replica's tail latency behind a faster sibling, while the pipeline is built
 // from the first replica of each group since the replicas are equivalent and share a vocabulary.
-func runHead(cmd *cobra.Command, peers []string, addr string, timeout time.Duration, cacheSize, maxInFlight int, hedgeDelay time.Duration) error {
+func runHead(cmd *cobra.Command, peers []string, addr string, timeout time.Duration, cacheSize, maxInFlight int, hedgeDelay time.Duration, binaryWire bool) error {
 	ctx := cmd.Context()
+	// When the deployment asks for the dense wire, every peer dial carries the binary codec
+	// option; the peers' handlers read the request content type and answer in kind, so the head
+	// is the only place this is set. With the flag off, the dials take no option and speak JSON,
+	// the unchanged default.
+	var dialOpts []search.RemoteOption
+	if binaryWire {
+		dialOpts = append(dialOpts, search.WithBinaryWire())
+	}
 	remotes := make([]*search.RemoteSearcher, 0, len(peers))
 	children := make([]search.Searcher, 0, len(peers))
 	for _, p := range peers {
@@ -150,7 +160,7 @@ func runHead(cmd *cobra.Command, peers []string, addr string, timeout time.Durat
 		reps := make([]search.Searcher, 0, len(urls))
 		var first *search.RemoteSearcher
 		for _, u := range urls {
-			rs, err := search.NewRemoteSearcher(ctx, u)
+			rs, err := search.NewRemoteSearcher(ctx, u, dialOpts...)
 			if err != nil {
 				return fmt.Errorf("dial peer %s: %w", u, err)
 			}
