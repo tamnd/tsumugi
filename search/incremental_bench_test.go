@@ -8,7 +8,7 @@ import "testing"
 // base vocabulary, so its cost is proportional to one shard, not the fleet. Compare it to
 // BenchmarkPublishFullRebuild over the same set to see the gap the incremental path opens.
 func BenchmarkPublishIncremental(b *testing.B) {
-	_, shards := benchBroker(b, 20000, 200)
+	_, shards, _, _ := benchBroker(b, 20000, 200)
 	base := newState(shards[:len(shards)-1])
 	spare := shards[len(shards)-1]
 	b.ResetTimer()
@@ -22,7 +22,7 @@ func BenchmarkPublishIncremental(b *testing.B) {
 // every shard's statistics. This is what a publish cost before the overlay, and what the
 // overlay path falls back to only once per overlayLimit publishes.
 func BenchmarkPublishFullRebuild(b *testing.B) {
-	_, shards := benchBroker(b, 20000, 200)
+	_, shards, _, _ := benchBroker(b, 20000, 200)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = newState(shards)

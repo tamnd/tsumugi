@@ -15,7 +15,8 @@ import "math"
 // handled the way every broker read is, against one loaded snapshot, so the enumeration is over
 // a consistent shard set.
 func (b *Broker) ForEachTerm(fn func(term string, df uint32)) {
-	st := b.loadState()
+	st := b.acquire()
+	defer b.release(st)
 	merged := make(map[string]uint64)
 	for _, s := range st.shards {
 		s.ForEachTerm(func(t string, df uint32) {
@@ -37,8 +38,10 @@ func (b *Broker) ForEachTerm(fn func(term string, df uint32)) {
 // and a fleet with no vector region, or one whose regions disagree, leaves it off rather than
 // encode into a width some shard cannot read.
 func (b *Broker) VectorDim() (int, bool) {
+	st := b.acquire()
+	defer b.release(st)
 	dim, ok := 0, false
-	for _, s := range b.loadState().shards {
+	for _, s := range st.shards {
 		d, has := s.VectorDim()
 		if !has {
 			continue

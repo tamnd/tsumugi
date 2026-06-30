@@ -38,16 +38,24 @@ type Broker struct {
 	cascade        *rank.Cascade
 	maxConcurrency int
 
-	// publishMu serializes publish and retire so two swaps build their new state off a
-	// consistent base; a query never takes it, it only loads the state pointer.
-	publishMu sync.Mutex
+	// swapMu serializes shard-set swaps (publish, retire, close) and excludes the brief
+	// load-and-reference a query takes at entry. A swap holds the write lock; a query holds
+	// the read lock only long enough to load the current snapshot and take a reference on
+	// it, never for the query itself. This is what makes the reclaim below safe without a
+	// lock on the query path: a query that has referenced a snapshot can never be racing the
+	// reclaim that frees one of that snapshot's shards, because the reference was taken under
+	// the read lock and the reclaim runs under the write lock.
+	swapMu sync.RWMutex
 
-	// retired holds shards removed from the served set whose file mappings stay mapped
-	// until Close. An in-flight query (including a fan-out goroutine that outlives its
-	// query at the deadline) may still reference a retired shard through the snapshot it
-	// loaded, so closing one at retire time could fault a live read; the mappings are
-	// released together at Close instead.
-	retired []*Shard
+	// mapped counts, per open shard, the number of live snapshots that contain it. A swap
+	// increments the count for the snapshot it installs, and a snapshot that has drained of
+	// in-flight queries decrements the count for its shards; a shard whose count reaches zero
+	// sits in no live snapshot, so no in-flight query can still reach it, and its file mapping
+	// is unmapped then. This is how a retired shard's address space is reclaimed while the
+	// broker runs rather than held until Close, the property a fleet churning shards toward the
+	// 100k-shard target needs so retired mappings do not accumulate for the life of the process.
+	// It is only ever touched under swapMu's write lock.
+	mapped map[*Shard]int
 
 	// cache is the optional result cache (doc 11). It is nil unless a deployment wires
 	// one, so a broker without a cache runs every query through the cascade unchanged. A
@@ -62,6 +70,14 @@ type brokerState struct {
 	shards  []*Shard
 	routing *RoutingIndex
 	stats   GlobalStats
+
+	// queryRefs counts the references on this snapshot: one owner reference held while it is
+	// the current served set, plus one per in-flight query that has loaded it. The owner
+	// reference is dropped when a swap supersedes the snapshot; the count reaches zero only
+	// after the snapshot is no longer current and every query that loaded it has finished, at
+	// which point its retired shards are safe to unmap. It is set to one when the snapshot is
+	// installed; a freshly constructed snapshot starts at zero until then.
+	queryRefs atomic.Int64
 
 	// baseN is the number of shards the routing index covers: shards[:baseN] are routed by
 	// the base index and shards[baseN:] by the overlay, the shards published since the last
@@ -122,21 +138,94 @@ func NewBrokerWith(shards []*Shard, cascade *rank.Cascade, routing *RoutingIndex
 	b := &Broker{
 		cascade:        cascade,
 		maxConcurrency: runtime.GOMAXPROCS(0),
+		mapped:         make(map[*Shard]int, len(shards)),
 	}
-	b.state.Store(&brokerState{
+	st := &brokerState{
 		shards:  shards,
 		baseN:   len(shards),
 		routing: routing,
 		sums:    sumsFromStats(stats),
 		stats:   stats,
-	})
+	}
+	st.queryRefs.Store(1)
+	for _, s := range shards {
+		b.mapped[s]++
+	}
+	b.state.Store(st)
 	return b
 }
 
-// state loads the current serving snapshot. A query calls it once at entry and uses the
-// returned snapshot to completion, so a concurrent publish or retire never splits a
-// single query across two shard sets.
+// loadState loads the current serving snapshot without taking a reference, for the scalar
+// reads (shard count, statistics) that return a value and never touch a shard's mapping, so
+// a concurrent reclaim of a superseded snapshot cannot fault them. A path that reads shard
+// data must go through acquire instead so the snapshot's shards stay mapped while it runs.
 func (b *Broker) loadState() *brokerState { return b.state.Load() }
+
+// acquire loads the current snapshot and takes a reference on it, so the snapshot's shards
+// stay mapped for the whole query even if a concurrent retire supersedes the snapshot and
+// the query outlives the swap. The read lock is held only for the load-and-reference, not
+// for the query: it serializes against a swap's write lock just long enough that the
+// reference is taken before the snapshot can be superseded, which is what keeps the matching
+// release from racing the reclaim. Every acquire must be paired with a release.
+func (b *Broker) acquire() *brokerState {
+	b.swapMu.RLock()
+	st := b.state.Load()
+	st.queryRefs.Add(1)
+	b.swapMu.RUnlock()
+	return st
+}
+
+// release drops a query's reference on a snapshot. When the count reaches zero the snapshot
+// is no longer current and no query still holds it, so its shards can be reclaimed; the
+// common case, a query against the still-current snapshot, never reaches zero because the
+// owner reference keeps the count above it, so release takes no lock at all. Only the last
+// query on a superseded snapshot pays the write lock to run the reclaim.
+func (b *Broker) release(st *brokerState) {
+	if st.queryRefs.Add(-1) == 0 {
+		b.swapMu.Lock()
+		b.reclaim(st)
+		b.swapMu.Unlock()
+	}
+}
+
+// reclaim drops one snapshot's contribution to the per-shard mapping counts and unmaps every
+// shard the snapshot was the last live holder of. A survivor shared with the current snapshot
+// keeps a positive count and stays mapped; a shard retired before this snapshot drained falls
+// to zero and is closed exactly once. The caller holds swapMu's write lock, so the counts and
+// the close run without racing a swap or another reclaim.
+func (b *Broker) reclaim(st *brokerState) {
+	for _, s := range st.shards {
+		c, ok := b.mapped[s]
+		if !ok {
+			// Already released, by an earlier reclaim or by Close clearing the table at
+			// shutdown. A reference dropped after Close lands here and closes nothing twice.
+			continue
+		}
+		if c <= 1 {
+			delete(b.mapped, s)
+			_ = s.Close()
+		} else {
+			b.mapped[s] = c - 1
+		}
+	}
+}
+
+// installState makes ns the current snapshot: it takes ns's owner reference, counts ns's
+// shards into the mapping table, swaps the pointer, and drops the superseded snapshot's owner
+// reference, reclaiming it immediately when no query still holds it. The caller holds swapMu's
+// write lock, so the mapping-count updates and the pointer swap are atomic with respect to a
+// query's acquire and to another swap.
+func (b *Broker) installState(ns *brokerState) {
+	ns.queryRefs.Store(1)
+	for _, s := range ns.shards {
+		b.mapped[s]++
+	}
+	old := b.state.Load()
+	b.state.Store(ns)
+	if old.queryRefs.Add(-1) == 0 {
+		b.reclaim(old)
+	}
+}
 
 // Publish swaps in a serving snapshot that includes shard, then clears the result cache
 // (doc 11 publish lifecycle): a new shard can hold a document that belongs in a cached
@@ -145,40 +234,48 @@ func (b *Broker) loadState() *brokerState { return b.state.Load() }
 // swap is atomic, so a query in flight finishes against the snapshot it loaded and the
 // next query sees the new shard.
 func (b *Broker) Publish(shard *Shard) {
-	b.publishMu.Lock()
-	cur := b.state.Load()
-	b.state.Store(cur.withShard(shard))
-	b.publishMu.Unlock()
+	b.swapMu.Lock()
+	b.installState(b.state.Load().withShard(shard))
+	b.swapMu.Unlock()
 	b.invalidateCache()
 }
 
 // Retire removes every served shard the predicate selects, swaps in a snapshot over the
 // survivors, and clears the result cache (the mirror of Publish): a retired shard can
 // remove a document from a cached query's top-k, so the cache is dropped on a retire the
-// same way. It returns the number of shards retired. A retired shard's file mapping is
-// kept mapped until Close because an in-flight query may still reference it; the swap
-// only stops new queries from seeing it.
+// same way. It returns the number of shards retired. A retired shard's mapping is held
+// until the last query that loaded a snapshot containing it finishes, then unmapped by the
+// reclaim, so the retire never faults an in-flight reader yet does not leak the mapping for
+// the life of the broker.
 func (b *Broker) Retire(pred func(*Shard) bool) int {
-	b.publishMu.Lock()
+	b.swapMu.Lock()
 	cur := b.state.Load()
 	keep := make([]*Shard, 0, len(cur.shards))
-	var removed []*Shard
+	removed := 0
 	for _, s := range cur.shards {
 		if pred(s) {
-			removed = append(removed, s)
+			removed++
 		} else {
 			keep = append(keep, s)
 		}
 	}
-	if len(removed) == 0 {
-		b.publishMu.Unlock()
+	if removed == 0 {
+		b.swapMu.Unlock()
 		return 0
 	}
-	b.state.Store(newState(keep))
-	b.retired = append(b.retired, removed...)
-	b.publishMu.Unlock()
+	b.installState(newState(keep))
+	b.swapMu.Unlock()
 	b.invalidateCache()
-	return len(removed)
+	return removed
+}
+
+// mappedShards is the number of distinct shard mappings the broker currently holds open,
+// the current snapshot's shards plus any retired shards a still-draining snapshot keeps
+// mapped. A test watches it fall as retired shards are reclaimed.
+func (b *Broker) mappedShards() int {
+	b.swapMu.RLock()
+	defer b.swapMu.RUnlock()
+	return len(b.mapped)
 }
 
 // invalidateCache clears the result cache if one is wired, the step a publish or retire
@@ -227,30 +324,23 @@ func (b *Broker) RoutingBytes() int {
 	return st.routing.sizeBytes() + st.overlaySize()
 }
 
-// Close releases every shard's file mapping, both the currently served set and the
-// shards retired during the broker's life that were kept mapped for in-flight queries.
-// It is the single point those retired mappings are released, so a long-lived broker
-// that retires shards reclaims their address space at shutdown. Each distinct shard is
-// closed once: a shard that was published, retired, and published again can appear both
-// in the served set and the retired list, and a munmap runs exactly once per mapping.
+// Close releases every shard mapping the broker still holds open: the current snapshot's
+// shards and any retired shard a still-draining snapshot kept mapped. During the broker's
+// life the reclaim unmaps a retired shard as soon as the last query holding it finishes, so
+// at a clean shutdown the mapping table is usually just the current set; Close is the
+// backstop that releases whatever remains. The table holds each distinct mapping once, so a
+// munmap runs exactly once per mapping. It assumes no query is in flight, the caller's
+// contract, so it does not wait on references.
 func (b *Broker) Close() error {
+	b.swapMu.Lock()
+	defer b.swapMu.Unlock()
 	var first error
-	seen := make(map[*Shard]struct{})
-	closeOnce := func(s *Shard) {
-		if _, ok := seen[s]; ok {
-			return
-		}
-		seen[s] = struct{}{}
+	for s := range b.mapped {
 		if err := s.Close(); err != nil && first == nil {
 			first = err
 		}
 	}
-	for _, s := range b.loadState().shards {
-		closeOnce(s)
-	}
-	for _, s := range b.retired {
-		closeOnce(s)
-	}
+	b.mapped = make(map[*Shard]int)
 	return first
 }
 
@@ -371,11 +461,14 @@ func (b *Broker) SearchWithinBudget(ctx context.Context, q Query) Results {
 // smaller set rather than an unranked one. The drop-a-slow-shard-at-the-deadline step
 // is orthogonal and automatic in the fan-out at any level, reported through Complete.
 func (b *Broker) SearchDegraded(ctx context.Context, q Query, level DegradeLevel) Results {
-	// Load the served snapshot once at entry and use it to the end. A concurrent publish
-	// or retire swaps in a new snapshot for the next query, but this query routes, gathers
-	// idf, fans out, and reranks against one consistent shard set, so a swap never splits a
-	// query across two sets or references a shard the snapshot it loaded does not hold.
-	st := b.loadState()
+	// Load the served snapshot once at entry, take a reference on it, and use it to the end.
+	// A concurrent publish or retire swaps in a new snapshot for the next query, but this
+	// query routes, gathers idf, fans out, and reranks against one consistent shard set, so a
+	// swap never splits a query across two sets. The reference keeps the snapshot's shards
+	// mapped until the query finishes even if a retire supersedes the snapshot mid-query, so a
+	// retired shard is reclaimed only after this query lets go of it, never under its read.
+	st := b.acquire()
+	defer b.release(st)
 	d := degradationFor(level)
 	// Analyze the query once at the broker and ship the term set to every shard, so the
 	// analysis chain runs one time per query rather than once per shard the fan-out
@@ -591,7 +684,8 @@ func (b *Broker) DocFreqs(ctx context.Context, terms []string) map[string]uint32
 	if len(terms) == 0 {
 		return nil
 	}
-	st := b.loadState()
+	st := b.acquire()
+	defer b.release(st)
 	return b.gatherDF(ctx, st, terms, st.routeTerms(terms))
 }
 
