@@ -242,7 +242,12 @@ func (s *Shard) retrieve(ctx context.Context, q Query) (lex, dense []scored, fea
 		return lex, dense, feats, false
 	}
 	if s.lex != nil && len(q.lexTerms()) > 0 {
-		cands, err := s.lexSearch(q, k)
+		cands, err := s.lexSearch(ctx, q, k)
+		if errors.Is(err, context.Canceled) {
+			// The deadline passed inside the WAND traversal, which abandoned its
+			// postings walk and handed back a partial. Drop the whole shard.
+			return lex, dense, feats, false
+		}
 		if err == nil {
 			for i, c := range cands {
 				if (i&retrievePreemptStride) == 0 && ctx.Err() != nil {
@@ -259,7 +264,11 @@ func (s *Shard) retrieve(ctx context.Context, q Query) (lex, dense []scored, fea
 		return lex, dense, feats, false
 	}
 	if s.sp != nil && len(q.Sparse) > 0 {
-		for i, c := range s.sp.Search(q.Sparse, k) {
+		cands, completed := s.sp.SearchCtx(ctx, q.Sparse, k)
+		if !completed {
+			return lex, dense, feats, false
+		}
+		for i, c := range cands {
 			if (i&retrievePreemptStride) == 0 && ctx.Err() != nil {
 				return lex, dense, feats, false
 			}
@@ -273,7 +282,11 @@ func (s *Shard) retrieve(ctx context.Context, q Query) (lex, dense []scored, fea
 		return lex, dense, feats, false
 	}
 	if s.vec != nil && len(q.Vector) > 0 {
-		for i, c := range s.vec.Search(q.Vector, k, vector.DefaultEfSearch, vector.DefaultRerankDepth) {
+		cands, completed := s.vec.SearchCtx(ctx, q.Vector, k, vector.DefaultEfSearch, vector.DefaultRerankDepth)
+		if !completed {
+			return lex, dense, feats, false
+		}
+		for i, c := range cands {
 			if (i&retrievePreemptStride) == 0 && ctx.Err() != nil {
 				return lex, dense, feats, false
 			}
@@ -290,12 +303,12 @@ func (s *Shard) retrieve(ctx context.Context, q Query) (lex, dense []scored, fea
 // the broker's pushed-down collection-wide idf when the query carries one and the
 // shard's local idf otherwise. The term set is the broker's pre-analyzed Terms when
 // present, so the shard does not re-run the analysis chain on the fan-out path.
-func (s *Shard) lexSearch(q Query, k int) ([]lexical.Candidate, error) {
+func (s *Shard) lexSearch(ctx context.Context, q Query, k int) ([]lexical.Candidate, error) {
 	terms := q.lexTerms()
 	if q.TermIDF != nil {
-		return s.lex.SearchTermsWithIDF(terms, k, q.TermIDF)
+		return s.lex.SearchTermsWithIDFCtx(ctx, terms, k, q.TermIDF)
 	}
-	return s.lex.SearchTerms(terms, k)
+	return s.lex.SearchTermsCtx(ctx, terms, k)
 }
 
 // LexDocFreqs returns the local document frequency of each query term this shard's

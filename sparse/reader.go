@@ -1,11 +1,20 @@
 package sparse
 
 import (
+	"context"
 	"errors"
 	"sort"
 
 	"github.com/tamnd/tsumugi/codec"
 )
+
+// rangePreemptStride bounds how often the pruned range walk polls the query context for a
+// passed deadline: once every stride+1 ranges, a power of two minus one so the test is one
+// bitwise and. The poll stays off the hot path because reading a cancellable context's Err
+// touches its mutex; polling every range would tax the common case where the budget holds
+// and the walk runs to its anytime stop. A shard preempted at the deadline stops scoring
+// ranges rather than finishing a walk no one will read.
+const rangePreemptStride = 1023
 
 // ErrCorrupt is returned when the region bytes do not parse as a valid IMP1
 // region or fail the header CRC.
@@ -159,9 +168,20 @@ type rangeBound struct {
 // integers, one for inference-free retrieval, so the scoring is exact integer
 // arithmetic and the result matches SearchExhaustive bit for bit.
 func (r *Region) Search(query map[string]int, k int) []Result {
+	res, _ := r.SearchCtx(context.Background(), query, k)
+	return res
+}
+
+// SearchCtx is Search threaded with the query's context: the pruned range walk polls the
+// context on a stride and abandons mid-walk if the deadline passes, returning
+// completed=false. A shard preempted at the deadline on the broker fan-out stops scoring
+// ranges in flight rather than finishing a walk whose result will be discarded; the
+// partial top-k it returns on an abandoned walk is meant to be discarded. Search keeps the
+// un-budgeted signature, delegating with a background context that never trips.
+func (r *Region) SearchCtx(ctx context.Context, query map[string]int, k int) ([]Result, bool) {
 	qts := r.loadQuery(query)
 	if len(qts) == 0 || k <= 0 {
-		return nil
+		return nil, true
 	}
 
 	// Per-range upper bound: sum over query terms of weight * block-max in range.
@@ -185,7 +205,10 @@ func (r *Region) Search(query map[string]int, k int) []Result {
 	h := &topK{k: k}
 	scratch := make([]int64, r.blockSize)
 	touched := make([]uint32, 0, r.blockSize)
-	for _, rb := range ranges {
+	for i, rb := range ranges {
+		if (i&rangePreemptStride) == 0 && ctx.Err() != nil {
+			return h.sorted(), false
+		}
 		// Anytime stop: ranges are in descending bound order, so once a range
 		// cannot beat the weakest kept candidate, none after it can either.
 		if h.full() && rb.bound < h.threshold() {
@@ -193,7 +216,7 @@ func (r *Region) Search(query map[string]int, k int) []Result {
 		}
 		r.scoreRange(qts, rb.rid, scratch, &touched, h)
 	}
-	return h.sorted()
+	return h.sorted(), true
 }
 
 // scoreRange sums the exact weighted impact of every document in one range and

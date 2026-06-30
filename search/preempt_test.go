@@ -94,11 +94,12 @@ func TestRetrieveSkipsDensePlaneAfterDeadline(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 
-	// Err calls for a lexical+dense query on an n<stride shard: entry (1), lexical loop i=0
-	// (2), the before-sparse boundary (3), the before-dense boundary (4). Trip on the 4th so
-	// the lexical plane completes and the dense plane is abandoned at its boundary.
+	// Err calls for a lexical+dense query on an n<stride shard: entry (1), the WAND's own
+	// step-0 poll inside the lexical walk (2), the lexical feats loop i=0 (3), the
+	// before-sparse boundary (4), the before-dense boundary (5). Trip on the 5th so the
+	// lexical plane completes and the dense plane is abandoned at its boundary.
 	calls := 0
-	ctx := tripContext{Context: context.Background(), calls: &calls, tripAt: 3}
+	ctx := tripContext{Context: context.Background(), calls: &calls, tripAt: 4}
 	q := Query{Text: "common document", K: 5, Vector: docs[0].vec}
 	lex, dense, _, completed := s.retrieve(ctx, q)
 	if completed {
@@ -129,16 +130,53 @@ func TestRetrievePreemptsWithinLexicalPlane(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 
-	// Err calls: entry (1), lexical loop i=0 (2), lexical loop i=stride+1 (3). Trip on the 3rd
-	// so the scan stops at the second poll, having gathered exactly the first stride+1 rows.
+	// Err calls (n below the WAND stride, so the walk itself polls only once): entry (1),
+	// the WAND's step-0 poll (2), lexical feats loop i=0 (3), lexical feats loop i=stride+1
+	// (4). Trip on the 4th so the feats scan stops at its second poll, having gathered
+	// exactly the first stride+1 rows. This pins the in-retrieve feats-loop poll, the layer
+	// above the walk's own preemption.
 	calls := 0
-	ctx := tripContext{Context: context.Background(), calls: &calls, tripAt: 2}
+	ctx := tripContext{Context: context.Background(), calls: &calls, tripAt: 3}
 	lex, _, _, completed := s.retrieve(ctx, Query{Text: "common document", K: n})
 	if completed {
 		t.Fatalf("retrieve preempted mid-plane reported completed")
 	}
 	if want := retrievePreemptStride + 1; len(lex) != want {
 		t.Fatalf("mid-plane preemption gathered %d candidates, want %d (one stride)", len(lex), want)
+	}
+}
+
+// TestRetrieveAbandonsInsideLexicalWalk proves the deadline now cuts the postings walk
+// itself, not just the boundaries around it: on a shard whose lexical plane scores more
+// than one WAND stride of documents, a deadline that passes during the traversal makes the
+// WAND abandon mid-list and hand back context.Canceled, which retrieve treats as a dropped
+// shard. This is the win this slice adds over the boundary-and-feats-loop preemption: a
+// single long in-progress plane stops in flight rather than running to its end.
+func TestRetrieveAbandonsInsideLexicalWalk(t *testing.T) {
+	const n = 1024*2 + 50 // more than two WAND strides, so the walk polls more than once
+	docs := makeCorpus(n)
+	dir := t.TempDir()
+	path := dir + "/shard.tsumugi"
+	buildShardFile(t, path, docs, 0, n, 0, false)
+	model := trainModel(t)
+	s, err := OpenShard(path, newTestCascade(model))
+	if err != nil {
+		t.Fatalf("open shard: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	// Err calls: retrieve entry (1), the WAND's step-0 poll (2), the WAND's next stride poll
+	// at step 1024 (3). Trip on the 3rd so the deadline lands inside the WAND traversal, well
+	// before the walk would finish, and the shard is dropped from the walk rather than at a
+	// plane boundary.
+	calls := 0
+	ctx := tripContext{Context: context.Background(), calls: &calls, tripAt: 2}
+	lex, _, _, completed := s.retrieve(ctx, Query{Text: "common document", K: n})
+	if completed {
+		t.Fatalf("retrieve abandoned inside the WAND walk reported completed")
+	}
+	if len(lex) != 0 {
+		t.Fatalf("a shard dropped on a cancelled lexical walk should contribute no candidates, got %d", len(lex))
 	}
 }
 

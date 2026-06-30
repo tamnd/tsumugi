@@ -1,6 +1,7 @@
 package vector
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
@@ -226,7 +227,8 @@ func (d *Delta) Search(query []float32, k, efSearch, efDelta, rerankDepth int) [
 	var merged []gcand
 
 	if r.h.count > 0 {
-		for _, c := range r.walk(r.navDist(qRot, qc), efSearch) {
+		regionCands, _ := r.walk(context.Background(), r.navDist(qRot, qc), efSearch)
+		for _, c := range regionCands {
 			if d.isTomb(uint32(c.id)) {
 				continue
 			}
@@ -319,9 +321,10 @@ func (d *Delta) rerankScore(local int32, qRot []float32, qc queryCode) float64 {
 // walk beams the delta graph under the supplied query distance, the same beamSearchQ
 // that drives the immutable region, here reading neighbors from the in-RAM graph.
 func (d *Delta) walk(distQ func(int32) float64, ef int) []cand {
-	return beamSearchQ(distQ, d.g.entry, d.g.maxLayer, ef,
+	cands, _ := beamSearchQ(context.Background(), distQ, d.g.entry, d.g.maxLayer, ef,
 		func(node int32, layer int) []int32 { return d.g.neighbors(node, layer) },
 		func(node int32) []int32 { return d.g.neighbors(node, 0) })
+	return cands
 }
 
 // Compact folds the delta into the immutable region by rebuilding the whole shard over
