@@ -102,11 +102,17 @@ func (c *Cascade) Rank(lexical, dense []uint32, l1feat, l2feat FeatureFunc, k in
 }
 
 // rerank scores each survivor with the L2 model and returns the top-k by the
-// ordinal score, ties to the smaller docID.
+// ordinal score, ties to the smaller docID. It borrows one leaf bitvector from the
+// model's pool and reuses it across every survivor, returning it when the rerank is
+// done, so a query's whole rerank allocates no per-document scratch (doc 11, the
+// cascade's pooled buffers held for the query's lifetime).
 func (c *Cascade) rerank(cands []Candidate, feat FeatureFunc, k int) []Candidate {
 	scored := make([]Candidate, len(cands))
+	p := c.L2.leafScratch()
+	defer c.L2.putLeafScratch(p)
+	v := *p
 	for i, cd := range cands {
-		scored[i] = Candidate{DocID: cd.DocID, Score: c.L2.Score(feat(cd.DocID))}
+		scored[i] = Candidate{DocID: cd.DocID, Score: c.L2.scoreInto(feat(cd.DocID), v)}
 	}
 	sort.Slice(scored, func(i, j int) bool {
 		if scored[i].Score != scored[j].Score {
