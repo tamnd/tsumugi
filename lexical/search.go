@@ -1,6 +1,10 @@
 package lexical
 
-import "github.com/tamnd/tsumugi/codec"
+import (
+	"context"
+
+	"github.com/tamnd/tsumugi/codec"
+)
 
 // DefaultK is the L0 candidate count a shard returns, the value the ranking
 // cascade consumes.
@@ -63,7 +67,7 @@ func (r *Region) SearchWithIDF(query string, k int, idfOf map[string]float64) ([
 }
 
 func (r *Region) search(query string, k int, idfOf map[string]float64) ([]Candidate, error) {
-	return r.searchInfos(r.queryTerms(query, idfOf), k)
+	return r.searchInfos(context.Background(), r.queryTerms(query, idfOf), k)
 }
 
 // SearchTerms is Search over an already-analyzed term set, the path the broker takes
@@ -72,17 +76,39 @@ func (r *Region) search(query string, k int, idfOf map[string]float64) ([]Candid
 // is the spec's analyze-once-at-broker rule: the chain runs one time per query, not
 // once per shard the fan-out visits.
 func (r *Region) SearchTerms(terms []string, k int) ([]Candidate, error) {
-	return r.searchInfos(r.termInfos(terms, nil), k)
+	return r.searchInfos(context.Background(), r.termInfos(terms, nil), k)
+}
+
+// SearchTermsCtx is SearchTerms threaded with the query's context: the BlockMax-WAND
+// traversal polls the context on a stride and abandons the postings walk if the deadline
+// passes mid-list, returning context.Canceled with the partial it gathered. A shard
+// preempted at the deadline on the broker fan-out stops decoding postings in flight
+// rather than finishing a traversal whose result will be discarded.
+func (r *Region) SearchTermsCtx(ctx context.Context, terms []string, k int) ([]Candidate, error) {
+	return r.searchInfos(ctx, r.termInfos(terms, nil), k)
 }
 
 // SearchTermsWithIDF is SearchTerms with the per-term idf supplied from outside, the
 // broker's pushed-down collection-wide idf, so every shard scores a term against the
 // same df and N over the term set the broker already analyzed.
 func (r *Region) SearchTermsWithIDF(terms []string, k int, idfOf map[string]float64) ([]Candidate, error) {
-	return r.searchInfos(r.termInfos(terms, idfOf), k)
+	return r.searchInfos(context.Background(), r.termInfos(terms, idfOf), k)
 }
 
-func (r *Region) searchInfos(infos []termInfo, k int) ([]Candidate, error) {
+// SearchTermsWithIDFCtx is SearchTermsWithIDF threaded with the query's context, the path
+// the broker fan-out takes with the pushed-down collection-wide idf: it abandons the
+// traversal with context.Canceled if the deadline passes, the deadline-aware counterpart
+// the shard preemption needs while still scoring every term against the broker's df.
+func (r *Region) SearchTermsWithIDFCtx(ctx context.Context, terms []string, k int, idfOf map[string]float64) ([]Candidate, error) {
+	return r.searchInfos(ctx, r.termInfos(terms, idfOf), k)
+}
+
+// searchInfos opens a cursor per term and runs the pruned BlockMax-WAND traversal under
+// ctx. When the traversal is preempted at the deadline it returns the partial it gathered
+// with context.Canceled, so the caller drops the shard rather than treating a half-walked
+// list as a complete answer. A context with no deadline (context.Background) never trips,
+// so the un-budgeted callers keep their old behavior.
+func (r *Region) searchInfos(ctx context.Context, infos []termInfo, k int) ([]Candidate, error) {
 	if len(infos) == 0 {
 		return nil, nil
 	}
@@ -94,7 +120,11 @@ func (r *Region) searchInfos(infos []termInfo, k int) ([]Candidate, error) {
 		}
 		cursors = append(cursors, c)
 	}
-	return r.blockMaxWAND(cursors, k), nil
+	cands, completed := r.blockMaxWAND(ctx, cursors, k)
+	if !completed {
+		return cands, context.Canceled
+	}
+	return cands, nil
 }
 
 // DocFreqs returns the local document frequency of each distinct analyzed query term

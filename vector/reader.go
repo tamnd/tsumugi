@@ -1,6 +1,7 @@
 package vector
 
 import (
+	"context"
 	"math"
 	"sort"
 	"unsafe"
@@ -230,8 +231,20 @@ func normF32(v []float32) float64 {
 // recall; rerankDepth bounds how many candidates get the sharp int8 refine. Pass
 // zero for either to take the defaults.
 func (r *Region) Search(query []float32, k, efSearch, rerankDepth int) []Result {
+	res, _ := r.SearchCtx(context.Background(), query, k, efSearch, rerankDepth)
+	return res
+}
+
+// SearchCtx is Search threaded with the query's context: the layer-0 beam polls the
+// context on a stride and abandons the graph walk if the deadline passes mid-descent,
+// returning completed=false. A shard preempted at the deadline (broker fan-out) stops
+// the most expensive plane in flight rather than finishing an ANN walk no one will read;
+// the partial top-k it returns on an abandoned walk is meant to be discarded. Search
+// keeps the un-budgeted signature for callers with no deadline, delegating with a
+// background context that never cancels.
+func (r *Region) SearchCtx(ctx context.Context, query []float32, k, efSearch, rerankDepth int) ([]Result, bool) {
 	if r.h.count == 0 || k <= 0 {
-		return nil
+		return nil, true
 	}
 	if efSearch <= 0 {
 		efSearch = DefaultEfSearch
@@ -242,8 +255,8 @@ func (r *Region) Search(query []float32, k, efSearch, rerankDepth int) []Result 
 	qRot := r.rot.rotate(query)
 	qc := encodeQuery(qRot)
 
-	cands := r.walk(r.navDist(qRot, qc), efSearch)
-	return r.rerankAndTop(qRot, qc, cands, k, rerankDepth)
+	cands, completed := r.walk(ctx, r.navDist(qRot, qc), efSearch)
+	return r.rerankAndTop(qRot, qc, cands, k, rerankDepth), completed
 }
 
 // navDist returns the navigation metric for the walk, where smaller is nearer.
@@ -285,8 +298,8 @@ func (r *Region) navDist(qRot []float32, qc queryCode) func(int32) float64 {
 // delegates to beamSearchQ with the region's mapped link accessors, the same routine the
 // delta graph walks with its in-RAM links, so the immutable and delta halves of a union
 // search navigate identically.
-func (r *Region) walk(distQ func(int32) float64, efSearch int) []cand {
-	return beamSearchQ(distQ, int32(r.h.entryPoint), int(r.h.maxLayer), efSearch,
+func (r *Region) walk(ctx context.Context, distQ func(int32) float64, efSearch int) ([]cand, bool) {
+	return beamSearchQ(ctx, distQ, int32(r.h.entryPoint), int(r.h.maxLayer), efSearch,
 		r.links.neighborsUpper, r.links.neighbors0)
 }
 

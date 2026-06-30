@@ -1,6 +1,7 @@
 package lexical
 
 import (
+	"context"
 	"sort"
 
 	"github.com/tamnd/tsumugi/codec"
@@ -8,6 +9,14 @@ import (
 
 // sentinel marks an exhausted cursor: a docID past every real one.
 const sentinel = ^uint32(0)
+
+// wandPreemptStride bounds how often the BlockMax-WAND traversal polls the query context
+// for a passed deadline: once every stride+1 pivot steps, a power of two minus one so the
+// test is one bitwise and. The poll stays off the hot path because reading a cancellable
+// context's Err touches its mutex; polling every pivot would tax the common case where the
+// budget holds and the whole list is traversed. A shard preempted at the deadline stops
+// decoding postings mid-list rather than finishing a traversal no one will read.
+const wandPreemptStride = 1023
 
 // cursor walks one term's docID-ordered posting list. It decodes block bodies
 // lazily and skips whole blocks using the per-block last-docID, so advancing far
@@ -203,13 +212,23 @@ func (r *Region) scoreDoc(cursors []*cursor, docID uint32) int32 {
 // Every comparison against the threshold is >= rather than >, so a document whose
 // upper bound merely equals the threshold is still evaluated: it can tie on score
 // and win the docID tiebreak, and the result must match the oracle on ties too.
-func (r *Region) blockMaxWAND(cursors []*cursor, k int) []Candidate {
+//
+// It polls ctx on a stride and reports completed=false if the deadline passes mid-
+// traversal, so a shard preempted at the deadline stops decoding postings rather than
+// finishing the walk; the candidates returned on an abandoned traversal are an arbitrary
+// partial meant to be discarded.
+func (r *Region) blockMaxWAND(ctx context.Context, cursors []*cursor, k int) (cands []Candidate, completed bool) {
 	tk := newTopK(k)
 	n := len(cursors)
+	steps := 0
 	for {
+		if (steps&wandPreemptStride) == 0 && ctx.Err() != nil {
+			return tk.results(), false
+		}
+		steps++
 		sort.Slice(cursors, func(i, j int) bool { return cursors[i].cur < cursors[j].cur })
 		if cursors[0].cur == sentinel {
-			return tk.results()
+			return tk.results(), true
 		}
 
 		// WAND tier: the pivot is the first cursor whose cumulative list-wide max
@@ -230,7 +249,7 @@ func (r *Region) blockMaxWAND(cursors []*cursor, k int) []Candidate {
 			}
 		}
 		if pivot < 0 {
-			return tk.results()
+			return tk.results(), true
 		}
 		pivotDoc := cursors[pivot].cur
 

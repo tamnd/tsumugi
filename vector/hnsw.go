@@ -1,10 +1,20 @@
 package vector
 
 import (
+	"context"
 	"math"
 	"math/rand"
 	"sort"
 )
+
+// beamPreemptStride bounds how often the layer-0 beam polls the query context for a
+// passed deadline: once every stride+1 popped candidates, a power of two minus one so
+// the test is a single bitwise and. The poll is off the hot path because reading a
+// cancellable context's Err touches its mutex, so polling every candidate would tax the
+// common case where the budget holds and the whole beam runs. Polling once per 1024 pops
+// abandons a long walk within a fraction of it while costing nothing measurable when the
+// deadline is not near.
+const beamPreemptStride = 1023
 
 // hnswGraph is the in-memory navigable small-world graph. The build distance is a
 // pluggable kernel over the node indices (distFn): the spec builds over the symmetric
@@ -95,11 +105,15 @@ func (g *hnswGraph) addNode(efConstruction int) int32 {
 // nearer): greedy through the upper layers from entry, then a width-efSearch beam on layer
 // 0. The graph shape is supplied through the neighbor accessors so the same routine drives
 // both the immutable region (links read from the mapping) and the in-RAM delta graph. It
-// returns candidate node IDs nearest first, or nil for an empty graph (entry < 0).
-func beamSearchQ(distQ func(int32) float64, entry int32, maxLayer, efSearch int,
-	upper func(node int32, layer int) []int32, zero func(node int32) []int32) []cand {
+// returns candidate node IDs nearest first, or nil for an empty graph (entry < 0). It
+// polls ctx on a stride through the layer-0 beam (the dominant cost) and reports
+// completed=false if the deadline passes mid-walk, so a shard preempted at the deadline
+// stops descending the graph rather than finishing a beam no one will read; the returned
+// candidates on an abandoned walk are an arbitrary partial meant to be discarded.
+func beamSearchQ(ctx context.Context, distQ func(int32) float64, entry int32, maxLayer, efSearch int,
+	upper func(node int32, layer int) []int32, zero func(node int32) []int32) (cands []cand, completed bool) {
 	if entry < 0 {
-		return nil
+		return nil, true
 	}
 	ep := entry
 	for layer := maxLayer; layer >= 1; layer-- {
@@ -124,7 +138,14 @@ func beamSearchQ(distQ func(int32) float64, entry int32, maxLayer, efSearch int,
 	d0 := distQ(ep)
 	candHeap := &minHeap{{ep, d0}}
 	resHeap := &maxHeap{{ep, d0}}
+	completed = true
+	steps := 0
 	for candHeap.Len() > 0 {
+		if (steps&beamPreemptStride) == 0 && ctx.Err() != nil {
+			completed = false
+			break
+		}
+		steps++
 		c := candHeap.popMin()
 		if resHeap.Len() >= efSearch && c.d > (*resHeap)[0].d {
 			break
@@ -152,7 +173,7 @@ func beamSearchQ(distQ func(int32) float64, entry int32, maxLayer, efSearch int,
 		}
 		return out[i].id < out[j].id
 	})
-	return out
+	return out, completed
 }
 
 // reachableCount returns how many nodes the search can reach from the entry point
