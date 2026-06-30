@@ -49,6 +49,9 @@ func formatInspect(r *tsumugi.Reader, path string) []byte {
 	if h.NodeBase != 0 {
 		fmt.Fprintf(&b, "node_base:%d\n", h.NodeBase)
 	}
+	if h.BuildEpoch != 0 {
+		fmt.Fprintf(&b, "epoch:    %d\n", h.BuildEpoch)
+	}
 
 	fmt.Fprintln(&b, "regions:")
 	// tabwriter writes into the bytes.Buffer and so never fails; ignore the
@@ -72,7 +75,15 @@ func formatInspect(r *tsumugi.Reader, path string) []byte {
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			fmt.Fprintf(&b, "  %-14s %g\n", k, r.Footer.Stats[k])
+			// The analyzer and build-config hashes are 64-bit values carried as a
+			// reinterpreted float64, so render them as hex rather than the meaningless
+			// floating-point number their bit pattern decodes to.
+			switch k {
+			case tsumugi.StatAnalyzerHash, tsumugi.StatBuildConfigHash:
+				fmt.Fprintf(&b, "  %-18s %#016x\n", k, tsumugi.AnalyzerHashFromStat(r.Footer.Stats[k]))
+			default:
+				fmt.Fprintf(&b, "  %-18s %g\n", k, r.Footer.Stats[k])
+			}
 		}
 	}
 	return b.Bytes()

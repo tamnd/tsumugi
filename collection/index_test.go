@@ -184,7 +184,7 @@ func TestCompactRefreshesIndex(t *testing.T) {
 	if before.NumShards() != 5 {
 		t.Fatalf("pre-compact index shards = %d, want 5", before.NumShards())
 	}
-	if _, err := Compact(out, 20); err != nil {
+	if _, err := Compact(out, 20, NoEpoch); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
 	after, err := LoadIndex(out)

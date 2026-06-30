@@ -102,13 +102,19 @@ func newCollectionAddCmd() *cobra.Command {
 
 func newCollectionCompactCmd() *cobra.Command {
 	var shardSize int
+	var epoch uint64
 	cmd := &cobra.Command{
 		Use:   "compact <dir>",
 		Short: "Merge a collection's shards into fewer, larger ones",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// As with build, the clock lives in the CLI: default the epoch to now, let a
+			// fixed value pin it for a reproducible compact.
+			if !cmd.Flags().Changed("build-epoch") {
+				epoch = uint64(time.Now().Unix())
+			}
 			start := time.Now()
-			res, err := collection.Compact(args[0], shardSize)
+			res, err := collection.Compact(args[0], shardSize, epoch)
 			if err != nil {
 				return err
 			}
@@ -119,6 +125,7 @@ func newCollectionCompactCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().IntVar(&shardSize, "shard-size", collection.DefaultShardSize, "documents per merged shard")
+	cmd.Flags().Uint64Var(&epoch, "build-epoch", 0, "build timestamp in unix seconds stamped into the compacted shards and index; unset uses the current time, a fixed value gives a reproducible compact")
 	return cmd
 }
 

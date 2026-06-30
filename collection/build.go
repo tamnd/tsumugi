@@ -1,11 +1,12 @@
 package collection
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"sort"
-	"time"
 
 	"github.com/tamnd/tsumugi"
 	"github.com/tamnd/tsumugi/analyze"
@@ -16,6 +17,52 @@ import (
 	"github.com/tamnd/tsumugi/lexical"
 	"github.com/tamnd/tsumugi/mph"
 )
+
+// shardMeta carries the build-level values every shard in a collection stamps
+// identically: the build epoch and the configuration hash. They are computed once
+// for the whole build and threaded into each shard so the shards a single build
+// writes agree on when, and under what configuration, they were produced.
+type shardMeta struct {
+	epoch      uint64
+	configHash uint64
+}
+
+// buildConfigHash digests the build configuration into the 64-bit value every shard
+// records as its build_config_hash. It folds in each input that decides how a shard's
+// bytes are produced: the container format version, the feature schema version, the
+// routing index version, the analyzer hash, the shard size, and the curated trust and
+// spam seeds in sorted order so the digest does not depend on the order the seeds were
+// passed. A change to any of these changes the digest, so two builds that share it
+// produced configuration-identical shards, the property a reproducibility check rests
+// on. It deliberately leaves out the build epoch and the corpus: the epoch is recorded
+// separately in the header, and the digest is meant to identify the configuration, not
+// the particular crawl, so the same configuration over a different corpus keeps it.
+func buildConfigHash(shardSize int, trustSeeds, spamSeeds []string) uint64 {
+	h := fnv.New64a()
+	var u [8]byte
+	put := func(v uint64) {
+		binary.LittleEndian.PutUint64(u[:], v)
+		_, _ = h.Write(u[:])
+	}
+	put(uint64(tsumugi.VersionMajor))
+	put(uint64(tsumugi.VersionMinor))
+	put(uint64(feature.SchemaVersion))
+	put(indexVersion)
+	put(lexical.DefaultAnalyzer.Hash())
+	put(uint64(shardSize))
+	putSeeds := func(seeds []string) {
+		s := append([]string(nil), seeds...)
+		sort.Strings(s)
+		put(uint64(len(s)))
+		for _, x := range s {
+			put(uint64(len(x)))
+			_, _ = h.Write([]byte(x))
+		}
+	}
+	putSeeds(trustSeeds)
+	putSeeds(spamSeeds)
+	return h.Sum64()
+}
 
 // DefaultShardSize is the document count a shard holds by default, the granularity
 // the collection shards a crawl at.
@@ -41,6 +88,14 @@ type Options struct {
 	// seeds trust purely from inverse PageRank and leaves anti-trust uniform.
 	TrustSeeds []string
 	SpamSeeds  []string
+
+	// BuildEpoch is the build timestamp in seconds stamped into every shard header
+	// and the collection index, the one input a build reads from a clock. The library
+	// never reads a clock itself: a caller that wants a reproducible build passes a
+	// fixed epoch and gets byte-identical shards and index, while the CLI defaults it
+	// to the current time so an operational build still records when it ran. Zero is a
+	// valid pinned epoch, the deterministic default for a library caller or a test.
+	BuildEpoch uint64
 }
 
 // Result reports what a build or add produced.
@@ -153,6 +208,15 @@ func build(opts Options, baseStart uint32, indexStart int, recrawl bool) (Result
 	// nodeBase+dense docID handle, which is untouched.
 	gids := AssignGlobalIDs(docs, DefaultPartitionParams())
 
+	// The epoch and the configuration digest are build-level: every shard stamps the
+	// same pair, so the shards a single build writes agree on when and under what
+	// configuration they were produced. Computing them once here keeps writeShard from
+	// re-deriving the digest per shard and guarantees the shards cannot disagree.
+	meta := shardMeta{
+		epoch:      opts.BuildEpoch,
+		configHash: buildConfigHash(opts.ShardSize, opts.TrustSeeds, opts.SpamSeeds),
+	}
+
 	res := Result{Docs: len(docs), Hosts: hosts}
 	base := baseStart
 	index := indexStart
@@ -162,7 +226,7 @@ func build(opts Options, baseStart uint32, indexStart int, recrawl bool) (Result
 			hi = len(docs)
 		}
 		path := shardPath(opts.Out, index)
-		n, err := writeShard(path, docs[lo:hi], sig.slice(lo, hi), base, lo, gids, dir)
+		n, err := writeShard(path, docs[lo:hi], sig.slice(lo, hi), base, lo, gids, dir, meta)
 		if err != nil {
 			return Result{}, err
 		}
@@ -187,7 +251,7 @@ func build(opts Options, baseStart uint32, indexStart int, recrawl bool) (Result
 	// statistics, and the routing index from one file instead of rescanning every
 	// shard. The index covers the whole directory, so an add reindexes the union of
 	// the old and new shards, not just the slice this call wrote.
-	if err := WriteIndex(opts.Out, uint64(time.Now().Unix())); err != nil {
+	if err := WriteIndex(opts.Out, opts.BuildEpoch); err != nil {
 		return Result{}, fmt.Errorf("write index: %w", err)
 	}
 	// Refresh the re-crawl membership directory so the next crawl can tell a page the
@@ -279,7 +343,7 @@ func dedupByIdentity(docs []convert.Document) ([]convert.Document, int) {
 // link signals in sig (one entry per document, aligned to docs); the forward store
 // keeps the url, title, and body so the shard holds the text it was built from; the
 // graph region carries the link graph recovered from the page bodies.
-func writeShard(path string, docs []convert.Document, sig graphSignals, base uint32, lo int, gids []uint64, dir *mph.Dir) (int64, error) {
+func writeShard(path string, docs []convert.Document, sig graphSignals, base uint32, lo int, gids []uint64, dir *mph.Dir, meta shardMeta) (int64, error) {
 	lb := lexical.NewBuilder(lexical.DefaultParams())
 	fb := feature.NewBuilder(feature.DefaultSchema(), feature.SchemaVersion)
 	cols := docColumns()
@@ -390,6 +454,12 @@ func writeShard(path string, docs []convert.Document, sig graphSignals, base uin
 	}
 	w.SetDocCount(uint32(len(docs)))
 	w.SetNodeBase(uint64(base))
+	// Stamp the build-level metadata: the epoch into the header (passed in, never read
+	// from a clock, so a build with a pinned epoch is byte-identical) and the
+	// configuration digest into the footer so a reader can check two shards were built
+	// the same way without reopening every region.
+	w.SetBuildEpoch(meta.epoch)
+	w.SetStat(tsumugi.StatBuildConfigHash, tsumugi.AnalyzerHashStat(meta.configHash))
 	w.SetStat(tsumugi.StatTokenCount, tokens)
 	w.SetStat(tsumugi.StatTitleTokenCount, titleTokens)
 	w.SetStat(tsumugi.StatBodyTokenCount, bodyTokens)

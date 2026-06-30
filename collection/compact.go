@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"time"
 
 	"github.com/tamnd/tsumugi"
 	"github.com/tamnd/tsumugi/convert"
@@ -20,7 +19,7 @@ import (
 // directory and swaps it in only once every new shard is written, so a failed compact
 // leaves the original collection untouched, the safety the immutable-shard discipline
 // buys.
-func Compact(dir string, shardSize int) (Result, error) {
+func Compact(dir string, shardSize int, epoch uint64) (Result, error) {
 	if shardSize <= 0 {
 		shardSize = DefaultShardSize
 	}
@@ -59,6 +58,11 @@ func Compact(dir string, shardSize int) (Result, error) {
 	// shards a fresh build writes carry as their graph id table.
 	gids := AssignGlobalIDs(docs, DefaultPartitionParams())
 
+	// A compact rebuilds with no curated seeds, the same default a build with none uses,
+	// so its configuration digest folds in the empty seed lists. The epoch is passed in
+	// so a pinned-epoch compact is byte-identical, the same reproducibility a build gets.
+	meta := shardMeta{epoch: epoch, configHash: buildConfigHash(shardSize, nil, nil)}
+
 	res := Result{Docs: len(docs), Hosts: hosts}
 	var base uint32
 	index := 0
@@ -67,7 +71,7 @@ func Compact(dir string, shardSize int) (Result, error) {
 		if hi > len(docs) {
 			hi = len(docs)
 		}
-		n, err := writeShard(shardPath(staging, index), docs[lo:hi], sig.slice(lo, hi), base, lo, gids, urlDir)
+		n, err := writeShard(shardPath(staging, index), docs[lo:hi], sig.slice(lo, hi), base, lo, gids, urlDir, meta)
 		if err != nil {
 			_ = os.RemoveAll(staging)
 			return Result{}, err
@@ -106,7 +110,7 @@ func Compact(dir string, shardSize int) (Result, error) {
 	}
 	// The shard set changed, so the old artifact's manifest and routing are stale.
 	// Rebuild it over the compacted shards.
-	if err := WriteIndex(dir, uint64(time.Now().Unix())); err != nil {
+	if err := WriteIndex(dir, epoch); err != nil {
 		return Result{}, fmt.Errorf("write index: %w", err)
 	}
 	return res, nil
