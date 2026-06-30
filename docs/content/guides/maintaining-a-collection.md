@@ -30,7 +30,7 @@ The shards are listed in global id order, so the listing reads as the collection
 tsumugi collection add ./data --source fresh-crawl.parquet
 ```
 
-It reads the collection's highest existing document id, continues the global id space past it, and names its new shards after the existing ones, so the new crawl extends the collection rather than rewriting a byte of it. This is the freshness path the immutable-shard discipline makes safe: a running `serve` process keeps mapping the old shards while `add` writes new files alongside them.
+It reads the collection's highest existing document id, continues the global id space past it, and names its new shards after the existing ones, so the new crawl extends the collection rather than rewriting a byte of it. This is the freshness path the immutable-shard discipline makes safe: a running `serve` process keeps mapping the old shards while `add` writes new files alongside them. To make the new shards live without a restart, POST `/admin/reload` to the running server, or start it with `--reload-interval` so it picks them up on a poll. See [serving search](/guides/serving-search/#reloading-shards-without-a-restart).
 
 `add` takes the same `--source`, `--shard-size`, and `--limit` flags as `build`. The trade-off is fragmentation: each add appends its own shards in its own host order, so after many small adds the collection is many small, separately-ordered shards. That is what compaction fixes.
 

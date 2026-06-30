@@ -55,6 +55,9 @@ Opens every `.tsumugi` shard in a directory, builds the routing index and the fl
 | `--model` | | Trained ranking model file |
 | `--addr` | `:8080` | Address to listen on |
 | `--timeout` | `10ms` | Per-request deadline |
+| `--cache` | `0` | Result-cache size in entries (0 disables) |
+| `--max-inflight` | `0` | Maximum concurrent searches before shedding with 503 (0 disables) |
+| `--reload-interval` | `0` | Poll the shard directory at this interval to publish and retire shards (0 disables polling) |
 
 ### Endpoints
 
@@ -62,6 +65,9 @@ Opens every `.tsumugi` shard in a directory, builds the routing index and the fl
 |------|---------|
 | `GET /search?q=<query>&k=<n>` | Ranked top-k as JSON: `hits` (each `doc_id` and `score`), `shards`, `took_ms`. `k` defaults to 10. |
 | `GET /healthz` | Collection size as JSON: `docs`, `shards`, `status`. |
+| `POST /admin/reload` | Reconcile the served set with the shard directory: publish new files, retire gone ones. Returns `published`, `retired`, `shards`, `docs`. |
+| `POST /admin/publish?shard=<name>` | Publish one named shard from the directory into the running server. |
+| `POST /admin/retire?shard=<name>` | Retire one named shard from the running server. |
 
 ## tsumugi collection
 

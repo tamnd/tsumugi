@@ -20,6 +20,9 @@ serving 11 shards (20246 docs) on :8080
 | `--model` | | Trained ranking model file |
 | `--addr` | `:8080` | Address to listen on |
 | `--timeout` | `10ms` | Per-request deadline |
+| `--cache` | `0` | Result-cache size in entries (0 disables) |
+| `--max-inflight` | `0` | Maximum concurrent searches before shedding with 503 (0 disables) |
+| `--reload-interval` | `0` | Poll the shard directory at this interval to publish and retire shards (0 disables polling) |
 
 ## Querying
 
@@ -50,6 +53,33 @@ curl localhost:8080/healthz
 
 ```json
 {"docs": 20246, "shards": 11, "status": "ok"}
+```
+
+## Reloading shards without a restart
+
+A running server can take on freshly built shards and drop retired ones without stopping. Build a new `.tsumugi` file into the served directory, or remove one, then tell the server to reconcile its served set with what is on disk:
+
+```bash
+curl -X POST localhost:8080/admin/reload
+```
+
+```json
+{"published": 2, "retired": 1, "shards": 12, "docs": 21430}
+```
+
+`reload` globs the directory, publishes every file not yet served, and retires every served shard whose file is gone. To act on a single shard by name instead, use `publish` and `retire`:
+
+```bash
+curl -X POST 'localhost:8080/admin/publish?shard=shard-00012.tsumugi'
+curl -X POST 'localhost:8080/admin/retire?shard=shard-00003.tsumugi'
+```
+
+A published shard whose recorded analyzer does not match the server's is refused, the same check the server applies at startup, so a shard built with a different analysis chain can never be queried against tokens the server does not produce. A retired shard's documents stop appearing in new results immediately; a query already in flight finishes against the set it started with.
+
+The admin endpoints are POST only. To reconcile unattended instead of on demand, set `--reload-interval` and the server polls the directory on that interval:
+
+```bash
+tsumugi serve --dir ./data --model ./data/model.bin --reload-interval 30s
 ```
 
 ## What a query does
