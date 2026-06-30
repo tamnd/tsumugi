@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tamnd/tsumugi/feature"
@@ -14,10 +15,10 @@ import (
 )
 
 // Broker fans a query across many shards, gathers their candidates, and runs one
-// global rerank to produce a fleet-wide top-k. It owns the shards, the routing index
-// that prunes the fan-out, the fleet-wide statistics, and the cascade that does the
-// global rerank. The broker is read-only after construction and serves queries
-// concurrently.
+// global rerank to produce a fleet-wide top-k. It owns the served shard set, the
+// routing index that prunes the fan-out, the fleet-wide statistics, and the cascade
+// that does the global rerank. A broker serves queries concurrently, and a publish or
+// retire swaps the served shard set atomically while queries keep running (doc 11).
 //
 // The global rerank is where the broker's exactness lives. Each shard does only
 // retrieval; the broker collects every candidate with its per-document feature row,
@@ -27,22 +28,54 @@ import (
 // from, so given a recall-complete candidate set the broker's top-k equals the top-k
 // a single index over every shard would produce.
 type Broker struct {
+	// state is the served shard set and the routing index and statistics computed over
+	// it, held behind one atomic pointer so a query reads a single consistent snapshot
+	// and a publish or retire swaps the whole set in one store. A query loads it once at
+	// entry and uses that snapshot to the end, so a concurrent swap never splits a query
+	// across two shard sets.
+	state atomic.Pointer[brokerState]
+
+	cascade        *rank.Cascade
+	maxConcurrency int
+
+	// publishMu serializes publish and retire so two swaps build their new state off a
+	// consistent base; a query never takes it, it only loads the state pointer.
+	publishMu sync.Mutex
+
+	// retired holds shards removed from the served set whose file mappings stay mapped
+	// until Close. An in-flight query (including a fan-out goroutine that outlives its
+	// query at the deadline) may still reference a retired shard through the snapshot it
+	// loaded, so closing one at retire time could fault a live read; the mappings are
+	// released together at Close instead.
+	retired []*Shard
+
+	// cache is the optional result cache (doc 11). It is nil unless a deployment wires
+	// one, so a broker without a cache runs every query through the cascade unchanged. A
+	// publish or retire clears it, because a changed shard set can change a query's top-k.
+	cache *ResultCache
+}
+
+// brokerState is the swappable serving snapshot: the shards a broker serves, the
+// routing index over them, and the fleet-wide statistics. It is immutable once stored,
+// so a query that loads it reads a consistent set even as a publish swaps in a new one.
+type brokerState struct {
 	shards  []*Shard
 	routing *RoutingIndex
 	stats   GlobalStats
-	cascade *rank.Cascade
-
-	maxConcurrency int
 
 	// shardStatic is the per-shard static-rank summary the shard-dropping degradation
-	// rung orders shards by, computed once on first use under staticOnce so a broker that
-	// never drops shards never pays the scan.
+	// rung orders shards by, computed once on first use under staticOnce so a state whose
+	// queries never drop shards never pays the scan. It belongs to the snapshot because
+	// it summarizes this snapshot's shards.
 	staticOnce  sync.Once
 	shardStatic []float64
+}
 
-	// cache is the optional result cache (doc 11). It is nil unless a deployment wires
-	// one, so a broker without a cache runs every query through the cascade unchanged.
-	cache *ResultCache
+// newState builds a serving snapshot over a shard set, scanning the shards for the
+// routing index and the fleet-wide statistics. It is the scan path a publish and a
+// retire rebuild through, fine because they are infrequent relative to queries.
+func newState(shards []*Shard) *brokerState {
+	return &brokerState{shards: shards, routing: BuildRoutingIndex(shards), stats: computeGlobalStats(shards)}
 }
 
 // NewBroker builds a broker over already-opened shards with a global cascade. It
@@ -62,12 +95,70 @@ func NewBroker(shards []*Shard, cascade *rank.Cascade) *Broker {
 // query vocabulary, not the corpus. The routing index's shard ids must line up with the
 // order of the shards slice.
 func NewBrokerWith(shards []*Shard, cascade *rank.Cascade, routing *RoutingIndex, stats GlobalStats) *Broker {
-	return &Broker{
-		shards:         shards,
-		routing:        routing,
-		stats:          stats,
+	b := &Broker{
 		cascade:        cascade,
 		maxConcurrency: runtime.GOMAXPROCS(0),
+	}
+	b.state.Store(&brokerState{shards: shards, routing: routing, stats: stats})
+	return b
+}
+
+// state loads the current serving snapshot. A query calls it once at entry and uses the
+// returned snapshot to completion, so a concurrent publish or retire never splits a
+// single query across two shard sets.
+func (b *Broker) loadState() *brokerState { return b.state.Load() }
+
+// Publish swaps in a serving snapshot that includes shard, then clears the result cache
+// (doc 11 publish lifecycle): a new shard can hold a document that belongs in a cached
+// query's top-k, so a result computed against the old set can be stale against the new
+// one, and the coarse correct thing is to drop the cache and let traffic re-warm it. The
+// swap is atomic, so a query in flight finishes against the snapshot it loaded and the
+// next query sees the new shard.
+func (b *Broker) Publish(shard *Shard) {
+	b.publishMu.Lock()
+	cur := b.state.Load()
+	shards := make([]*Shard, len(cur.shards)+1)
+	copy(shards, cur.shards)
+	shards[len(cur.shards)] = shard
+	b.state.Store(newState(shards))
+	b.publishMu.Unlock()
+	b.invalidateCache()
+}
+
+// Retire removes every served shard the predicate selects, swaps in a snapshot over the
+// survivors, and clears the result cache (the mirror of Publish): a retired shard can
+// remove a document from a cached query's top-k, so the cache is dropped on a retire the
+// same way. It returns the number of shards retired. A retired shard's file mapping is
+// kept mapped until Close because an in-flight query may still reference it; the swap
+// only stops new queries from seeing it.
+func (b *Broker) Retire(pred func(*Shard) bool) int {
+	b.publishMu.Lock()
+	cur := b.state.Load()
+	keep := make([]*Shard, 0, len(cur.shards))
+	var removed []*Shard
+	for _, s := range cur.shards {
+		if pred(s) {
+			removed = append(removed, s)
+		} else {
+			keep = append(keep, s)
+		}
+	}
+	if len(removed) == 0 {
+		b.publishMu.Unlock()
+		return 0
+	}
+	b.state.Store(newState(keep))
+	b.retired = append(b.retired, removed...)
+	b.publishMu.Unlock()
+	b.invalidateCache()
+	return len(removed)
+}
+
+// invalidateCache clears the result cache if one is wired, the step a publish or retire
+// runs so no top-k computed against the old shard set is served against the new one.
+func (b *Broker) invalidateCache() {
+	if b.cache != nil {
+		b.cache.Clear()
 	}
 }
 
@@ -93,19 +184,35 @@ func (b *Broker) CheckModel() error {
 	return nil
 }
 
-// Stats returns the fleet-wide collection statistics.
-func (b *Broker) Stats() GlobalStats { return b.stats }
+// Stats returns the fleet-wide collection statistics over the served shard set.
+func (b *Broker) Stats() GlobalStats { return b.loadState().stats }
 
-// NumShards is the number of shards the broker serves.
-func (b *Broker) NumShards() int { return len(b.shards) }
+// NumShards is the number of shards the broker currently serves.
+func (b *Broker) NumShards() int { return len(b.loadState().shards) }
 
-// Close releases every shard's file mapping.
+// Close releases every shard's file mapping, both the currently served set and the
+// shards retired during the broker's life that were kept mapped for in-flight queries.
+// It is the single point those retired mappings are released, so a long-lived broker
+// that retires shards reclaims their address space at shutdown. Each distinct shard is
+// closed once: a shard that was published, retired, and published again can appear both
+// in the served set and the retired list, and a munmap runs exactly once per mapping.
 func (b *Broker) Close() error {
 	var first error
-	for _, s := range b.shards {
+	seen := make(map[*Shard]struct{})
+	closeOnce := func(s *Shard) {
+		if _, ok := seen[s]; ok {
+			return
+		}
+		seen[s] = struct{}{}
 		if err := s.Close(); err != nil && first == nil {
 			first = err
 		}
+	}
+	for _, s := range b.loadState().shards {
+		closeOnce(s)
+	}
+	for _, s := range b.retired {
+		closeOnce(s)
 	}
 	return first
 }
@@ -227,6 +334,11 @@ func (b *Broker) SearchWithinBudget(ctx context.Context, q Query) Results {
 // smaller set rather than an unranked one. The drop-a-slow-shard-at-the-deadline step
 // is orthogonal and automatic in the fan-out at any level, reported through Complete.
 func (b *Broker) SearchDegraded(ctx context.Context, q Query, level DegradeLevel) Results {
+	// Load the served snapshot once at entry and use it to the end. A concurrent publish
+	// or retire swaps in a new snapshot for the next query, but this query routes, gathers
+	// idf, fans out, and reranks against one consistent shard set, so a swap never splits a
+	// query across two sets or references a shard the snapshot it loaded does not hold.
+	st := b.loadState()
 	d := degradationFor(level)
 	// Analyze the query once at the broker and ship the term set to every shard, so the
 	// analysis chain runs one time per query rather than once per shard the fan-out
@@ -244,13 +356,13 @@ func (b *Broker) SearchDegraded(ctx context.Context, q Query, level DegradeLevel
 	if d.dropDense {
 		q.Vector = nil
 	}
-	targets := b.routing.RouteTerms(q.Terms)
+	targets := st.routing.RouteTerms(q.Terms)
 	// Lever 3: drop the lowest-static-rank shards from the routed set before the gather
 	// and the fan-out, so the dropped shards cost nothing downstream. ShardsTotal then
 	// reflects the shards actually queried, so the completeness flag stays honest about
 	// deadline drops while the Degraded level reports the deliberate reduction.
 	if d.dropShardFrac > 0 {
-		targets = b.dropLowStatic(targets, d.dropShardFrac)
+		targets = st.dropLowStatic(targets, d.dropShardFrac)
 	}
 	// Phase one of distributed exact idf: gather each query term's df across the routed
 	// shards and turn it into one collection-wide idf the fan-out scores every shard
@@ -258,9 +370,9 @@ func (b *Broker) SearchDegraded(ctx context.Context, q Query, level DegradeLevel
 	// favor whichever shard happens to hold a globally rare term densely. A query that
 	// already carries idf overrides, or has no lexical text, skips the gather.
 	if len(q.Terms) > 0 && q.TermIDF == nil {
-		q.TermIDF = b.globalIDF(ctx, q.Terms, targets)
+		q.TermIDF = b.globalIDF(ctx, st, q.Terms, targets)
 	}
-	results, ok := b.fanOut(ctx, q, targets)
+	results, ok := b.fanOut(ctx, st, q, targets)
 
 	var allLex, allDense []scored
 	feats := make(map[uint32][]float64)
@@ -284,7 +396,7 @@ func (b *Broker) SearchDegraded(ctx context.Context, q Query, level DegradeLevel
 	// its owning shard's per-query extractor, built once and reused across that
 	// shard's survivors. Online extraction runs only over the L1 survivors, the
 	// bounded set the spec's budget allots the per-candidate text work.
-	exts := make([]*onlineExtractor, len(b.shards))
+	exts := make([]*onlineExtractor, len(st.shards))
 	l1feat := func(id uint32) []float64 { return feats[id] }
 	l2feat := func(id uint32) []float64 {
 		base := feats[id]
@@ -292,9 +404,9 @@ func (b *Broker) SearchDegraded(ctx context.Context, q Query, level DegradeLevel
 		if !ok {
 			return base
 		}
-		s := b.shards[si]
+		s := st.shards[si]
 		if exts[si] == nil {
-			exts[si] = s.newOnline(q, q.TermIDF, b.stats.AvgFieldLen)
+			exts[si] = s.newOnline(q, q.TermIDF, st.stats.AvgFieldLen)
 		}
 		return s.l2Row(base, exts[si], id-s.nodeBase)
 	}
@@ -324,7 +436,7 @@ func (b *Broker) SearchDegraded(ctx context.Context, q Query, level DegradeLevel
 // shard, so a slow shard is dropped instead of holding the query past its budget. A
 // dropped shard's slice of the corpus is simply absent from the merge, which the
 // returned count reports so the caller can flag the result partial.
-func (b *Broker) fanOut(ctx context.Context, q Query, targets []int) ([]*shardResult, int) {
+func (b *Broker) fanOut(ctx context.Context, st *brokerState, q Query, targets []int) ([]*shardResult, int) {
 	// The channel is buffered to the full target count so a shard goroutine that
 	// finishes after the collection has stopped at the deadline can still send and
 	// exit rather than leaking, blocked on a reader that has gone away.
@@ -341,7 +453,7 @@ dispatch:
 		dispatched++
 		go func(si int) {
 			defer func() { <-sem }()
-			s := b.shards[si]
+			s := st.shards[si]
 			lex, dense, feats := s.retrieve(q)
 			base := s.nodeBase
 			gl := make([]scored, len(lex))
@@ -377,8 +489,8 @@ dispatch:
 // and the df is summed over exactly the shards routing selected, which for a lexical
 // term are all the shards that hold it, so the sum is the term's true collection df. An
 // empty result lets the fan-out fall back to shard-local idf.
-func (b *Broker) globalIDF(ctx context.Context, terms []string, targets []int) map[string]float64 {
-	return idfFromDF(b.gatherDF(ctx, terms, targets), b.stats.DocCount)
+func (b *Broker) globalIDF(ctx context.Context, st *brokerState, terms []string, targets []int) map[string]float64 {
+	return idfFromDF(b.gatherDF(ctx, st, terms, targets), st.stats.DocCount)
 }
 
 // gatherDF sums each term's document frequency across a set of this broker's shards. The
@@ -387,7 +499,7 @@ func (b *Broker) globalIDF(ctx context.Context, terms []string, targets []int) m
 // context returns whatever has been gathered, which only loosens an idf, never corrupts a
 // score. The returned map holds only the terms some shard carried, so a term no shard
 // holds is absent rather than zero.
-func (b *Broker) gatherDF(ctx context.Context, terms []string, targets []int) map[string]uint32 {
+func (b *Broker) gatherDF(ctx context.Context, st *brokerState, terms []string, targets []int) map[string]uint32 {
 	df := make(map[string]uint32)
 	var mu sync.Mutex
 	sem := make(chan struct{}, b.maxConcurrency)
@@ -403,7 +515,7 @@ func (b *Broker) gatherDF(ctx context.Context, terms []string, targets []int) ma
 		go func(si int) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			local := b.shards[si].LexDocFreqs(terms)
+			local := st.shards[si].LexDocFreqs(terms)
 			if len(local) == 0 {
 				return
 			}
@@ -421,7 +533,7 @@ func (b *Broker) gatherDF(ctx context.Context, terms []string, targets []int) ma
 // NumDocs is the fleet-wide document count beneath this broker, the N idf divides by, so
 // an aggregator over several brokers sums their NumDocs into the fleet N it computes one
 // shared idf against (the Searcher contract).
-func (b *Broker) NumDocs() uint64 { return b.stats.DocCount }
+func (b *Broker) NumDocs() uint64 { return b.loadState().stats.DocCount }
 
 // DocFreqs sums each term's document frequency across the broker's shards that hold it, so
 // an aggregator can add the per-broker counts into the fleet-wide df no single broker can
@@ -432,7 +544,8 @@ func (b *Broker) DocFreqs(ctx context.Context, terms []string) map[string]uint32
 	if len(terms) == 0 {
 		return nil
 	}
-	return b.gatherDF(ctx, terms, b.routing.RouteTerms(terms))
+	st := b.loadState()
+	return b.gatherDF(ctx, st, terms, st.routing.RouteTerms(terms))
 }
 
 // idfFromDF turns gathered per-term document frequencies into per-term idf against the

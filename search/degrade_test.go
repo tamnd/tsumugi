@@ -210,16 +210,17 @@ func TestDropLowStatic(t *testing.T) {
 	for i := range targets {
 		targets[i] = i
 	}
-	static := b.shardStatics()
+	st := b.loadState()
+	static := st.shardStatics()
 	if len(static) != parts {
 		t.Fatalf("shardStatics returned %d entries, want %d", len(static), parts)
 	}
 
 	// A zero fraction and a single target are no-ops.
-	if got := b.dropLowStatic(targets, 0); len(got) != parts {
+	if got := st.dropLowStatic(targets, 0); len(got) != parts {
 		t.Fatalf("frac 0 dropped shards: %v", got)
 	}
-	if got := b.dropLowStatic([]int{2}, 0.5); len(got) != 1 || got[0] != 2 {
+	if got := st.dropLowStatic([]int{2}, 0.5); len(got) != 1 || got[0] != 2 {
 		t.Fatalf("single target was dropped: %v", got)
 	}
 
@@ -230,7 +231,7 @@ func TestDropLowStatic(t *testing.T) {
 			lowest = i
 		}
 	}
-	kept := b.dropLowStatic(targets, 0.25)
+	kept := st.dropLowStatic(targets, 0.25)
 	if len(kept) != parts-1 {
 		t.Fatalf("dropLowStatic(0.25) kept %d shards, want %d", len(kept), parts-1)
 	}
@@ -245,7 +246,7 @@ func TestDropLowStatic(t *testing.T) {
 
 	// Dropping the whole fraction still keeps at least one shard, so a query never
 	// degrades to no shards at all.
-	all := b.dropLowStatic(targets, 1.0)
+	all := st.dropLowStatic(targets, 1.0)
 	if len(all) != 1 {
 		t.Fatalf("frac 1.0 kept %d shards, want 1 (never drop them all)", len(all))
 	}

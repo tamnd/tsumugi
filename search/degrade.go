@@ -126,7 +126,7 @@ func DegradeForBudget(remaining time.Duration) DegradeLevel {
 // were the least likely to win anyway. The kept set is returned in shard-index order so
 // the fan-out stays deterministic, and at least one shard is always kept so a query
 // never degrades to no shards.
-func (b *Broker) dropLowStatic(targets []int, frac float64) []int {
+func (st *brokerState) dropLowStatic(targets []int, frac float64) []int {
 	if frac <= 0 || len(targets) <= 1 {
 		return targets
 	}
@@ -137,7 +137,7 @@ func (b *Broker) dropLowStatic(targets []int, frac float64) []int {
 	if drop >= len(targets) {
 		drop = len(targets) - 1
 	}
-	static := b.shardStatics()
+	static := st.shardStatics()
 	kept := append([]int(nil), targets...)
 	// Order by static rank descending, ties by shard index ascending, so the cut is
 	// deterministic regardless of the routing order, then drop the tail.
@@ -154,17 +154,18 @@ func (b *Broker) dropLowStatic(targets []int, frac float64) []int {
 }
 
 // shardStatics returns the per-shard static-rank summary, the highest static rank in
-// each shard, computed once on first use and cached. It is computed lazily rather than
-// at construction so a broker that never degrades to dropping shards never pays the
-// scan, which keeps the common startup proportional to the query vocabulary, not the
-// corpus. The scan reads one feature column per document and runs only the first time
-// the shard-dropping rung fires.
-func (b *Broker) shardStatics() []float64 {
-	b.staticOnce.Do(func() {
-		b.shardStatic = make([]float64, len(b.shards))
-		for i, s := range b.shards {
-			b.shardStatic[i] = s.MaxStaticRank()
+// each shard, computed once on first use and cached on the serving snapshot. It is
+// computed lazily rather than when the snapshot is built so a snapshot whose queries
+// never degrade to dropping shards never pays the scan, which keeps the common startup
+// proportional to the query vocabulary, not the corpus. The scan reads one feature
+// column per document and runs only the first time the shard-dropping rung fires on this
+// snapshot; a publish or retire builds a fresh snapshot that recomputes it on demand.
+func (st *brokerState) shardStatics() []float64 {
+	st.staticOnce.Do(func() {
+		st.shardStatic = make([]float64, len(st.shards))
+		for i, s := range st.shards {
+			st.shardStatic[i] = s.MaxStaticRank()
 		}
 	})
-	return b.shardStatic
+	return st.shardStatic
 }
