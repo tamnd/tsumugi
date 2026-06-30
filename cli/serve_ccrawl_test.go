@@ -137,7 +137,7 @@ func TestAggregatorCCrawl(t *testing.T) {
 	// shards are what the aggregator's sub-brokers are built from. The all-shards broker
 	// owns the file mappings, so it is the one closed, and the sub-brokers reference the
 	// same read-only shards without closing them a second time.
-	shards, all, err := openShards(out, model)
+	shards, _, all, err := openShards(out, model)
 	if err != nil {
 		t.Fatalf("openShards: %v", err)
 	}
@@ -225,7 +225,7 @@ func TestAggregatorCCrawlDocFreqsExact(t *testing.T) {
 	// all is the broker over every shard, the monolith ground truth for the fleet statistics;
 	// it owns the file mappings, so it is the one closed. The aggregator's two sub-brokers
 	// reference the same read-only shards split in half.
-	shards, all, err := openShards(out, model)
+	shards, _, all, err := openShards(out, model)
 	if err != nil {
 		t.Fatalf("openShards: %v", err)
 	}
@@ -321,7 +321,7 @@ func TestDegradeCCrawl(t *testing.T) {
 	}
 	model := ens.Compile()
 
-	shards, b, err := openShards(out, model)
+	shards, _, b, err := openShards(out, model)
 	if err != nil {
 		t.Fatalf("openShards: %v", err)
 	}
@@ -427,7 +427,7 @@ func TestCacheCCrawl(t *testing.T) {
 	}
 	model := ens.Compile()
 
-	shards, b, err := openShards(out, model)
+	shards, _, b, err := openShards(out, model)
 	if err != nil {
 		t.Fatalf("openShards: %v", err)
 	}
@@ -527,7 +527,7 @@ func TestRoutingCCrawlEquivalence(t *testing.T) {
 	}
 	model := ens.Compile()
 
-	shards, b, err := openShards(out, model)
+	shards, _, b, err := openShards(out, model)
 	if err != nil {
 		t.Fatalf("openShards: %v", err)
 	}

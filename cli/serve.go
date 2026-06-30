@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -26,12 +27,13 @@ func queryAnalyzerHash() uint64 { return lexical.DefaultAnalyzer.Hash() }
 
 func newServeCmd() *cobra.Command {
 	var (
-		dir         string
-		addr        string
-		modelP      string
-		timeout     time.Duration
-		cacheSize   int
-		maxInFlight int
+		dir            string
+		addr           string
+		modelP         string
+		timeout        time.Duration
+		cacheSize      int
+		maxInFlight    int
+		reloadInterval time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -50,7 +52,7 @@ func newServeCmd() *cobra.Command {
 			if modelP == "" {
 				return fmt.Errorf("a ranking model is required: pass --model")
 			}
-			broker, pl, err := openCollection(dir, modelP)
+			broker, pl, rl, err := loadServe(dir, modelP)
 			if err != nil {
 				return err
 			}
@@ -68,10 +70,23 @@ func newServeCmd() *cobra.Command {
 			// answered 503 fast rather than queued into latency it would miss its deadline in.
 			// A zero capacity disables the gate, leaving the broker unbounded.
 			adm := search.NewAdmission(maxInFlight)
-			srv := &httpServer{broker: broker, pipeline: pl, timeout: timeout, admission: adm}
+			srv := &httpServer{broker: broker, pipeline: pl, timeout: timeout, admission: adm, reloader: rl}
 			mux := http.NewServeMux()
 			mux.HandleFunc("/search", srv.search)
 			mux.HandleFunc("/healthz", srv.health)
+			// The admin endpoints publish and retire shards on the running broker, the freshness
+			// half doc 11 needs. /admin/reload syncs the whole served set to the directory;
+			// /admin/publish and /admin/retire name one shard for explicit control.
+			mux.HandleFunc("/admin/reload", srv.reload)
+			mux.HandleFunc("/admin/publish", srv.publish)
+			mux.HandleFunc("/admin/retire", srv.retire)
+
+			// An optional poll picks up shards dropped into or removed from the directory without
+			// an admin call, so a deployment can publish by writing a file. A zero interval leaves
+			// the served set fixed until an admin call, the pre-slice behavior.
+			if reloadInterval > 0 {
+				go pollReload(cmd.Context(), rl, reloadInterval, cmd.OutOrStdout())
+			}
 
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "serving %d shards (%d docs) on %s\n",
 				broker.NumShards(), broker.Stats().DocCount, addr)
@@ -84,6 +99,7 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().DurationVar(&timeout, "timeout", 10*time.Millisecond, "per-request deadline")
 	cmd.Flags().IntVar(&cacheSize, "cache", 0, "result cache capacity in entries (0 disables the cache)")
 	cmd.Flags().IntVar(&maxInFlight, "max-inflight", 0, "maximum concurrent in-flight searches (0 disables admission control)")
+	cmd.Flags().DurationVar(&reloadInterval, "reload-interval", 0, "poll the shard directory at this interval to publish and retire shards (0 disables polling)")
 	return cmd
 }
 
@@ -118,29 +134,48 @@ func serveHTTP(ctx context.Context, addr string, h http.Handler, adm *search.Adm
 	return srv.Shutdown(dctx)
 }
 
-// openCollection opens every shard in a directory, loads the model, wires a broker
-// over them, and builds the query-understanding pipeline the broker runs each query
-// through. Each shard and the broker share the same compiled model so a document scores
-// identically wherever it is reranked, and the pipeline is built from the same open
-// shards so the corrector's dictionary and the dense plane's dimension match the fleet
-// the broker serves.
-func openCollection(dir, modelPath string) (*search.Broker, *pipeline, error) {
+// loadModel opens and compiles the ranking model the broker and every shard score
+// against, so the loader and the live reloader share one model rather than each loading
+// its own copy.
+func loadModel(modelPath string) (*rank.Model, error) {
 	f, err := os.Open(modelPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("open model: %w", err)
+		return nil, fmt.Errorf("open model: %w", err)
 	}
 	ens, err := rank.LoadEnsemble(f)
 	_ = f.Close()
 	if err != nil {
-		return nil, nil, fmt.Errorf("load model: %w", err)
+		return nil, fmt.Errorf("load model: %w", err)
 	}
-	model := ens.Compile()
+	return ens.Compile(), nil
+}
 
-	shards, broker, err := openShards(dir, model)
+// openCollection opens every shard in a directory, loads the model, wires a broker over
+// them, and builds the query-understanding pipeline the broker runs each query through. It
+// is the test-facing wrapper over loadServe that drops the reloader, so the many tests that
+// only need the broker and the pipeline keep their three-value call.
+func openCollection(dir, modelPath string) (*search.Broker, *pipeline, error) {
+	broker, pl, _, err := loadServe(dir, modelPath)
+	return broker, pl, err
+}
+
+// loadServe opens the collection and additionally builds the reloader the serve command
+// uses to publish and retire shards on a running broker. Each shard and the broker share
+// the same compiled model so a document scores identically wherever it is reranked, the
+// pipeline is built from the same open shards so the corrector's dictionary and the dense
+// plane's dimension match the fleet the broker serves, and the reloader holds that same
+// model and the path-to-shard map so a later publish opens a new shard the same way and a
+// retire names the exact shard to remove.
+func loadServe(dir, modelPath string) (*search.Broker, *pipeline, *reloader, error) {
+	model, err := loadModel(modelPath)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return broker, buildPipeline(shards), nil
+	shards, paths, broker, err := openShards(dir, model)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return broker, buildPipeline(shards), newReloader(dir, model, broker, shards, paths), nil
 }
 
 // openShards opens the directory's shards and wires a broker over them, returning the
@@ -150,25 +185,25 @@ func openCollection(dir, modelPath string) (*search.Broker, *pipeline, error) {
 // without rescanning every shard's vocabulary, which is what lets serve start in time at
 // fleet scale; a collection built before the artifact existed has none, so it falls back
 // to the glob scan.
-func openShards(dir string, model *rank.Model) ([]*search.Shard, *search.Broker, error) {
+func openShards(dir string, model *rank.Model) ([]*search.Shard, []string, *search.Broker, error) {
 	if ix, err := collection.LoadIndex(dir); err == nil {
 		// The manifest records the collection-wide analyzer hash in one place, so the
 		// broker verifies it once here rather than opening every shard's footer.
 		if h := ix.AnalyzerHash; h != 0 && h != queryAnalyzerHash() {
-			return nil, nil, fmt.Errorf("%w: collection is %#016x, broker analyzer is %#016x",
+			return nil, nil, nil, fmt.Errorf("%w: collection is %#016x, broker analyzer is %#016x",
 				collection.ErrAnalyzerMismatch, h, queryAnalyzerHash())
 		}
 		return shardsFromIndex(dir, model, ix)
 	} else if !os.IsNotExist(err) {
-		return nil, nil, fmt.Errorf("load index: %w", err)
+		return nil, nil, nil, fmt.Errorf("load index: %w", err)
 	}
 
 	paths, err := filepath.Glob(filepath.Join(dir, "*.tsumugi"))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if len(paths) == 0 {
-		return nil, nil, fmt.Errorf("no .tsumugi shards in %s", dir)
+		return nil, nil, nil, fmt.Errorf("no .tsumugi shards in %s", dir)
 	}
 	shards := make([]*search.Shard, 0, len(paths))
 	closeAll := func() {
@@ -180,7 +215,7 @@ func openShards(dir string, model *rank.Model) ([]*search.Shard, *search.Broker,
 		s, err := search.OpenShard(p, newCascade(model))
 		if err != nil {
 			closeAll()
-			return nil, nil, fmt.Errorf("open shard %s: %w", p, err)
+			return nil, nil, nil, fmt.Errorf("open shard %s: %w", p, err)
 		}
 		// No manifest in this directory, so verify each shard's own recorded analyzer
 		// against the broker's. A shard built before the hash was recorded reports
@@ -188,7 +223,7 @@ func openShards(dir string, model *rank.Model) ([]*search.Shard, *search.Broker,
 		if h, ok := s.AnalyzerHash(); ok && h != queryAnalyzerHash() {
 			_ = s.Close()
 			closeAll()
-			return nil, nil, fmt.Errorf("%w: shard %s is %#016x, broker analyzer is %#016x",
+			return nil, nil, nil, fmt.Errorf("%w: shard %s is %#016x, broker analyzer is %#016x",
 				collection.ErrAnalyzerMismatch, p, h, queryAnalyzerHash())
 		}
 		shards = append(shards, s)
@@ -196,9 +231,9 @@ func openShards(dir string, model *rank.Model) ([]*search.Shard, *search.Broker,
 	broker := search.NewBroker(shards, newCascade(model))
 	if err := broker.CheckModel(); err != nil {
 		closeAll()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return shards, broker, nil
+	return shards, paths, broker, nil
 }
 
 // shardsFromIndex opens the shards the artifact names, in the artifact's order, and
@@ -206,8 +241,9 @@ func openShards(dir string, model *rank.Model) ([]*search.Shard, *search.Broker,
 // the manifest's order is what keeps the routing index's shard ids aligned with the
 // shard slice, so a routed shard id always points at the shard the artifact recorded it
 // for.
-func shardsFromIndex(dir string, model *rank.Model, ix *collection.Index) ([]*search.Shard, *search.Broker, error) {
+func shardsFromIndex(dir string, model *rank.Model, ix *collection.Index) ([]*search.Shard, []string, *search.Broker, error) {
 	shards := make([]*search.Shard, 0, len(ix.Shards))
+	paths := make([]string, 0, len(ix.Shards))
 	for _, info := range ix.Shards {
 		p := filepath.Join(dir, filepath.Base(info.Path))
 		s, err := search.OpenShard(p, newCascade(model))
@@ -215,9 +251,10 @@ func shardsFromIndex(dir string, model *rank.Model, ix *collection.Index) ([]*se
 			for _, opened := range shards {
 				_ = opened.Close()
 			}
-			return nil, nil, fmt.Errorf("open shard %s: %w", p, err)
+			return nil, nil, nil, fmt.Errorf("open shard %s: %w", p, err)
 		}
 		shards = append(shards, s)
+		paths = append(paths, p)
 	}
 	routing := search.NewRoutingIndex(ix.RoutingMap(), ix.AlwaysRouted(), len(shards))
 	stats := search.GlobalStats{
@@ -231,9 +268,9 @@ func shardsFromIndex(dir string, model *rank.Model, ix *collection.Index) ([]*se
 		for _, opened := range shards {
 			_ = opened.Close()
 		}
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return shards, broker, nil
+	return shards, paths, broker, nil
 }
 
 func newCascade(model *rank.Model) *rank.Cascade {
@@ -253,6 +290,11 @@ type httpServer struct {
 	// socket write, the hold-for-the-whole-search discipline doc 11 pins. A disabled gate
 	// (capacity zero) admits everything, so the field is never nil but may be a no-op.
 	admission *search.Admission
+
+	// reloader publishes and retires shards on the broker for the admin endpoints. It is nil
+	// only in tests that construct the server directly without one; the serve command always
+	// wires it.
+	reloader *reloader
 }
 
 type searchResponse struct {
@@ -379,6 +421,117 @@ func toQuery(pq *query.ParsedQuery, k int) search.Query {
 		Terms:  pq.RetrievalTerms(),
 		Vector: query.DecodeDenseVec(pq.DenseVec),
 		K:      k,
+	}
+}
+
+// reloadResponse reports the outcome of an admin reload or a single publish/retire: the
+// counts swapped and the resulting served shard and document totals, so an operator sees
+// what the call changed and the broker's new size in one response.
+type reloadResponse struct {
+	Published int    `json:"published"`
+	Retired   int    `json:"retired"`
+	Shards    int    `json:"shards"`
+	Docs      uint64 `json:"docs"`
+	Error     string `json:"error,omitempty"`
+}
+
+// reload syncs the served set to the shard directory: it publishes files not yet served
+// and retires shards whose files are gone, the doc 11 freshness operation a deployment
+// triggers after building or removing shards. It is POST-only, since it changes server
+// state, and a partial failure (one shard fails to open or fails the analyzer check)
+// reports the error while still applying the rest of the sweep.
+func (s *httpServer) reload(w http.ResponseWriter, r *http.Request) {
+	if !s.adminGuard(w, r) {
+		return
+	}
+	pub, ret, err := s.reloader.sync()
+	resp := reloadResponse{Published: pub, Retired: ret, Shards: s.broker.NumShards(), Docs: s.broker.Stats().DocCount}
+	if err != nil {
+		resp.Error = err.Error()
+	}
+	writeJSON(w, resp)
+}
+
+// publish opens and publishes one named shard from the served directory, the explicit
+// single-shard control next to the directory sync. It refuses a shard whose analyzer does
+// not match the broker's with 400, the same guard the startup loader applies.
+func (s *httpServer) publish(w http.ResponseWriter, r *http.Request) {
+	if !s.adminGuard(w, r) {
+		return
+	}
+	name := filepath.Base(r.URL.Query().Get("shard"))
+	if name == "" || name == "." {
+		http.Error(w, "a shard name is required: pass ?shard=", http.StatusBadRequest)
+		return
+	}
+	if err := s.reloader.publish(name); err != nil {
+		writeJSON(w, reloadResponse{Shards: s.broker.NumShards(), Docs: s.broker.Stats().DocCount, Error: err.Error()})
+		return
+	}
+	writeJSON(w, reloadResponse{Published: 1, Shards: s.broker.NumShards(), Docs: s.broker.Stats().DocCount})
+}
+
+// retire removes one named shard from the served set, the mirror of publish. A name that
+// is not served reports zero retired rather than an error, so a retire is idempotent.
+func (s *httpServer) retire(w http.ResponseWriter, r *http.Request) {
+	if !s.adminGuard(w, r) {
+		return
+	}
+	name := filepath.Base(r.URL.Query().Get("shard"))
+	if name == "" || name == "." {
+		http.Error(w, "a shard name is required: pass ?shard=", http.StatusBadRequest)
+		return
+	}
+	n := 0
+	if s.reloader.retire(name) {
+		n = 1
+	}
+	writeJSON(w, reloadResponse{Retired: n, Shards: s.broker.NumShards(), Docs: s.broker.Stats().DocCount})
+}
+
+// adminGuard rejects an admin request that has no reloader wired (404, the endpoint is not
+// active) or uses a non-POST method (405, an admin call mutates state). It returns whether
+// the request may proceed.
+func (s *httpServer) adminGuard(w http.ResponseWriter, r *http.Request) bool {
+	if s.reloader == nil {
+		http.Error(w, "reload is not enabled", http.StatusNotFound)
+		return false
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "admin endpoints require POST", http.StatusMethodNotAllowed)
+		return false
+	}
+	return true
+}
+
+// writeJSON encodes a value as the JSON body of a 200 response, the shared tail of the
+// admin handlers.
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// pollReload runs the reloader's directory sync on a ticker until the context is
+// cancelled, the unattended freshness path: a shard built into the directory is picked up
+// and a removed file is retired without an admin call. It logs only when a sweep changes
+// the served set or errors, so an idle poll is silent.
+func pollReload(ctx context.Context, rl *reloader, every time.Duration, out io.Writer) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			pub, ret, err := rl.sync()
+			if err != nil {
+				_, _ = fmt.Fprintf(out, "reload: %v\n", err)
+			}
+			if pub > 0 || ret > 0 {
+				_, _ = fmt.Fprintf(out, "reload: published %d, retired %d, now %d shards\n", pub, ret, rl.numServed())
+			}
+		}
 	}
 }
 
