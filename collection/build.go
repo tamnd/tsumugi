@@ -15,7 +15,6 @@ import (
 	"github.com/tamnd/tsumugi/forward"
 	"github.com/tamnd/tsumugi/graph"
 	"github.com/tamnd/tsumugi/lexical"
-	"github.com/tamnd/tsumugi/mph"
 )
 
 // shardMeta carries the build-level values every shard in a collection stamps
@@ -191,22 +190,32 @@ func build(opts Options, baseStart uint32, indexStart int, recrawl bool) (Result
 	}
 	docs = reordered
 
-	// Compute the link signals over the whole collection before cutting shards.
-	// The web graph is almost entirely cross-shard, so this is the only place a
-	// real signal exists; each shard then receives its slice of every signal vector
-	// to bake into its feature matrix. The signals are indexed by the same host+url
-	// order the shards are cut from, so sig.slice(lo, hi) lines up with docs[lo:hi].
-	sig, graphRegion, dir := globalSignals(docs, opts.TrustSeeds, opts.SpamSeeds)
-
-	// Assign every document its corpus-stable global node id by the host and domain
-	// partition, the id the graph region keys a far out-edge by. It is a separate id
-	// from the dense docID a shard numbers its documents 0..N with: the dense id is
-	// the within-shard position the postings and forward store use, the global id is
-	// the host-clustered name a cross-shard edge points at, so a page's far targets on
-	// one host fall in a contiguous id range the cross-shard list gap-encodes cheaply.
-	// The shards carry it as their graph id table; serving keeps using the contiguous
-	// nodeBase+dense docID handle, which is untouched.
+	// Resolve the collection-wide canonical-URL directory and assign every document its
+	// corpus-stable global node id before any signal is computed. The directory resolves
+	// each outbound link to a collection index, and the global id is the host-clustered
+	// name a cross-shard edge points at; both feed the per-shard graph regions built next.
+	// The global id is separate from the dense docID a shard numbers its documents 0..N
+	// with: the dense id is the within-shard position the postings and forward store use,
+	// the global id is the contiguous per-host range a cross-shard list gap-encodes
+	// cheaply. The shards carry it as their graph id table; serving keeps using the
+	// contiguous nodeBase+dense docID handle, which is untouched.
+	dir := buildDir(docs)
 	gids := AssignGlobalIDs(docs, DefaultPartitionParams())
+
+	// Build every shard's graph region first, in shard order, then compute the link
+	// signals off those persisted per-shard graphs. The M15 reorder: the web graph is
+	// almost entirely cross-shard, so a real link signal only exists across the whole
+	// collection, but rather than rank over a second merged in-core graph the build now
+	// joins the per-shard regions with the cross-shard rank loops, the shardable form
+	// that holds no expanded adjacency resident. Each shard then receives its slice of
+	// every signal vector to bake into its feature matrix. The signals are indexed by the
+	// same host+url order the shards are cut from, so sig.slice(lo, hi) lines up with
+	// docs[lo:hi] and with the shard whose graph carries those documents.
+	layouts, regions, err := buildShardGraphs(docs, gids, dir, opts.ShardSize)
+	if err != nil {
+		return Result{}, fmt.Errorf("build shard graphs: %w", err)
+	}
+	sig := shardedSignals(regions, docs, gids, opts.TrustSeeds, opts.SpamSeeds, dir, DefaultPartitionParams())
 
 	// The epoch and the configuration digest are build-level: every shard stamps the
 	// same pair, so the shards a single build writes agree on when and under what
@@ -220,31 +229,31 @@ func build(opts Options, baseStart uint32, indexStart int, recrawl bool) (Result
 	res := Result{Docs: len(docs), Hosts: hosts}
 	base := baseStart
 	index := indexStart
-	for lo := 0; lo < len(docs); lo += opts.ShardSize {
-		hi := lo + opts.ShardSize
-		if hi > len(docs) {
-			hi = len(docs)
-		}
+	for _, sl := range layouts {
 		path := shardPath(opts.Out, index)
-		n, err := writeShard(path, docs[lo:hi], sig.slice(lo, hi), base, lo, gids, dir, meta)
+		n, err := writeShard(path, docs[sl.lo:sl.hi], sig.slice(sl.lo, sl.hi), base, sl.gregion, meta)
 		if err != nil {
 			return Result{}, err
 		}
 		res.Bytes += n
-		base += uint32(hi - lo)
+		base += uint32(sl.hi - sl.lo)
 		index++
 		res.Shards++
 	}
 	// Persist the collection-wide link graph as its own artifact, the cross-shard
 	// graph the out-of-core StreamPageRank streams from at scale without buffering
-	// the adjacency. A fresh build's node space is the whole collection from global
-	// id zero (baseStart and indexStart are zero), so the region's dense [0, N) ids
-	// are the collection's global ids directly; an add extends an existing collection
-	// and its union graph is a later milestone's concern, so it leaves the artifact
-	// the original build wrote in place.
-	if baseStart == 0 && indexStart == 0 && len(graphRegion) > 0 {
-		if err := writeCollectionGraph(opts.Out, graphRegion, len(docs)); err != nil {
-			return Result{}, fmt.Errorf("write collection graph: %w", err)
+	// the adjacency. It is assembled out of core from the documents, the same union
+	// the per-shard regions carry sharded, encoded over the dense [0, N) global id
+	// space the artifact spans. A fresh build's node space is the whole collection from
+	// global id zero (baseStart and indexStart are zero), so the region's dense [0, N)
+	// ids are the collection's global ids directly; an add extends an existing collection
+	// and its union graph is a later milestone's concern, so it leaves the artifact the
+	// original build wrote in place.
+	if baseStart == 0 && indexStart == 0 {
+		if graphRegion := buildGraphRegionBytes(docs, dir); len(graphRegion) > 0 {
+			if err := writeCollectionGraph(opts.Out, graphRegion, len(docs)); err != nil {
+				return Result{}, fmt.Errorf("write collection graph: %w", err)
+			}
 		}
 	}
 	// Refresh the collection artifact so serve reads the manifest, the fleet-wide
@@ -336,14 +345,17 @@ func dedupByIdentity(docs []convert.Document) ([]convert.Document, int) {
 	return out, dropped
 }
 
-// writeShard builds the lexical, feature, forward, and graph regions for one slice
-// of documents and writes them into a single shard file at the given global base. It
-// returns the file size. The lexical index gets the title, body, and url fields; the
-// feature matrix gets the derived content and url signals plus the collection-wide
-// link signals in sig (one entry per document, aligned to docs); the forward store
-// keeps the url, title, and body so the shard holds the text it was built from; the
-// graph region carries the link graph recovered from the page bodies.
-func writeShard(path string, docs []convert.Document, sig graphSignals, base uint32, lo int, gids []uint64, dir *mph.Dir, meta shardMeta) (int64, error) {
+// writeShard builds the lexical, feature, and forward regions for one slice of
+// documents and writes them, with the prebuilt graph region, into a single shard file
+// at the given global base. It returns the file size. The lexical index gets the title,
+// body, and url fields; the feature matrix gets the derived content and url signals plus
+// the collection-wide link signals in sig (one entry per document, aligned to docs); the
+// forward store keeps the url, title, and body so the shard holds the text it was built
+// from. The graph region is passed in: the M15 reorder builds every shard's graph region
+// first so the signals can be computed off the persisted shard graphs, and writeShard
+// embeds the very bytes those signals were read from, so the stored graph and the graph
+// the signals saw are one.
+func writeShard(path string, docs []convert.Document, sig graphSignals, base uint32, gregion []byte, meta shardMeta) (int64, error) {
 	lb := lexical.NewBuilder(lexical.DefaultParams())
 	fb := feature.NewBuilder(feature.DefaultSchema(), feature.SchemaVersion)
 	cols := docColumns()
@@ -369,10 +381,6 @@ func writeShard(path string, docs []convert.Document, sig graphSignals, base uin
 		}
 	}
 	fwd := forward.NewBuilder(fwdCols)
-	// The shard's graph region carries the partition global node ids for its nodes as
-	// its id table (dense docID d in this shard is collection index lo+d, whose global
-	// id is gids[lo+d]), the names a cross-shard edge resolves against.
-	gb := graph.NewBuilder(len(docs)).WithNodeIDs(gids[lo : lo+len(docs)])
 
 	var tokens, titleTokens, bodyTokens, urlTokens float64
 	for i, d := range docs {
@@ -428,26 +436,10 @@ func writeShard(path string, docs []convert.Document, sig graphSignals, base uin
 		fwd.Set(id, "url", []byte(d.URL))
 		fwd.Set(id, "title", []byte(a.Title))
 		fwd.Set(id, "body", []byte(d.Body))
-		// Resolve each outbound link against the collection-wide directory. A target
-		// the collection holds is either in this shard (an intra-shard edge, keyed by
-		// the local dense docID) or in another shard (a cross-shard edge, keyed by the
-		// target's global node id, framed into the region's cross-shard list to route to
-		// the owning shard later). A target the crawl never captured does not resolve
-		// and is dropped, which on a breadth-first sample is almost all of them.
-		for _, tgt := range analyze.Links(d) {
-			j, ok := dir.Lookup([]byte(tgt))
-			if !ok || int(j) == lo+i {
-				continue
-			}
-			if int(j) >= lo && int(j) < lo+len(docs) {
-				gb.AddEdge(i, int(j)-lo)
-			} else {
-				gb.AddCrossEdge(i, gids[j])
-			}
-		}
 	}
 
-	gregion := gb.Build()
+	// Open the prebuilt graph region to read its edge count for the footer; the bytes are
+	// stored as-is below. graph.Open holds no adjacency resident, so this is a header parse.
 	g, err := graph.Open(gregion)
 	if err != nil {
 		return 0, err

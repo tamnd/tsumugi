@@ -49,14 +49,24 @@ func Compact(dir string, shardSize int, epoch uint64) (Result, error) {
 	if err := os.MkdirAll(staging, 0o755); err != nil {
 		return Result{}, err
 	}
-	// Recompute the collection-wide link signals over the reordered set, the same
-	// pass a fresh build runs, so the compacted shards carry the signals as if built
-	// whole. A compact has no seed list to thread through, so it seeds trust from
-	// inverse PageRank alone, the same default a build with no curated seeds uses.
-	sig, graphRegion, urlDir := globalSignals(docs, nil, nil)
-	// Reassign the partition global node ids over the reordered set, the same id the
-	// shards a fresh build writes carry as their graph id table.
+	// Resolve the directory and reassign the partition global node ids over the reordered
+	// set, the same ids the shards a fresh build writes carry as their graph id table,
+	// before recomputing any signal.
+	urlDir := buildDir(docs)
 	gids := AssignGlobalIDs(docs, DefaultPartitionParams())
+
+	// Recompute the collection-wide link signals over the reordered set the same way a
+	// fresh build does: build every shard's graph region first, then join them with the
+	// cross-shard rank loops, so the compacted shards carry the signals as if built whole
+	// without ranking over a second merged in-core graph. A compact has no seed list to
+	// thread through, so it seeds trust from inverse PageRank alone, the same default a
+	// build with no curated seeds uses.
+	layouts, regions, err := buildShardGraphs(docs, gids, urlDir, shardSize)
+	if err != nil {
+		_ = os.RemoveAll(staging)
+		return Result{}, fmt.Errorf("build shard graphs: %w", err)
+	}
+	sig := shardedSignals(regions, docs, gids, nil, nil, urlDir, DefaultPartitionParams())
 
 	// A compact rebuilds with no curated seeds, the same default a build with none uses,
 	// so its configuration digest folds in the empty seed lists. The epoch is passed in
@@ -66,18 +76,14 @@ func Compact(dir string, shardSize int, epoch uint64) (Result, error) {
 	res := Result{Docs: len(docs), Hosts: hosts}
 	var base uint32
 	index := 0
-	for lo := 0; lo < len(docs); lo += shardSize {
-		hi := lo + shardSize
-		if hi > len(docs) {
-			hi = len(docs)
-		}
-		n, err := writeShard(shardPath(staging, index), docs[lo:hi], sig.slice(lo, hi), base, lo, gids, urlDir, meta)
+	for _, sl := range layouts {
+		n, err := writeShard(shardPath(staging, index), docs[sl.lo:sl.hi], sig.slice(sl.lo, sl.hi), base, sl.gregion, meta)
 		if err != nil {
 			_ = os.RemoveAll(staging)
 			return Result{}, err
 		}
 		res.Bytes += n
-		base += uint32(hi - lo)
+		base += uint32(sl.hi - sl.lo)
 		index++
 		res.Shards++
 	}
@@ -103,7 +109,7 @@ func Compact(dir string, shardSize int, epoch uint64) (Result, error) {
 	// A compact rebuilds the whole collection over the reordered set from global id
 	// zero, so refresh the collection-wide graph artifact the same way a fresh build
 	// writes it, keeping the streamed cross-shard graph in step with the new ids.
-	if len(graphRegion) > 0 {
+	if graphRegion := buildGraphRegionBytes(docs, urlDir); len(graphRegion) > 0 {
 		if err := writeCollectionGraph(dir, graphRegion, len(docs)); err != nil {
 			return Result{}, fmt.Errorf("write collection graph: %w", err)
 		}
