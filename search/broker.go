@@ -461,6 +461,51 @@ func (b *Broker) SearchWithinBudget(ctx context.Context, q Query) Results {
 // smaller set rather than an unranked one. The drop-a-slow-shard-at-the-deadline step
 // is orthogonal and automatic in the fan-out at any level, reported through Complete.
 func (b *Broker) SearchDegraded(ctx context.Context, q Query, level DegradeLevel) Results {
+	casc, survivors, rows, total, ok := b.candidates(ctx, q, level)
+	cands := casc.ScoreRows(survivors, rows, q.K)
+	hits := make([]Hit, len(cands))
+	for i, c := range cands {
+		hits[i] = Hit{DocID: c.DocID, Score: c.Score}
+	}
+	return Results{Hits: hits, ShardsTotal: total, ShardsOK: ok, Degraded: level}
+}
+
+// FeatureHit is a retrieval candidate paired with the exact L2 feature row the cascade
+// would score it on: the matrix row gathered from its shard followed by the online
+// query-dependent features. It is what SearchFeatures returns so an offline trainer sees
+// the same feature vector the serving path builds, the spec's training-and-serving
+// identical-features requirement.
+type FeatureHit struct {
+	DocID uint32
+	Row   []float64
+}
+
+// SearchFeatures runs the cascade up to but not including the L2 model: it retrieves,
+// fuses the planes, runs the L1 linear cut, and extracts each survivor's full L2 feature
+// row, returning the survivors paired with those rows instead of the model's order. It
+// is the seam the training bootstrap retrieves candidates through, so the rows it labels
+// and fits the model over are byte-for-byte the rows ScoreRows consumes at serve time,
+// which is what makes a model trained on them see identical features when it ranks. It
+// runs at full quality, with no degradation, because the trainer wants the complete
+// candidate pool the spec's bootstrap pools and judges.
+func (b *Broker) SearchFeatures(ctx context.Context, q Query) []FeatureHit {
+	_, survivors, rows, _, _ := b.candidates(ctx, q, DegradeNone)
+	out := make([]FeatureHit, len(survivors))
+	for i, c := range survivors {
+		out[i] = FeatureHit{DocID: c.DocID, Row: rows[i]}
+	}
+	return out
+}
+
+// candidates runs the shared cascade front: it routes the query, gathers the global idf,
+// fans out to the shards, merges the per-plane ranked lists, runs the L1 linear cut, and
+// extracts the survivors' full L2 feature rows, returning the per-query cascade (degraded
+// or not), the L1 survivors, their feature rows aligned to the survivors, and the shard
+// counts. It is the half SearchDegraded and SearchFeatures share: the former scores the
+// rows with the L2 model and returns ranked hits, the latter returns the rows themselves.
+// Pulling it out keeps the two paths byte-identical through retrieval and extraction, so
+// a candidate's training row is exactly its serving row.
+func (b *Broker) candidates(ctx context.Context, q Query, level DegradeLevel) (*rank.Cascade, []rank.Candidate, [][]float64, int, int) {
 	// Load the served snapshot once at entry, take a reference on it, and use it to the end.
 	// A concurrent publish or retire swaps in a new snapshot for the next query, but this
 	// query routes, gathers idf, fans out, and reranks against one consistent shard set, so a
@@ -555,12 +600,7 @@ func (b *Broker) SearchDegraded(ctx context.Context, q Query, level DegradeLevel
 	// the core count while the cheap serial scoring pass is unchanged.
 	survivors := casc.Survivors(localIDs(allLex), localIDs(allDense), l1feat)
 	rows := b.extractRows(survivors, feats, owner, st, q, avgField)
-	cands := casc.ScoreRows(survivors, rows, q.K)
-	hits := make([]Hit, len(cands))
-	for i, c := range cands {
-		hits[i] = Hit{DocID: c.DocID, Score: c.Score}
-	}
-	return Results{Hits: hits, ShardsTotal: len(targets), ShardsOK: ok, Degraded: level}
+	return casc, survivors, rows, len(targets), ok
 }
 
 // extractRows builds the full L2 feature row for each survivor, the matrix row

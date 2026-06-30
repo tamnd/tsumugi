@@ -17,19 +17,34 @@ func newTrainCmd() *cobra.Command {
 		out       string
 		groupSize int
 		rounds    int
+		queries   string
+		model     string
+		evalFrac  float64
+		poolK     int
 	)
 	cmd := &cobra.Command{
 		Use:   "train <dir>",
 		Short: "Bootstrap a ranking model from a collection",
-		Long: "train fits a LambdaMART model over a collection's feature matrix using the\n" +
-			"static-rank prior as a bootstrap label, the cold-start model the serve command\n" +
-			"ranks with until real relevance judgments replace the prior. It reads every\n" +
-			"shard's features, groups documents into synthetic queries, fits the model, and\n" +
-			"writes it to a file.",
+		Long: "train fits a LambdaMART ranking model from a collection.\n\n" +
+			"Without --queries it fits the cold-start model: a LambdaMART over the feature\n" +
+			"matrix using the static-rank prior as a bootstrap label, the model the serve\n" +
+			"command ranks with until real relevance judgments exist.\n\n" +
+			"With --queries it runs the UMBRELA training bootstrap: for each query it\n" +
+			"retrieves a candidate pool through the same feature path serving uses, grades\n" +
+			"every candidate with the UMBRELA judge (the LLM judge when TSUMUGI_JUDGE_URL is\n" +
+			"set, otherwise the deterministic lexical judge), fits a model on the graded\n" +
+			"labels, and writes it only when its NDCG@10 beats the --model cold-start\n" +
+			"baseline on a held-out query split.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if out == "" {
 				return fmt.Errorf("a model output path is required: pass --out")
+			}
+			if queries != "" {
+				if model == "" {
+					return fmt.Errorf("the UMBRELA bootstrap needs a cold-start baseline model: pass --model")
+				}
+				return runBootstrap(cmd.OutOrStdout(), args[0], model, queries, out, evalFrac, rounds, poolK)
 			}
 			d, err := bootstrapDataset(args[0], groupSize)
 			if err != nil {
@@ -59,8 +74,12 @@ func newTrainCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&out, "out", "", "model output file")
-	cmd.Flags().IntVar(&groupSize, "group-size", 16, "documents per synthetic query group")
+	cmd.Flags().IntVar(&groupSize, "group-size", 16, "documents per synthetic query group (cold-start path)")
 	cmd.Flags().IntVar(&rounds, "rounds", 200, "boosting rounds")
+	cmd.Flags().StringVar(&queries, "queries", "", "training query file, one query per line, for the UMBRELA bootstrap")
+	cmd.Flags().StringVar(&model, "model", "", "cold-start baseline model the UMBRELA bootstrap retrieves with and gates against")
+	cmd.Flags().Float64Var(&evalFrac, "eval-frac", 0.3, "fraction of queries held out to evaluate the trained model")
+	cmd.Flags().IntVar(&poolK, "pool", 200, "candidate pool width retrieved per query for judging")
 	return cmd
 }
 
