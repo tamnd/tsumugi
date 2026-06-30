@@ -81,6 +81,16 @@ func newServeCmd() *cobra.Command {
 			mux.HandleFunc("/admin/publish", srv.publish)
 			mux.HandleFunc("/admin/retire", srv.retire)
 
+			// Expose the broker as one node of a serving tree that spans machines: an aggregator on
+			// a head node dials these routes to fan a query across this broker as a remote child, so
+			// a deployment reaches past one machine's shards by adding leaf nodes rather than growing
+			// one box (doc 11, "The serving topology", across hosts). The RPC routes live under /rpc/
+			// so the machine-to-machine wire is kept separate from the human /search above, which
+			// understands a raw query string and returns the took-ms-and-completeness envelope; the
+			// /rpc/search wire carries an already-analyzed query and returns the bare Results an
+			// aggregator merges.
+			mux.Handle("/rpc/", http.StripPrefix("/rpc", search.NewSearcherHandler(broker)))
+
 			// An optional poll picks up shards dropped into or removed from the directory without
 			// an admin call, so a deployment can publish by writing a file. A zero interval leaves
 			// the served set fixed until an admin call, the pre-slice behavior.
