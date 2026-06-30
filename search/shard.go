@@ -1,6 +1,7 @@
 package search
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -206,7 +207,28 @@ func (s *Shard) featureRow(localID uint32) []float64 {
 // in local document ids together with the feature rows of every candidate. It is the
 // shared core of Search and the broker fan-out: Search runs the cascade locally,
 // while the broker gathers retrievals from many shards and runs one global rerank.
-func (s *Shard) retrieve(q Query) (lex, dense []scored, feats map[uint32][]float64) {
+// retrievePreemptStride is how often the retrieval checks the deadline while gathering
+// a plane's candidates: once every this-many-plus-one rows. The check is a context Err
+// read, cheap but not free on a cancellable context (it touches the context's mutex), so
+// it runs against a stride rather than every row, often enough to abandon a long plane
+// soon after the budget runs out and rare enough to cost nothing on the common path where
+// the budget holds. A power-of-two-minus-one so the test is a single bitwise and.
+const retrievePreemptStride = 255
+
+// retrieve runs the shard's retrieval planes and returns the candidates each produced
+// with their feature rows, and whether it finished before the query's deadline. The
+// deadline reaches the shard through ctx so a goroutine the broker dispatched before the
+// budget ran out does not keep scanning after it: at each plane boundary, and on a stride
+// while gathering a plane's rows, the shard checks whether ctx is done and abandons the
+// rest of the work if it is. An abandoned retrieval returns completed=false, and the
+// broker drops the shard from the merge rather than serving its half-built candidate set,
+// so the partial answer stays honest (the shard is rolled up as not responded, exactly as
+// a slow shard the collection stopped waiting for) and no CPU is spent on a plane whose
+// result the collection has already stopped waiting for. The dense plane is the most
+// expensive, so abandoning at the lexical-to-dense boundary when the deadline has already
+// passed is where this saves the most. The returned slices on an abandoned retrieval are
+// an arbitrary partial and must be discarded; only the completed flag is meaningful then.
+func (s *Shard) retrieve(ctx context.Context, q Query) (lex, dense []scored, feats map[uint32][]float64, completed bool) {
 	feats = make(map[uint32][]float64)
 	l0 := s.l0
 	if q.L0 > 0 {
@@ -216,10 +238,16 @@ func (s *Shard) retrieve(q Query) (lex, dense []scored, feats map[uint32][]float
 	if k < l0 {
 		k = l0
 	}
+	if ctx.Err() != nil {
+		return lex, dense, feats, false
+	}
 	if s.lex != nil && len(q.lexTerms()) > 0 {
 		cands, err := s.lexSearch(q, k)
 		if err == nil {
-			for _, c := range cands {
+			for i, c := range cands {
+				if (i&retrievePreemptStride) == 0 && ctx.Err() != nil {
+					return lex, dense, feats, false
+				}
 				lex = append(lex, scored{docID: c.DocID, score: float64(c.Score)})
 				if _, ok := feats[c.DocID]; !ok {
 					feats[c.DocID] = s.featureRow(c.DocID)
@@ -227,23 +255,35 @@ func (s *Shard) retrieve(q Query) (lex, dense []scored, feats map[uint32][]float
 			}
 		}
 	}
+	if ctx.Err() != nil {
+		return lex, dense, feats, false
+	}
 	if s.sp != nil && len(q.Sparse) > 0 {
-		for _, c := range s.sp.Search(q.Sparse, k) {
+		for i, c := range s.sp.Search(q.Sparse, k) {
+			if (i&retrievePreemptStride) == 0 && ctx.Err() != nil {
+				return lex, dense, feats, false
+			}
 			lex = append(lex, scored{docID: c.DocID, score: float64(c.Score)})
 			if _, ok := feats[c.DocID]; !ok {
 				feats[c.DocID] = s.featureRow(c.DocID)
 			}
 		}
 	}
+	if ctx.Err() != nil {
+		return lex, dense, feats, false
+	}
 	if s.vec != nil && len(q.Vector) > 0 {
-		for _, c := range s.vec.Search(q.Vector, k, vector.DefaultEfSearch, vector.DefaultRerankDepth) {
+		for i, c := range s.vec.Search(q.Vector, k, vector.DefaultEfSearch, vector.DefaultRerankDepth) {
+			if (i&retrievePreemptStride) == 0 && ctx.Err() != nil {
+				return lex, dense, feats, false
+			}
 			dense = append(dense, scored{docID: c.DocID, score: c.Score})
 			if _, ok := feats[c.DocID]; !ok {
 				feats[c.DocID] = s.featureRow(c.DocID)
 			}
 		}
 	}
-	return lex, dense, feats
+	return lex, dense, feats, true
 }
 
 // lexSearch runs the lexical plane over the query's analyzed term set, scoring with
@@ -284,7 +324,7 @@ func (s *Shard) ForEachTerm(fn func(term string, docFreq uint32)) {
 // cascade wired end to end: retrieve on every plane, fuse and cut and rerank, and
 // shift the local ids into the global space by the shard's node base.
 func (s *Shard) Search(q Query) []Hit {
-	lex, dense, feats := s.retrieve(q)
+	lex, dense, feats, _ := s.retrieve(context.Background(), q)
 	lexIDs := localIDs(lex)
 	denseIDs := localIDs(dense)
 	// L1 reads the cheap matrix row; L2 reads the matrix row followed by the online

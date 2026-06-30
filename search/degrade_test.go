@@ -111,12 +111,12 @@ func TestQueryL0OverridesRetrieval(t *testing.T) {
 
 	// Every document carries the shared term, so the lexical plane can return up to n
 	// candidates. With the default L0 (1000) and a small K, retrieval returns all n.
-	full, _, _ := s.retrieve(Query{Text: "common document", K: 5})
+	full, _, _, _ := s.retrieve(context.Background(), Query{Text: "common document", K: 5})
 	if len(full) != n {
 		t.Fatalf("default L0 retrieved %d candidates, want %d (every doc matches)", len(full), n)
 	}
 	// The same query with a small L0 override caps retrieval to that width.
-	small, _, _ := s.retrieve(Query{Text: "common document", K: 5, L0: 10})
+	small, _, _, _ := s.retrieve(context.Background(), Query{Text: "common document", K: 5, L0: 10})
 	if len(small) != 10 {
 		t.Fatalf("L0=10 retrieved %d candidates, want 10", len(small))
 	}
