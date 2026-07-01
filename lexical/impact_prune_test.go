@@ -1,6 +1,9 @@
 package lexical
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 // queryInfos resolves a query string to the termInfo slice the traversals take, the same
 // resolution SearchImpact does, so the prune tests can call the exhaustive oracle and the
@@ -158,5 +161,31 @@ func TestPrunedImpactRejectsBM25Region(t *testing.T) {
 	infos := queryInfos(r, "term0001")
 	if _, err := r.prunedImpact(infos, 10); err != errNotImpactRegion {
 		t.Fatalf("prunedImpact on bm25 region: got %v, want errNotImpactRegion", err)
+	}
+}
+
+// TestSearchImpactTermsCtxCancel checks the deadline contract the shard fan-out relies on: a
+// search whose context is already cancelled abandons the walk and returns context.Canceled,
+// so a preempted shard drops its result rather than serve a half-walked list.
+func TestSearchImpactTermsCtxCancel(t *testing.T) {
+	docs := genCorpus(13, 3000, 200)
+	r := buildImpactRegion(t, docs)
+	terms := Analyze("term0001 term0002 term0003")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := r.SearchImpactTermsCtx(ctx, terms, 10); err != context.Canceled {
+		t.Fatalf("cancelled search: got %v, want context.Canceled", err)
+	}
+	// An un-cancelled context returns the same result the un-budgeted path does.
+	got, err := r.SearchImpactTermsCtx(context.Background(), terms, 10)
+	if err != nil {
+		t.Fatalf("background search: %v", err)
+	}
+	want, err := r.SearchImpactTerms(terms, 10)
+	if err != nil {
+		t.Fatalf("plain search: %v", err)
+	}
+	if !sameCandidates(got, want) {
+		t.Fatalf("ctx search %+v != plain search %+v", got, want)
 	}
 }

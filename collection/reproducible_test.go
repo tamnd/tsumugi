@@ -159,30 +159,31 @@ func TestBuildConfigHashStable(t *testing.T) {
 	if !ok {
 		t.Fatal("shard recorded no build_config_hash")
 	}
-	want := buildConfigHash(20, nil, nil)
+	want := buildConfigHash(20, nil, nil, false)
 	if got != want {
 		t.Fatalf("recorded config hash %#016x, computed %#016x", got, want)
 	}
 
-	base := buildConfigHash(20, nil, nil)
+	base := buildConfigHash(20, nil, nil, false)
 	cases := []struct {
 		name string
 		hash uint64
 		same bool
 	}{
-		{"same inputs", buildConfigHash(20, nil, nil), true},
-		{"different shard size", buildConfigHash(50, nil, nil), false},
-		{"added trust seed", buildConfigHash(20, []string{"https://a/"}, nil), false},
-		{"added spam seed", buildConfigHash(20, nil, []string{"https://b/"}), false},
+		{"same inputs", buildConfigHash(20, nil, nil, false), true},
+		{"different shard size", buildConfigHash(50, nil, nil, false), false},
+		{"added trust seed", buildConfigHash(20, []string{"https://a/"}, nil, false), false},
+		{"added spam seed", buildConfigHash(20, nil, []string{"https://b/"}, false), false},
+		{"impact ordering", buildConfigHash(20, nil, nil, true), false},
 		{"seed order irrelevant",
-			buildConfigHash(20, []string{"https://b/", "https://a/"}, nil),
-			buildConfigHash(20, []string{"https://a/", "https://b/"}, nil) == base},
+			buildConfigHash(20, []string{"https://b/", "https://a/"}, nil, false),
+			buildConfigHash(20, []string{"https://a/", "https://b/"}, nil, false) == base},
 	}
 	for _, c := range cases {
 		if c.name == "seed order irrelevant" {
 			// This case asserts two seed orderings agree with each other, not with base.
-			h1 := buildConfigHash(20, []string{"https://b/", "https://a/"}, nil)
-			h2 := buildConfigHash(20, []string{"https://a/", "https://b/"}, nil)
+			h1 := buildConfigHash(20, []string{"https://b/", "https://a/"}, nil, false)
+			h2 := buildConfigHash(20, []string{"https://a/", "https://b/"}, nil, false)
 			if h1 != h2 {
 				t.Errorf("seed order changed the digest: %#016x vs %#016x", h1, h2)
 			}

@@ -45,6 +45,7 @@ func newBuildCmd() *cobra.Command {
 	cmd.Flags().IntVar(&opts.ShardSize, "shard-size", collection.DefaultShardSize, "documents per shard")
 	cmd.Flags().IntVar(&opts.Limit, "limit", 0, "cap documents read, zero for all")
 	cmd.Flags().Uint64Var(&opts.BuildEpoch, "build-epoch", 0, "build timestamp in unix seconds stamped into the shards and index; unset uses the current time, a fixed value gives a reproducible build")
+	cmd.Flags().BoolVar(&opts.Impact, "impact", false, "build the lexical region impact-ordered by static rank and serve it inference-free (query-term coverage weighted by static rank) instead of BM25F")
 	return cmd
 }
 
