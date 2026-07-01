@@ -102,11 +102,10 @@ func BenchmarkBuildBM25(b *testing.B) {
 	}
 }
 
-// BenchmarkSearchImpact measures the impact scorer's query latency on the mid-size shard,
-// the number the impl note reads against the sub-10ms shard budget. This slice serves it
-// from the exhaustive scan; the pruned traversal the next slice adds is benchmarked against
-// this baseline.
-func BenchmarkSearchImpact(b *testing.B) {
+// benchImpactShard builds the mid-size impact-ordered shard the impact search benchmarks
+// share, so the pruned and exhaustive numbers are read off one corpus.
+func benchImpactShard(b *testing.B) (*Region, []string) {
+	b.Helper()
 	docs := genCorpus(1, 50000, 2000)
 	bld := NewBuilder(DefaultParams())
 	for i, d := range docs {
@@ -116,12 +115,47 @@ func BenchmarkSearchImpact(b *testing.B) {
 	if err != nil {
 		b.Fatalf("open: %v", err)
 	}
-	queries := genQueries(2, 1000, 2000, 4)
+	return r, genQueries(2, 1000, 2000, 4)
+}
 
+// BenchmarkSearchImpact measures the impact scorer's query latency on the mid-size shard,
+// the number the impl note reads against the sub-10ms shard budget. It now serves from the
+// pruned early-termination traversal; BenchmarkSearchImpactExhaustive is the full-scan
+// baseline the skip win is read against.
+func BenchmarkSearchImpact(b *testing.B) {
+	r, queries := benchImpactShard(b)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		q := queries[i%len(queries)]
 		if _, err := r.SearchImpact(q, DefaultK); err != nil {
+			b.Fatalf("search: %v", err)
+		}
+	}
+}
+
+// BenchmarkSearchImpactSmallK measures the pruned traversal at k=10, where the top-k settles
+// early and the skip discards the most work, the query shape the impact ordering exists for.
+func BenchmarkSearchImpactSmallK(b *testing.B) {
+	r, queries := benchImpactShard(b)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		q := queries[i%len(queries)]
+		if _, err := r.SearchImpact(q, 10); err != nil {
+			b.Fatalf("search: %v", err)
+		}
+	}
+}
+
+// BenchmarkSearchImpactExhaustive is the full-scan baseline: the exhaustive scorer decodes
+// every posting of every list. The gap to BenchmarkSearchImpact at the same k is the pruned
+// traversal's skip win.
+func BenchmarkSearchImpactExhaustive(b *testing.B) {
+	r, queries := benchImpactShard(b)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		q := queries[i%len(queries)]
+		infos := r.termInfos(Analyze(q), nil)
+		if _, err := r.exhaustiveImpact(infos, DefaultK); err != nil {
 			b.Fatalf("search: %v", err)
 		}
 	}

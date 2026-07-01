@@ -86,13 +86,16 @@ func naiveImpactCCrawl(r *lexical.Region, inv map[string][]uint32, terms []strin
 	return cands
 }
 
-// TestImpactCCrawl proves the impact format and its scorer on real crawl data, the skewed
-// language and posting-length distribution the engine is meant to serve. It builds the real
-// documents impact-ordered, draws queries from the corpus's most frequent terms so most
-// queries hit several multi-block lists, and checks the region's impact scorer returns
-// exactly the naive coverage-times-impact oracle. It runs without the race detector because
-// the ccrawl build times out under it; the in-package tests cover the format under -race on
-// synthetic corpora.
+// TestImpactCCrawl proves the impact format and the pruned traversal on real crawl data, the
+// skewed language and posting-length distribution the engine is meant to serve. It builds the
+// real documents impact-ordered, draws queries from the corpus's most frequent terms so most
+// queries hit several multi-block lists, and checks the served path returns exactly the naive
+// coverage-times-impact oracle. The served path is the pruned early-termination traversal:
+// SearchImpactTerms runs prunedImpact, so a match here is the pruned traversal proven correct
+// on real data, at both a broad k and the small k where the early stop discards the tail. It
+// runs without the race detector because the ccrawl build times out under it; the in-package
+// tests cover the traversal under -race on synthetic corpora and gate it against the
+// exhaustive scan directly.
 func TestImpactCCrawl(t *testing.T) {
 	docs := ccrawlSpimiDocs(t, 20000)
 	if len(docs) == 0 {
@@ -127,28 +130,32 @@ func TestImpactCCrawl(t *testing.T) {
 	}
 
 	rng := rand.New(rand.NewSource(97))
-	const k = 100
 	queries := 150
-	for q := 0; q < queries; q++ {
-		n := 1 + rng.Intn(4)
-		terms := make([]string, n)
-		for i := range terms {
-			terms[i] = vocab[rng.Intn(len(vocab))].term
-		}
-		got, err := r.SearchImpactTerms(terms, k)
-		if err != nil {
-			t.Fatalf("search %v: %v", terms, err)
-		}
-		want := naiveImpactCCrawl(r, inv, terms, k)
-		if len(got) != len(want) {
-			t.Fatalf("query %v: got %d results, want %d", terms, len(got), len(want))
-		}
-		for i := range want {
-			if got[i] != want[i] {
-				t.Fatalf("query %v result %d: got %+v want %+v", terms, i, got[i], want[i])
+	// Both a broad k and a small k: at k=10 the top-k settles early on the frequent terms, so
+	// the pruned traversal skips the tail, exactly where an off-by-one in the stop bound would
+	// change the result. The oracle is independent of k, so both must still match it exactly.
+	for _, k := range []int{100, 10} {
+		for q := 0; q < queries; q++ {
+			n := 1 + rng.Intn(4)
+			terms := make([]string, n)
+			for i := range terms {
+				terms[i] = vocab[rng.Intn(len(vocab))].term
+			}
+			got, err := r.SearchImpactTerms(terms, k)
+			if err != nil {
+				t.Fatalf("search %v k=%d: %v", terms, k, err)
+			}
+			want := naiveImpactCCrawl(r, inv, terms, k)
+			if len(got) != len(want) {
+				t.Fatalf("query %v k=%d: got %d results, want %d", terms, k, len(got), len(want))
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Fatalf("query %v k=%d result %d: got %+v want %+v", terms, k, i, got[i], want[i])
+				}
 			}
 		}
 	}
-	t.Logf("impact scorer matched the coverage-times-impact oracle over %d queries on %d ccrawl docs",
+	t.Logf("pruned impact traversal matched the coverage-times-impact oracle over %d queries at k=100 and k=10 on %d ccrawl docs",
 		queries, len(docs))
 }
