@@ -220,6 +220,14 @@ func build(opts Options, baseStart uint32, indexStart int, recrawl bool) (Result
 	dir := buildDir(docs)
 	gids := AssignGlobalIDs(docs, DefaultPartitionParams())
 
+	// Invert the outbound anchor text into per-document inbound anchor fields now that
+	// the directory can resolve every link to a node id. A document's anchor field is
+	// the phrases other pages used to link it, weighted by distinct source domain and by
+	// off-domain endorsement, the off-page describes-me signal the shards index as
+	// FieldAnchor. It is gathered over the whole collection here, in the same node-id
+	// order the shards slice their documents by, so each writeShard reads its own slice.
+	anchors := anchorFields(docs, dir)
+
 	// Build every shard's graph region first, in shard order, then compute the link
 	// signals off those persisted per-shard graphs. The M15 reorder: the web graph is
 	// almost entirely cross-shard, so a real link signal only exists across the whole
@@ -250,7 +258,7 @@ func build(opts Options, baseStart uint32, indexStart int, recrawl bool) (Result
 	index := indexStart
 	for _, sl := range layouts {
 		path := shardPath(opts.Out, index)
-		n, err := writeShard(path, docs[sl.lo:sl.hi], sig.slice(sl.lo, sl.hi), base, sl.gregion, meta)
+		n, err := writeShard(path, docs[sl.lo:sl.hi], anchors[sl.lo:sl.hi], sig.slice(sl.lo, sl.hi), base, sl.gregion, meta)
 		if err != nil {
 			return Result{}, err
 		}
@@ -367,14 +375,16 @@ func dedupByIdentity(docs []convert.Document) ([]convert.Document, int) {
 // writeShard builds the lexical, feature, and forward regions for one slice of
 // documents and writes them, with the prebuilt graph region, into a single shard file
 // at the given global base. It returns the file size. The lexical index gets the title,
-// body, and url fields; the feature matrix gets the derived content and url signals plus
+// body, url, and inbound-anchor fields (anchors[i] is the anchor field the inversion
+// gathered for the shard-local document i); the feature matrix gets the derived content
+// and url signals plus
 // the collection-wide link signals in sig (one entry per document, aligned to docs); the
 // forward store keeps the url, title, and body so the shard holds the text it was built
 // from. The graph region is passed in: the M15 reorder builds every shard's graph region
 // first so the signals can be computed off the persisted shard graphs, and writeShard
 // embeds the very bytes those signals were read from, so the stored graph and the graph
 // the signals saw are one.
-func writeShard(path string, docs []convert.Document, sig graphSignals, base uint32, gregion []byte, meta shardMeta) (int64, error) {
+func writeShard(path string, docs []convert.Document, anchors []string, sig graphSignals, base uint32, gregion []byte, meta shardMeta) (int64, error) {
 	lb := lexical.NewBuilder(lexical.DefaultParams())
 	fb := feature.NewBuilder(feature.DefaultSchema(), feature.SchemaVersion)
 	cols := docColumns()
@@ -406,9 +416,10 @@ func writeShard(path string, docs []convert.Document, sig graphSignals, base uin
 		a := analyze.Document(d)
 		id := uint32(i)
 		lb.AddDoc(id, map[lexical.Field]string{
-			lexical.FieldTitle: a.Title,
-			lexical.FieldBody:  d.Body,
-			lexical.FieldURL:   d.URL,
+			lexical.FieldTitle:  a.Title,
+			lexical.FieldBody:   d.Body,
+			lexical.FieldURL:    d.URL,
+			lexical.FieldAnchor: anchors[i],
 		})
 		// Per-field token counts feed the fleet average field lengths the broker BM25F
 		// normalizes each field by. token_count stays title+body so avg_doc_len is
