@@ -14,8 +14,9 @@ type posting struct {
 
 // Builder accumulates impact postings and encodes them into an IMP1 region.
 // Postings arrive as (term, docID, weight) in any order; Build finds the global
-// weight range, quantizes, groups each term's postings into docID-aligned blocks,
-// and writes the per-block max impact the BMP traversal prunes on.
+// weight range, quantizes, orders each term's postings impact-descending, groups
+// them into fixed-count blocks, and writes the per-block leading (max) impact the
+// anytime traversal prunes on.
 type Builder struct {
 	terms     map[string][]posting
 	docCount  uint32
@@ -82,8 +83,8 @@ func (b *Builder) Build() []byte {
 		})
 		// One impact per (term, docID). Postings are sorted by docID then weight
 		// descending, so the first of each docID run is the strongest; drop the
-		// rest. Duplicates would double-count a doc past its own block-max bound
-		// and break the pruned == exhaustive guarantee.
+		// rest. Deduping here means encodeTermBlocks sees each doc once, so a doc's
+		// whole contribution for the term is a single impact in a single block.
 		return name, dedupByDoc(ps), true
 	}
 
@@ -153,53 +154,67 @@ func dedupByDoc(ps []posting) []posting {
 	return out
 }
 
-// encodeTermBlocks writes one term's postings as docID-aligned blocks and returns
-// the block count. Each block covers the range [blockID*B, (blockID+1)*B); its
-// header is the block id, the posting count, and the block-max impact (the
-// largest quantized impact in the block, the BMP upper bound for the range).
+// encodeTermBlocks writes one term's postings impact-descending and returns the
+// block count. This is the doc-04 impact ordering: the postings are quantized,
+// sorted by impact descending (docID ascending on a tie), and cut into fixed-count
+// blocks of blockSize postings. Because the list is impact-sorted, each block's
+// leading impact is its maximum and those leading impacts are monotone
+// non-increasing down the list, so the traversal can walk blocks in descending
+// bound order and stop once no unvisited block can lift a document past the top-k.
+//
+// A block header is the trailing (min) impact, the posting count, the leading
+// (max) impact, and the body length; the body is the block's docIDs as zig-zag
+// signed deltas (impact order is not docID monotone, so gaps run both ways)
+// followed by one impact byte per posting. The body length lets a reader skip a
+// whole block without decoding it, which is what makes the pruning pay off.
 func encodeTermBlocks(dst *[]byte, ps []posting, q quantizer, blockSize uint32) uint32 {
-	type blk struct {
-		id      uint32
-		docIDs  []uint32
-		impacts []uint8
-		max     uint8
+	if len(ps) == 0 {
+		return 0
 	}
-	var blocks []blk
-	var cur *blk
-	for _, p := range ps {
-		id := p.docID / blockSize
-		if cur == nil || cur.id != id {
-			blocks = append(blocks, blk{id: id})
-			cur = &blocks[len(blocks)-1]
-		}
-		imp := q.quantize(p.weight)
-		cur.docIDs = append(cur.docIDs, p.docID)
-		cur.impacts = append(cur.impacts, imp)
-		if imp > cur.max {
-			cur.max = imp
-		}
+	type qp struct {
+		docID  uint32
+		impact uint8
 	}
-	for _, blk := range blocks {
-		// Encode the body (gap varints then impacts) first so its byte length can
-		// be written in the header. The length lets a reader skip a whole block
-		// without decoding it, which is what makes BMP pruning pay off.
-		var body []byte
-		prev := uint32(0)
-		for i, d := range blk.docIDs {
-			if i == 0 {
-				body = codec.AppendUvarint(body, uint64(d))
-			} else {
-				body = codec.AppendUvarint(body, uint64(d-prev))
-			}
-			prev = d
+	qps := make([]qp, len(ps))
+	for i, p := range ps {
+		qps[i] = qp{docID: p.docID, impact: q.quantize(p.weight)}
+	}
+	sort.Slice(qps, func(a, c int) bool {
+		if qps[a].impact != qps[c].impact {
+			return qps[a].impact > qps[c].impact
 		}
-		body = append(body, blk.impacts...)
+		return qps[a].docID < qps[c].docID
+	})
 
-		*dst = codec.AppendUvarint(*dst, uint64(blk.id))
-		*dst = codec.AppendUvarint(*dst, uint64(len(blk.docIDs)))
-		*dst = append(*dst, blk.max)
+	if blockSize == 0 {
+		blockSize = DefaultBlockSize
+	}
+	var blocks uint32
+	for start := 0; start < len(qps); start += int(blockSize) {
+		end := start + int(blockSize)
+		if end > len(qps) {
+			end = len(qps)
+		}
+		blk := qps[start:end]
+		lead := blk[0].impact            // block-max: first, since impact-descending
+		minImp := blk[len(blk)-1].impact // block-min: trailing impact
+
+		var body []byte
+		prev := int64(0)
+		for _, e := range blk {
+			body = codec.AppendVarint(body, int64(e.docID)-prev)
+			prev = int64(e.docID)
+		}
+		for _, e := range blk {
+			body = append(body, e.impact)
+		}
+
+		*dst = codec.AppendUvarint(*dst, uint64(minImp))
+		*dst = codec.AppendUvarint(*dst, uint64(len(blk)))
+		*dst = append(*dst, lead)
 		*dst = codec.AppendUvarint(*dst, uint64(len(body)))
 		*dst = append(*dst, body...)
+		blocks++
 	}
-	return uint32(len(blocks))
+	return blocks
 }

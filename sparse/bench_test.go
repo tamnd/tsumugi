@@ -19,10 +19,11 @@ func benchRegion(b *testing.B, docs, vocab int) (*Region, []map[string]int) {
 		df := 1 + int(float64(docs)/2/float64(term+1))
 		name := termName(term)
 		// A term's strong documents cluster in a contiguous docID band, the way a
-		// real index assigns nearby docIDs to related pages. That locality gives
-		// blocks genuinely different maxes, which is the skew BMP prunes on; a
-		// uniform sprinkle of strong docs would top every block out near the
-		// ceiling and leave nothing to skip.
+		// real index assigns nearby docIDs to related pages. The impact ordering
+		// re-sorts postings by weight regardless, but the band gives a term a few
+		// genuinely strong docs among many weak ones, the heavy-tailed weight skew
+		// the anytime cutoff prunes on; a flat weight would top every block out near
+		// the ceiling and leave nothing to skip.
 		homeStart := uint32(rng.Intn(docs))
 		homeLen := uint32(docs / 50)
 		for i := 0; i < df; i++ {
@@ -51,7 +52,7 @@ func benchRegion(b *testing.B, docs, vocab int) (*Region, []map[string]int) {
 	return r, queries
 }
 
-func BenchmarkSearchPruned(b *testing.B) {
+func BenchmarkSearchAnytime(b *testing.B) {
 	r, queries := benchRegion(b, 1_000_000, 50_000)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

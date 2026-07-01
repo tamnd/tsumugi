@@ -1,21 +1,29 @@
 // Package sparse implements the .tsumugi learned-sparse retrieval region: an
-// impact index with Block-Max Pruning. Where the M1 lexical region scores BM25F
-// over docID-ordered postings, this region stores a per-term per-document learned
-// impact weight, quantized to one byte, and retrieves by summing the impacts of
-// the query terms. The query carries small integer term weights (one for the
-// inference-free case), so there is no transformer on the hot path; the heavy
-// lifting happened offline when the doc-side model produced the impacts.
+// impact-ordered index with an anytime traversal. Where the M1 lexical region
+// scores BM25F over docID-ordered postings, this region stores a per-term
+// per-document learned impact weight, quantized to one byte, and retrieves by
+// summing the impacts of the query terms. The query carries small integer term
+// weights (one for the inference-free case), so there is no transformer on the hot
+// path; the heavy lifting happened offline when the doc-side model produced the
+// impacts.
 //
-// Retrieval is Block-Max Pruning: the docID space is partitioned into fixed
-// ranges, each range gets an upper bound from the per-term block-max metadata,
-// the ranges are visited in descending bound order, and the scan stops as soon as
-// the next range's bound cannot beat the current top-k. With integer query
-// weights the pruned traversal returns exactly what an exhaustive scan would,
-// ties included, which is the region's correctness gate. The bytes are the IMP1
-// format, framed by the M0 container as RegionLexical with the impact flag set.
+// Retrieval is the doc-04 impact ordering: each term's postings are stored
+// impact-descending and cut into fixed-count blocks, so a block's leading impact
+// is its maximum and those maxima fall monotonically down the list. Every
+// query-term block becomes a work item bounded by weight*leadImpact; the items are
+// walked in descending bound order, accumulating weight*impact per document, and
+// the walk stops once the top-k is full and the block at the cursor cannot lift a
+// fresh document past the weakest kept score. This anytime cutoff is exact for a
+// single-term query, where a document's whole score lives in one block, and
+// near-exact for multi-term queries, where a document's contributions scatter
+// across impact-descending blocks with no docID index to complete a partially-seen
+// winner; recall is the gate there, not bit-equality. SearchExhaustive keeps the
+// exact oracle. The bytes are the IMP1 format, framed by the M0 container as
+// RegionLexical with the impact flag set.
 //
-// The lineage is the lexical region and the BMP literature; this is a
-// self-contained native implementation, no import edge, so a fresh clone builds.
+// The lineage is the lexical region and the impact-ordered / anytime retrieval
+// literature; this is a self-contained native implementation, no import edge, so a
+// fresh clone builds.
 package sparse
 
 import (
@@ -28,8 +36,9 @@ const regionMagic = "IMP1"
 
 const regionVersion = 1
 
-// DefaultBlockSize is the range width for both the posting blocks and the BMP
-// ranges. They share one grid so a range maps to one block per term.
+// DefaultBlockSize is the number of postings per impact-ordered block. A smaller
+// block sharpens the leading-impact bound the traversal prunes on, at the cost of
+// more block headers; 128 balances the two.
 const DefaultBlockSize = 128
 
 // quantizer maps a raw learned weight to one byte and back. Learned-sparse
