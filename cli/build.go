@@ -46,6 +46,7 @@ func newBuildCmd() *cobra.Command {
 	cmd.Flags().IntVar(&opts.Limit, "limit", 0, "cap documents read, zero for all")
 	cmd.Flags().Uint64Var(&opts.BuildEpoch, "build-epoch", 0, "build timestamp in unix seconds stamped into the shards and index; unset uses the current time, a fixed value gives a reproducible build")
 	cmd.Flags().BoolVar(&opts.Impact, "impact", false, "build the lexical region impact-ordered by static rank and serve it inference-free (query-term coverage weighted by static rank) instead of BM25F")
+	cmd.Flags().IntVar(&opts.DenseDim, "dense-dim", 0, "embed each document at this kept dimension into a per-shard dense vector region and serve dense recall alongside the lexical plane; zero emits no vector region")
 	return cmd
 }
 

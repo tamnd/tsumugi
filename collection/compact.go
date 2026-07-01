@@ -43,6 +43,13 @@ func Compact(dir string, shardSize int, epoch uint64) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	// Preserve the dense plane the same way: a compact of a collection built with a vector
+	// region must re-embed at the same dimension, or it would drop dense retrieval and the
+	// broker would serve the compacted shards lexical-only.
+	denseDim, err := shardsDenseDim(infos)
+	if err != nil {
+		return Result{}, err
+	}
 	sort.Slice(docs, func(i, j int) bool {
 		if docs[i].Host != docs[j].Host {
 			return docs[i].Host < docs[j].Host
@@ -84,7 +91,7 @@ func Compact(dir string, shardSize int, epoch uint64) (Result, error) {
 	// A compact rebuilds with no curated seeds, the same default a build with none uses,
 	// so its configuration digest folds in the empty seed lists. The epoch is passed in
 	// so a pinned-epoch compact is byte-identical, the same reproducibility a build gets.
-	meta := shardMeta{epoch: epoch, configHash: buildConfigHash(shardSize, nil, nil, impact), impact: impact}
+	meta := shardMeta{epoch: epoch, configHash: buildConfigHash(shardSize, nil, nil, impact, denseDim), impact: impact, denseDim: denseDim}
 
 	res := Result{Docs: len(docs), Hosts: hosts}
 	var base uint32
@@ -204,6 +211,31 @@ func shardsAreImpact(infos []ShardInfo) (bool, error) {
 		return impact, nil
 	}
 	return false, nil
+}
+
+// shardsDenseDim reports the dense vector dimension the collection was built with, read
+// from the first shard that records a vector_dim stat. The build writes every shard the
+// same way, so one shard settles the dimension; a collection with no dense region anywhere
+// returns zero, which a rebuild reads as "emit no vector region", so a compact of a
+// lexical-only collection stays lexical-only and a compact of a dense one re-embeds at the
+// same dimension rather than silently dropping the dense plane.
+func shardsDenseDim(infos []ShardInfo) (int, error) {
+	for _, in := range infos {
+		r, err := tsumugi.Open(in.Path)
+		if err != nil {
+			return 0, err
+		}
+		if !r.HasRegion(tsumugi.RegionVector) {
+			_ = r.Close()
+			continue
+		}
+		v, ok := r.Stat(tsumugi.StatVectorDim)
+		_ = r.Close()
+		if ok && v > 0 {
+			return int(v), nil
+		}
+	}
+	return 0, nil
 }
 
 // hostOf parses the host back out of a url, the field the build ordered on, so a

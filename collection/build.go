@@ -11,10 +11,12 @@ import (
 	"github.com/tamnd/tsumugi"
 	"github.com/tamnd/tsumugi/analyze"
 	"github.com/tamnd/tsumugi/convert"
+	"github.com/tamnd/tsumugi/dense"
 	"github.com/tamnd/tsumugi/feature"
 	"github.com/tamnd/tsumugi/forward"
 	"github.com/tamnd/tsumugi/graph"
 	"github.com/tamnd/tsumugi/lexical"
+	"github.com/tamnd/tsumugi/vector"
 )
 
 // shardMeta carries the build-level values every shard in a collection stamps
@@ -25,6 +27,7 @@ type shardMeta struct {
 	epoch      uint64
 	configHash uint64
 	impact     bool // build the lexical region impact-ordered from the static rank
+	denseDim   int  // kept dimension of the dense vector region, zero to emit none
 }
 
 // buildConfigHash digests the build configuration into the 64-bit value every shard
@@ -37,7 +40,7 @@ type shardMeta struct {
 // on. It deliberately leaves out the build epoch and the corpus: the epoch is recorded
 // separately in the header, and the digest is meant to identify the configuration, not
 // the particular crawl, so the same configuration over a different corpus keeps it.
-func buildConfigHash(shardSize int, trustSeeds, spamSeeds []string, impact bool) uint64 {
+func buildConfigHash(shardSize int, trustSeeds, spamSeeds []string, impact bool, denseDim int) uint64 {
 	h := fnv.New64a()
 	var u [8]byte
 	put := func(v uint64) {
@@ -58,6 +61,11 @@ func buildConfigHash(shardSize int, trustSeeds, spamSeeds []string, impact bool)
 	} else {
 		put(0)
 	}
+	// The dense dimension is a configuration input: a shard built with a vector region
+	// carries different bytes than one built without, and two collections at different
+	// dimensions embed into different spaces, so the digest must separate them or a
+	// reproducibility check would call two differently-embedded collections identical.
+	put(uint64(denseDim))
 	putSeeds := func(seeds []string) {
 		s := append([]string(nil), seeds...)
 		sort.Strings(s)
@@ -113,6 +121,18 @@ type Options struct {
 	// The dictionary and every other region are unchanged, so routing and the feature and
 	// forward planes are identical; only the posting bodies and their order differ.
 	Impact bool
+
+	// DenseDim is the kept dimension of the per-shard dense vector region the build emits,
+	// the retrieval plane doc 08 pins alongside the lexical one. Zero leaves it off: no
+	// vector region is written and the serving cascade's dense plane stays inert, the
+	// behavior before this was wired. A positive value embeds every document's analyzed
+	// body with the package default static encoder (dense.NewDefault), the same encoder the
+	// query pipeline builds its query vector with, so a document and a query at this
+	// dimension live in one comparable space, and writes the quantized ANN region the shard
+	// serves dense recall from. The dimension is recorded in each shard's footer as
+	// vector_dim and read back by the broker, which turns the dense plane on the moment a
+	// shard carries a region and every shard agrees on the dimension.
+	DenseDim int
 }
 
 // Result reports what a build or add produced.
@@ -249,8 +269,9 @@ func build(opts Options, baseStart uint32, indexStart int, recrawl bool) (Result
 	// re-deriving the digest per shard and guarantees the shards cannot disagree.
 	meta := shardMeta{
 		epoch:      opts.BuildEpoch,
-		configHash: buildConfigHash(opts.ShardSize, opts.TrustSeeds, opts.SpamSeeds, opts.Impact),
+		configHash: buildConfigHash(opts.ShardSize, opts.TrustSeeds, opts.SpamSeeds, opts.Impact, opts.DenseDim),
 		impact:     opts.Impact,
+		denseDim:   opts.DenseDim,
 	}
 
 	res := Result{Docs: len(docs), Hosts: hosts}
@@ -411,6 +432,20 @@ func writeShard(path string, docs []convert.Document, anchors []string, sig grap
 	}
 	fwd := forward.NewBuilder(fwdCols)
 
+	// The dense retrieval plane: when the build is configured with a kept dimension, embed
+	// every document with the package default static encoder and collect the vectors into a
+	// vector-region builder. The encoder is the same dense.NewDefault the query pipeline
+	// builds its query vector with, so a document and a query at this dimension land in one
+	// comparable space. Add is called once per document below, in dense docID order, so the
+	// vector region's node id for a document is the shard-local docID the lexical and
+	// forward planes use, and the cascade can fuse a dense hit with a lexical one by id.
+	var enc *dense.StaticEncoder
+	var vb *vector.Builder
+	if meta.denseDim > 0 {
+		enc = dense.NewDefault(meta.denseDim)
+		vb = vector.NewBuilder(meta.denseDim)
+	}
+
 	var tokens, titleTokens, bodyTokens, urlTokens, anchorTokens float64
 	for i, d := range docs {
 		a := analyze.Document(d)
@@ -424,7 +459,8 @@ func writeShard(path string, docs []convert.Document, anchors []string, sig grap
 		// Per-field token counts feed the fleet average field lengths the broker BM25F
 		// normalizes each field by. token_count stays title+body so avg_doc_len is
 		// unchanged; the per-field sums are recorded alongside it.
-		bt := len(lexical.Analyze(d.Body))
+		bodyTerms := lexical.Analyze(d.Body)
+		bt := len(bodyTerms)
 		tt := len(lexical.Analyze(a.Title))
 		ut := len(lexical.Analyze(d.URL))
 		at := len(lexical.Analyze(anchors[i]))
@@ -476,6 +512,17 @@ func writeShard(path string, docs []convert.Document, anchors []string, sig grap
 		fwd.Set(id, "title", []byte(a.Title))
 		fwd.Set(id, "body", []byte(d.Body))
 		fwd.Set(id, "anchor", []byte(anchors[i]))
+		// Embed the document into the dense plane, when it is on, from the same analyzed
+		// body tokens the lexical body field indexes, pooled and L2-normalized by the static
+		// encoder. Every document is added, in docID order, so the vector region's node ids
+		// line up one-for-one with the shard's docIDs. A body whose terms are all unknown to
+		// the table pools to the zero vector, which the region reads as no dense signal (a
+		// cosine of zero against any query), so the document stays lexically reachable while
+		// contributing no spurious dense neighbor. Encode returns exactly denseDim floats, so
+		// the Add width is uniform across the shard.
+		if vb != nil {
+			vb.Add(enc.Encode(bodyTerms))
+		}
 	}
 
 	// Open the prebuilt graph region to read its edge count for the footer; the bytes are
@@ -552,6 +599,22 @@ func writeShard(path string, docs []convert.Document, anchors []string, sig grap
 	}
 	if err := w.AddRegion(tsumugi.RegionGraph, tsumugi.CodecZstd, 0, 0, gregion); err != nil {
 		return 0, err
+	}
+	// The dense vector region, when the build embedded documents. Its bytes are already a
+	// packed quantized format (rotated one-bit codes plus the int8 rerank payload and the
+	// HNSW graph), so like the forward region it is stored with no container codec: a shard
+	// open mmaps it and the reader inflates nothing up front. The kept dimension goes into
+	// the footer as vector_dim so the broker can read the dense-plane width without opening
+	// the region, and refuse to serve a fleet whose shards disagree on it.
+	if vb != nil {
+		vecBytes, err := vb.Build()
+		if err != nil {
+			return 0, fmt.Errorf("build vector region: %w", err)
+		}
+		w.SetStat(tsumugi.StatVectorDim, float64(meta.denseDim))
+		if err := w.AddRegion(tsumugi.RegionVector, tsumugi.CodecNone, 0, 0, vecBytes); err != nil {
+			return 0, err
+		}
 	}
 	if err := w.Close(); err != nil {
 		return 0, err
