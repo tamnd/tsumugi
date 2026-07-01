@@ -12,16 +12,6 @@ import (
 	"github.com/tamnd/tsumugi/spell"
 )
 
-// denseNonzero and denseSeed parameterize the broker's dense query encoder, the
-// random-indexing table that turns a query's terms into the dense-plane vector. They are
-// the canon settings the dense tests pin: eight signed coordinates per token, which keeps
-// distinct tokens near-orthogonal while a pooled query still fills enough of the space to
-// compare, and a fixed seed so the table is reproducible across broker restarts.
-const (
-	denseNonzero = 8
-	denseSeed    = 1
-)
-
 // pipeline is the query-understanding front the broker runs each raw query through once,
 // at the broker, before fanning the parsed query out to the shards. It holds the
 // components doc 10 places between the search box and retrieval: a language detector and
@@ -76,7 +66,7 @@ func newPipeline(feed func(*spell.Builder), dim int, hasDim bool) *pipeline {
 	p.corrector = spell.NewQueryCorrector(b.BuildWithOptions(spell.DefaultOptions()))
 
 	if hasDim {
-		p.encoder = dense.NewStatic(dense.NewHashTable(dim, denseNonzero, denseSeed))
+		p.encoder = dense.NewDefault(dim)
 	}
 	return p
 }

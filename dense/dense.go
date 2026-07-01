@@ -57,6 +57,30 @@ func NewStatic(table Table) *StaticEncoder {
 	return &StaticEncoder{table: table}
 }
 
+// DefaultNonzero and DefaultSeed are the random-indexing hash table parameters the
+// default static encoder uses: how many nonzero entries each token's sparse vector
+// carries, and the seed that fixes the table. They live here, not at each call site, so
+// the build side that embeds documents and the query side that embeds queries construct
+// the same table by construction and their vectors land in one comparable space. Changing
+// either changes the space, so a collection built at one setting must be queried at the
+// same one; pinning them as package defaults is what keeps the two sides from drifting.
+const (
+	DefaultNonzero = 8
+	DefaultSeed    = 1
+)
+
+// NewDefault builds the default static encoder at the given kept dimension: a static
+// token-lookup embedder over a random-indexing HashTable seeded with the package
+// defaults. It is the one constructor both the collection build (document vectors) and
+// the query pipeline (query vectors) call, so a document and a query at the same
+// dimension are embedded by the identical table and their cosine is meaningful. The
+// dimension is chosen per collection, so it is a parameter; the nonzero count and seed
+// are fixed defaults so the two sides cannot disagree on anything but the dimension the
+// shards already record.
+func NewDefault(dim int) *StaticEncoder {
+	return NewStatic(NewHashTable(dim, DefaultNonzero, DefaultSeed))
+}
+
 // Dim is the kept dimension, the table's embedding dimension.
 func (e *StaticEncoder) Dim() int {
 	if e == nil || e.table == nil {
