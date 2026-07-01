@@ -17,14 +17,24 @@ type Dataset struct {
 }
 
 // Params controls the LambdaMART fit. The defaults are a reasonable ranking
-// configuration: a few hundred shallow trees with a small learning rate, leaves
-// kept within the QuickScorer budget by the depth bound.
+// configuration: a few hundred trees with a small learning rate, grown leaf-wise and
+// kept within the QuickScorer one-word leaf budget by MaxLeaves, with feature values
+// histogram-binned so a fit is linear in the sample count.
+//
+// MaxLeaves bounds a tree by its number of leaves, the LightGBM shape; it is clamped
+// to the QuickScorer leaf ceiling. MaxDepth, when positive, is an extra per-branch
+// depth guard; with MaxLeaves set it can be left zero. If both are zero the fit falls
+// back to a leaf budget one under the ceiling. MaxBins is the histogram resolution,
+// defaulting to 255 when zero; a feature with fewer distinct values than MaxBins is
+// binned exactly.
 type Params struct {
 	Rounds         int
 	LearningRate   float64
+	MaxLeaves      int
 	MaxDepth       int
 	MinSamplesLeaf int
 	LambdaL2       float64
+	MaxBins        int
 	NDCGCutoff     int
 }
 
@@ -33,9 +43,11 @@ func DefaultParams() Params {
 	return Params{
 		Rounds:         300,
 		LearningRate:   0.1,
-		MaxDepth:       6,
+		MaxLeaves:      32,
+		MaxDepth:       0,
 		MinSamplesLeaf: 5,
 		LambdaL2:       1.0,
+		MaxBins:        255,
 		NDCGCutoff:     10,
 	}
 }
@@ -102,11 +114,20 @@ func Train(d *Dataset, p Params) *Ensemble {
 		idx[i] = i
 	}
 	fp := fitParams{
+		maxLeaves:      p.MaxLeaves,
 		maxDepth:       p.MaxDepth,
 		minSamplesLeaf: p.MinSamplesLeaf,
 		lambdaL2:       p.LambdaL2,
 		learningRate:   p.LearningRate,
 	}
+	maxBins := p.MaxBins
+	if maxBins <= 0 {
+		maxBins = 255
+	}
+	// The feature values never change between rounds, only the gradients fitted
+	// against them, so the histogram binning is computed once and reused for every
+	// tree.
+	bins := newBinned(d.Features, maxBins)
 	trees := make([]*treeNode, 0, p.Rounds)
 	for round := 0; round < p.Rounds; round++ {
 		for i := range grad {
@@ -114,7 +135,7 @@ func Train(d *Dataset, p Params) *Ensemble {
 			hess[i] = 0
 		}
 		lambdas(d, scores, p.NDCGCutoff, grad, hess)
-		t := fitTree(d.Features, grad, hess, idx, fp)
+		t := fitTree(bins, grad, hess, idx, fp)
 		trees = append(trees, t)
 		for i := range scores {
 			scores[i] += t.walk(d.Features[i])
