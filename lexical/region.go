@@ -24,6 +24,18 @@ const regionVersion = 2
 // returning silently wrong scores.
 const flagIDFFreeBlockMax = 1 << 0
 
+// flagImpactMode marks a region whose posting lists are impact-ordered rather than
+// docID-ordered: each list is sorted by descending per-document impact (the composite
+// static rank quantized to a byte), the block header's first field is the block's
+// minimum impact instead of a last-docID skip pointer, the docID stream is zig-zag
+// signed deltas because the docIDs are no longer monotone, and each posting's payload
+// is its one-byte impact rather than a field mask and term frequencies. The block-max
+// array holds each block's leading (largest) impact, which is monotone non-increasing
+// across the list, the property the approximate early-termination traversal rests on.
+// A region carries either this ordering or the docID ordering, never both; Open records
+// which one so the reader decodes blocks the way the build wrote them.
+const flagImpactMode = 1 << 1
+
 // norm record width: four uint32 field lengths per document, fixed-width so the
 // scorer reaches a document's lengths in O(1).
 const normRecord = numFields * 4
@@ -44,6 +56,7 @@ type Region struct {
 	st     stats
 	params Params
 	codec  docCodec // gap-stream codec the header named, used to decode blocks
+	impact bool     // true when the lists are impact-ordered (flagImpactMode)
 }
 
 // header sub-offsets, all relative to the region start.
@@ -205,6 +218,7 @@ func Open(b []byte) (*Region, error) {
 	r.terms = h.termCount
 	r.st.docCount = h.docCount
 	r.st.avgFieldLen = h.avgFieldLen
+	r.impact = h.flags&flagImpactMode != 0
 	return r, nil
 }
 

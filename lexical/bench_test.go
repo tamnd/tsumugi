@@ -72,3 +72,57 @@ func BenchmarkSearchExhaustive(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkBuildImpact measures the impact-ordered build against the docID-ordered build
+// over the same corpus, so the impl note can quote what impact ordering costs at build
+// time: the same term inversion plus a per-list impact sort in place of the docID sort.
+func BenchmarkBuildImpact(b *testing.B) {
+	docs := genCorpus(1, 50000, 2000)
+	bld := NewBuilder(DefaultParams())
+	for i, d := range docs {
+		bld.AddDoc(uint32(i), d)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = bld.BuildImpact(impactFor)
+	}
+}
+
+// BenchmarkBuildBM25 is the docID-ordered build baseline BenchmarkBuildImpact is read
+// against, the same corpus and builder.
+func BenchmarkBuildBM25(b *testing.B) {
+	docs := genCorpus(1, 50000, 2000)
+	bld := NewBuilder(DefaultParams())
+	for i, d := range docs {
+		bld.AddDoc(uint32(i), d)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = bld.Build()
+	}
+}
+
+// BenchmarkSearchImpact measures the impact scorer's query latency on the mid-size shard,
+// the number the impl note reads against the sub-10ms shard budget. This slice serves it
+// from the exhaustive scan; the pruned traversal the next slice adds is benchmarked against
+// this baseline.
+func BenchmarkSearchImpact(b *testing.B) {
+	docs := genCorpus(1, 50000, 2000)
+	bld := NewBuilder(DefaultParams())
+	for i, d := range docs {
+		bld.AddDoc(uint32(i), d)
+	}
+	r, err := Open(bld.BuildImpact(impactFor))
+	if err != nil {
+		b.Fatalf("open: %v", err)
+	}
+	queries := genQueries(2, 1000, 2000, 4)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		q := queries[i%len(queries)]
+		if _, err := r.SearchImpact(q, DefaultK); err != nil {
+			b.Fatalf("search: %v", err)
+		}
+	}
+}
