@@ -8,10 +8,10 @@ import (
 )
 
 // tripContext is a context whose Err trips to cancelled after a fixed number of Err
-// calls, so a test can pin exactly where in the range walk the deadline appears to pass.
+// calls, so a test can pin exactly where in the block walk the deadline appears to pass.
 // Its Done channel never fires (it embeds Background), and the walk polls Err and never
 // selects on Done, so the walk abandons at the stride poll the call count lands on. The
-// walk polls once per stride+1 ranges, so tripAt=n abandons after n strides of ranges.
+// walk polls once per stride+1 blocks, so tripAt=n abandons after n strides of blocks.
 type tripContext struct {
 	context.Context
 	calls  *int
@@ -27,9 +27,9 @@ func (c tripContext) Err() error {
 }
 
 // oneTermRegion builds a region where a single term holds one document per block over n
-// blocks, so a query for that term touches exactly n ranges of one document each. With k
+// blocks, so a query for that term walks exactly n blocks of one document each. With k
 // covering the corpus the anytime stop never fires, so the walk scores one document per
-// range and a stride-placed deadline abandons after an exact, predictable count.
+// block and a stride-placed deadline abandons after an exact, predictable count.
 func oneTermRegion(t *testing.T, n int) *Region {
 	t.Helper()
 	b := NewBuilder(uint32(n)).WithBlockSize(1)
@@ -69,7 +69,7 @@ func TestSearchCtxLiveMatchesPlain(t *testing.T) {
 }
 
 // TestSearchCtxCancelledAbandons checks the first stride poll: a context already
-// cancelled when the walk starts trips at the first range, so the walk abandons before
+// cancelled when the walk starts trips at the first block, so the walk abandons before
 // scoring anything and reports not completed.
 func TestSearchCtxCancelledAbandons(t *testing.T) {
 	r := oneTermRegion(t, 2000)
@@ -85,7 +85,7 @@ func TestSearchCtxCancelledAbandons(t *testing.T) {
 }
 
 // TestSearchCtxPreemptsMidWalk is the headline: a deadline that passes after the first
-// stride poll abandons the range walk mid-corpus, with exactly one stride of ranges
+// stride poll abandons the block walk mid-corpus, with exactly one stride of blocks
 // scored, proving the poll lives inside the walk loop and is strided.
 func TestSearchCtxPreemptsMidWalk(t *testing.T) {
 	const n = rangePreemptStride*2 + 100

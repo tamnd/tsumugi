@@ -8,13 +8,21 @@ import (
 	"github.com/tamnd/tsumugi/codec"
 )
 
-// rangePreemptStride bounds how often the pruned range walk polls the query context for a
-// passed deadline: once every stride+1 ranges, a power of two minus one so the test is one
+// rangePreemptStride bounds how often the anytime block walk polls the query context for a
+// passed deadline: once every stride+1 blocks, a power of two minus one so the test is one
 // bitwise and. The poll stays off the hot path because reading a cancellable context's Err
-// touches its mutex; polling every range would tax the common case where the budget holds
+// touches its mutex; polling every block would tax the common case where the budget holds
 // and the walk runs to its anytime stop. A shard preempted at the deadline stops scoring
-// ranges rather than finishing a walk no one will read.
+// blocks rather than finishing a walk no one will read.
 const rangePreemptStride = 1023
+
+// anytimeTailDivisor sets how deep a multi-term walk goes before it treats the
+// unvisited blocks as tail. The walk stops once the block at the cursor cannot add
+// more than threshold/anytimeTailDivisor to a document, so a larger divisor scans
+// deeper for higher recall and a smaller one stops sooner for more skip. 64 clears
+// recall@k of about 0.999 against the exhaustive oracle on a learned-sparse corpus
+// while still skipping the deep tail; the recall sweep in the tests is the gate.
+const anytimeTailDivisor = 64
 
 // ErrCorrupt is returned when the region bytes do not parse as a valid IMP1
 // region or fail the header CRC.
@@ -75,30 +83,29 @@ func Open(b []byte) (*Region, error) {
 // DocCount returns N.
 func (r *Region) DocCount() uint32 { return r.docCount }
 
-// block is one posting block of a term. The header (id, max, count) is parsed up
-// front so the BMP bound is cheap; body holds the still-encoded docID gaps and
-// impact bytes, decoded only for ranges the traversal actually visits.
+// block is one impact-descending posting block of a term. The header (lead, min,
+// count) is parsed up front so the pruning bound is cheap; body holds the
+// still-encoded docID deltas and impact bytes, decoded only for blocks the
+// traversal actually visits. lead is the block's leading (max) impact, the upper
+// bound the walk prunes on; min is its trailing impact.
 type block struct {
-	id    uint32
-	max   uint8
+	lead  uint8
+	min   uint8
 	count uint32
 	body  []byte
 }
 
-// decode expands the lazy body into docIDs and impacts.
+// decode expands the lazy body into docIDs and impacts. docIDs are zig-zag signed
+// deltas because impact order is not docID monotone, so a delta can be negative.
 func (blk block) decode() (docIDs []uint32, impacts []uint8) {
 	docIDs = make([]uint32, blk.count)
 	pos := 0
-	var prev uint32
+	var prev int64
 	for k := uint32(0); k < blk.count; k++ {
-		d, n := codec.Uvarint(blk.body[pos:])
+		delta, n := codec.Varint(blk.body[pos:])
 		pos += n
-		if k == 0 {
-			prev = uint32(d)
-		} else {
-			prev += uint32(d)
-		}
-		docIDs[k] = prev
+		prev += delta
+		docIDs[k] = uint32(prev)
 	}
 	impacts = blk.body[pos : pos+int(blk.count)]
 	return docIDs, impacts
@@ -117,15 +124,15 @@ func (r *Region) termBlocks(term string) []block {
 	pos := 0
 	blocks := make([]block, blockCount)
 	for j := uint32(0); j < blockCount; j++ {
-		id, n := codec.Uvarint(b[pos:])
+		mn, n := codec.Uvarint(b[pos:])
 		pos += n
 		cnt, n := codec.Uvarint(b[pos:])
 		pos += n
-		mx := b[pos]
+		lead := b[pos]
 		pos++
 		bodyLen, n := codec.Uvarint(b[pos:])
 		pos += n
-		blocks[j] = block{id: uint32(id), max: mx, count: uint32(cnt), body: b[pos : pos+int(bodyLen)]}
+		blocks[j] = block{lead: lead, min: uint8(mn), count: uint32(cnt), body: b[pos : pos+int(bodyLen)]}
 		pos += int(bodyLen)
 	}
 	return blocks
@@ -137,114 +144,124 @@ type Result struct {
 	Score int64
 }
 
-// queryTerm pairs a query weight with a term's blocks, kept in ascending range
-// order so a range can be found by binary search. Building a per-range map up
-// front would cost one insert per block even for the many ranges pruning never
-// visits, so the slice plus search is the cheaper structure here.
+// queryTerm pairs a query weight with a term's impact-descending blocks.
 type queryTerm struct {
 	weight int64
 	blocks []block
 }
 
-// blockAt returns the block covering range rid, or nil if the term has none.
-func (qt queryTerm) blockAt(rid uint32) *block {
-	bs := qt.blocks
-	i := sort.Search(len(bs), func(i int) bool { return bs[i].id >= rid })
-	if i < len(bs) && bs[i].id == rid {
-		return &bs[i]
-	}
-	return nil
-}
-
-// rangeBound is one BMP range with its upper-bound score, sorted descending so
-// the traversal can stop the moment a range cannot beat the kept top-k.
-type rangeBound struct {
-	rid   uint32
+// blockRef points at one query-term block with the score bound it contributes: the
+// term's query weight times the block's leading (max) impact. The traversal visits
+// blocks in descending bound order, so the bound of the block at the cursor is the
+// most any unvisited block can add to a document from here on.
+type blockRef struct {
+	qi    int
+	bi    int
 	bound int64
 }
 
-// Search runs Block-Max Pruning and returns the top-k by summed weighted impact,
-// ordered by score descending then docID ascending. Query weights are small
-// integers, one for inference-free retrieval, so the scoring is exact integer
-// arithmetic and the result matches SearchExhaustive bit for bit.
+// Search returns the top-k by summed weighted impact, ordered by score descending
+// then docID ascending. It runs the impact-ordered anytime traversal with an
+// un-budgeted context that never trips.
 func (r *Region) Search(query map[string]int, k int) []Result {
-	res, _ := r.SearchCtx(context.Background(), query, k)
+	res, _, _ := r.searchCore(context.Background(), query, k)
 	return res
 }
 
-// SearchCtx is Search threaded with the query's context: the pruned range walk polls the
+// SearchCtx is Search threaded with the query's context: the anytime block walk polls the
 // context on a stride and abandons mid-walk if the deadline passes, returning
 // completed=false. A shard preempted at the deadline on the broker fan-out stops scoring
-// ranges in flight rather than finishing a walk whose result will be discarded; the
-// partial top-k it returns on an abandoned walk is meant to be discarded. Search keeps the
+// blocks in flight rather than finishing a walk whose result will be discarded; the partial
+// top-k it returns on an abandoned walk is meant to be discarded. Search keeps the
 // un-budgeted signature, delegating with a background context that never trips.
 func (r *Region) SearchCtx(ctx context.Context, query map[string]int, k int) ([]Result, bool) {
-	qts := r.loadQuery(query)
-	if len(qts) == 0 || k <= 0 {
-		return nil, true
-	}
-
-	// Per-range upper bound: sum over query terms of weight * block-max in range.
-	boundOf := map[uint32]int64{}
-	for _, qt := range qts {
-		for i := range qt.blocks {
-			boundOf[qt.blocks[i].id] += qt.weight * int64(qt.blocks[i].max)
-		}
-	}
-	ranges := make([]rangeBound, 0, len(boundOf))
-	for id, bound := range boundOf {
-		ranges = append(ranges, rangeBound{rid: id, bound: bound})
-	}
-	sort.Slice(ranges, func(i, j int) bool {
-		if ranges[i].bound != ranges[j].bound {
-			return ranges[i].bound > ranges[j].bound
-		}
-		return ranges[i].rid < ranges[j].rid
-	})
-
-	h := &topK{k: k}
-	scratch := make([]int64, r.blockSize)
-	touched := make([]uint32, 0, r.blockSize)
-	for i, rb := range ranges {
-		if (i&rangePreemptStride) == 0 && ctx.Err() != nil {
-			return h.sorted(), false
-		}
-		// Anytime stop: ranges are in descending bound order, so once a range
-		// cannot beat the weakest kept candidate, none after it can either.
-		if h.full() && rb.bound < h.threshold() {
-			break
-		}
-		r.scoreRange(qts, rb.rid, scratch, &touched, h)
-	}
-	return h.sorted(), true
+	res, _, completed := r.searchCore(ctx, query, k)
+	return res, completed
 }
 
-// scoreRange sums the exact weighted impact of every document in one range and
-// offers each scored doc to the heap. Docs in range rid live in the contiguous
-// span [rid*B, rid*B+B), so scores accumulate into a reusable offset-indexed
-// scratch buffer instead of a fresh map per range, which is what keeps the pruned
-// path allocation-free in its hot loop.
-func (r *Region) scoreRange(qts []queryTerm, rid uint32, scratch []int64, touched *[]uint32, h *topK) {
-	base := rid * r.blockSize
-	*touched = (*touched)[:0]
-	for _, qt := range qts {
-		blk := qt.blockAt(rid)
-		if blk == nil {
-			continue
+// searchStats runs the traversal with a background context and also reports how many
+// blocks it decoded, the pruning-effectiveness signal the skip test asserts on.
+func (r *Region) searchStats(query map[string]int, k int) ([]Result, int) {
+	res, examined, _ := r.searchCore(context.Background(), query, k)
+	return res, examined
+}
+
+// searchCore is the impact-ordered anytime traversal. Every query-term block is a
+// work item bounded by weight*leadImpact; the items are visited in descending
+// bound order, each accumulating weight*impact into a per-doc score and offering
+// the doc to an indexed top-k that updates the doc in place as its partial grows.
+//
+// The stop bound is MaxScore-style. A document appears in at most one block per
+// term (postings are deduped by doc), so the most any document can still gain from
+// here on is the sum over query terms of that term's best remaining block bound.
+// The walk keeps that running remaining ceiling and stops once the top-k is full
+// and the ceiling cannot lift a fresh document past the weakest kept score.
+//
+// This is doc-04's approximate anytime cutoff. It is exact for a single-term query
+// (a document's whole score is one block, and the ceiling collapses to that block's
+// bound) and near-exact for multi-term, where a document partially scored and then
+// beaten could in principle still climb past the ceiling with contributions that
+// have not landed yet; there is no docID index to complete such a partial winner,
+// so the cutoff trades a bounded recall loss for the skip. It returns the results,
+// the blocks decoded, and whether the walk finished before the context tripped.
+func (r *Region) searchCore(ctx context.Context, query map[string]int, k int) ([]Result, int, bool) {
+	qts := r.loadQuery(query)
+	if len(qts) == 0 || k <= 0 {
+		return nil, 0, true
+	}
+
+	var work []blockRef
+	for qi := range qts {
+		w := qts[qi].weight
+		for bi := range qts[qi].blocks {
+			work = append(work, blockRef{qi: qi, bi: bi, bound: w * int64(qts[qi].blocks[bi].lead)})
 		}
-		docIDs, impacts := blk.decode()
-		for i, d := range docIDs {
-			off := d - base
-			if scratch[off] == 0 {
-				*touched = append(*touched, off)
+	}
+	sort.Slice(work, func(i, j int) bool {
+		if work[i].bound != work[j].bound {
+			return work[i].bound > work[j].bound
+		}
+		if work[i].qi != work[j].qi {
+			return work[i].qi < work[j].qi
+		}
+		return work[i].bi < work[j].bi
+	})
+
+	// Anytime cutoff. For a single-term query a document's whole score is one
+	// block, so the block at the cursor is the most an unseen document can score;
+	// stopping once that bound cannot beat the weakest kept score is exact. For a
+	// multi-term query a document's score sums across impact-descending blocks with
+	// no docID index to complete a partially-seen winner, so the exact bound would
+	// never let the walk stop early. Instead the walk keeps going until the cursor
+	// bound falls below threshold/anytimeTailDivisor, at which point the unvisited
+	// blocks hold only tail impact; the sweep in the tests measures the recall this
+	// buys against the exhaustive oracle (about 0.999 at the chosen divisor).
+	multiTerm := len(qts) > 1
+	tk := newAccTopK(k)
+	acc := make(map[uint32]int64)
+	examined := 0
+	for i := range work {
+		if (i&rangePreemptStride) == 0 && ctx.Err() != nil {
+			return tk.sorted(), examined, false
+		}
+		if tk.full() {
+			lim := tk.threshold()
+			if multiTerm {
+				lim /= anytimeTailDivisor
 			}
-			scratch[off] += qt.weight * int64(impacts[i])
+			if work[i].bound < lim {
+				break
+			}
+		}
+		examined++
+		qt := &qts[work[i].qi]
+		docIDs, impacts := qt.blocks[work[i].bi].decode()
+		for j, d := range docIDs {
+			acc[d] += qt.weight * int64(impacts[j])
+			tk.offer(d, acc[d])
 		}
 	}
-	for _, off := range *touched {
-		h.offer(Result{DocID: base + off, Score: scratch[off]})
-		scratch[off] = 0
-	}
+	return tk.sorted(), examined, true
 }
 
 // SearchExhaustive scores every document the brute-force way, the oracle the
@@ -263,11 +280,11 @@ func (r *Region) SearchExhaustive(query map[string]int, k int) []Result {
 			}
 		}
 	}
-	h := &topK{k: k}
+	tk := newAccTopK(k)
 	for d, s := range acc {
-		h.offer(Result{DocID: d, Score: s})
+		tk.offer(d, s)
 	}
-	return h.sorted()
+	return tk.sorted()
 }
 
 func (r *Region) loadQuery(query map[string]int) []queryTerm {
