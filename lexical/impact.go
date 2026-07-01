@@ -299,9 +299,9 @@ func (r *Region) exhaustiveImpact(infos []termInfo, k int) ([]Candidate, error) 
 }
 
 // SearchImpact returns the top-k documents for a query over an impact-ordered region,
-// scoring by query-term coverage weighted by static rank. This slice serves it from the
-// exhaustive scan; the pruned traversal that the impact ordering exists for replaces the
-// scan behind this same entry in the next slice, gated against the scan.
+// scoring by query-term coverage weighted by static rank. It serves from the pruned
+// traversal, which decodes the lists highest impact first and stops once the top-k is
+// settled; the exhaustive scan it is gated against is exhaustiveImpact.
 func (r *Region) SearchImpact(query string, k int) ([]Candidate, error) {
 	return r.SearchImpactTerms(Analyze(query), k)
 }
@@ -316,7 +316,7 @@ func (r *Region) SearchImpactTerms(terms []string, k int) ([]Candidate, error) {
 	if len(infos) == 0 {
 		return nil, nil
 	}
-	return r.exhaustiveImpact(infos, k)
+	return r.prunedImpact(infos, k)
 }
 
 // impactBlockInvariant decodes every block of every impact-ordered list and checks the
