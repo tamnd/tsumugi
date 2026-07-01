@@ -411,7 +411,7 @@ func writeShard(path string, docs []convert.Document, anchors []string, sig grap
 	}
 	fwd := forward.NewBuilder(fwdCols)
 
-	var tokens, titleTokens, bodyTokens, urlTokens float64
+	var tokens, titleTokens, bodyTokens, urlTokens, anchorTokens float64
 	for i, d := range docs {
 		a := analyze.Document(d)
 		id := uint32(i)
@@ -427,13 +427,22 @@ func writeShard(path string, docs []convert.Document, anchors []string, sig grap
 		bt := len(lexical.Analyze(d.Body))
 		tt := len(lexical.Analyze(a.Title))
 		ut := len(lexical.Analyze(d.URL))
+		at := len(lexical.Analyze(anchors[i]))
 		bodyTokens += float64(bt)
 		titleTokens += float64(tt)
 		urlTokens += float64(ut)
+		anchorTokens += float64(at)
 		tokens += float64(bt + tt)
 		for fid, v := range a.Features {
 			fb.Set(id, fid, v)
 		}
+		// The anchor field length is a collection-wide quantity: it is known only after the
+		// inbound link text is inverted by target, so the per-document analyze stage cannot
+		// set it the way it sets the title, body, and url field lengths. Set it here, once the
+		// inversion has assembled each document's anchor field, so the query-independent matrix
+		// carries the anchor-field-length column the ranking model reads alongside the other
+		// three field lengths.
+		fb.Set(id, feature.FeatAnchorFieldLen, float64(at))
 		// The collection-wide link signals, the columns that need the whole graph;
 		// the per-document analyze stage leaves them at zero.
 		fb.Set(id, feature.FeatPageRank, sig.pageRank[i])
@@ -466,6 +475,7 @@ func writeShard(path string, docs []convert.Document, anchors []string, sig grap
 		fwd.Set(id, "url", []byte(d.URL))
 		fwd.Set(id, "title", []byte(a.Title))
 		fwd.Set(id, "body", []byte(d.Body))
+		fwd.Set(id, "anchor", []byte(anchors[i]))
 	}
 
 	// Open the prebuilt graph region to read its edge count for the footer; the bytes are
@@ -491,6 +501,7 @@ func writeShard(path string, docs []convert.Document, anchors []string, sig grap
 	w.SetStat(tsumugi.StatTitleTokenCount, titleTokens)
 	w.SetStat(tsumugi.StatBodyTokenCount, bodyTokens)
 	w.SetStat(tsumugi.StatURLTokenCount, urlTokens)
+	w.SetStat(tsumugi.StatAnchorTokenCount, anchorTokens)
 	w.SetStat(tsumugi.StatEdgeCount, float64(g.EdgeCount()))
 	// The remaining shard-level numbers the footer promises but the build left empty.
 	// node_min and node_max bracket the shard's global id range so the graph tooling can

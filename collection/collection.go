@@ -21,14 +21,19 @@ const shardGlob = "shard-*.tsumugi"
 
 // docColumns is the forward-store schema every shard carries: the doc_id (doc 02's
 // 32-byte sha256-of-canonical-URL identity, the durable cross-crawl key), the url and
-// title for display, and the body so a shard holds the text it was built from, which
-// is what lets Compact rebuild merged shards from the documents alone.
+// title for display, the body so a shard holds the text it was built from (which is
+// what lets Compact rebuild merged shards from the documents alone), and the anchor
+// field the online L2 extractor rescans to recompute anchor BM25F for the survivors it
+// reranks. The anchor field is the inbound link text collection anchor inversion
+// assembled; it is already in the inverted index driving L0/L1, and storing it forward
+// lets L2 read it the same way it reads title, body, and url.
 func docColumns() []forwardColumn {
 	return []forwardColumn{
 		{Name: "doc_id"},
 		{Name: "url"},
 		{Name: "title"},
 		{Name: "body", Blob: true},
+		{Name: "anchor"},
 	}
 }
 

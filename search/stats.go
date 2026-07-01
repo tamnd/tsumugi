@@ -14,7 +14,7 @@ type GlobalStats struct {
 	AvgDocLen  float64
 
 	// AvgFieldLen is the fleet average length in tokens of each field, indexed by the
-	// online extractor's field order (title, body, url). The per-field BM25F length
+	// online extractor's field order (title, body, url, anchor). The per-field BM25F length
 	// normalizer divides a candidate's own field length by these, so a term that
 	// appears in a short title is normalized against the fleet's average title rather
 	// than against the conflated average document length. A zero entry means no fleet
@@ -23,7 +23,7 @@ type GlobalStats struct {
 	// score: the candidate's field lengths come from its own matrix columns and the
 	// denominators are fleet-wide, so a document's BM25F is identical regardless of the
 	// shard it was retrieved from.
-	AvgFieldLen [3]float64
+	AvgFieldLen [4]float64
 }
 
 // statSums holds the raw additive accumulators the fleet statistics derive from: the
@@ -39,6 +39,7 @@ type statSums struct {
 	titleTok   float64
 	bodyTok    float64
 	urlTok     float64
+	anchorTok  float64
 }
 
 // shardSums reads one shard's raw statistics, the per-shard contribution computeStatSums
@@ -66,6 +67,11 @@ func shardSums(s *Shard) statSums {
 	if v, ok := s.r.Stat(tsumugi.StatURLTokenCount); ok {
 		ss.urlTok = v
 	}
+	// The anchor field falls back to zero for a shard built before the field was stored
+	// forward, the no-normalization case its BM25F took before this stat existed.
+	if v, ok := s.r.Stat(tsumugi.StatAnchorTokenCount); ok {
+		ss.anchorTok = v
+	}
 	return ss
 }
 
@@ -78,6 +84,7 @@ func (ss statSums) add(o statSums) statSums {
 		titleTok:   ss.titleTok + o.titleTok,
 		bodyTok:    ss.bodyTok + o.bodyTok,
 		urlTok:     ss.urlTok + o.urlTok,
+		anchorTok:  ss.anchorTok + o.anchorTok,
 	}
 }
 
@@ -92,6 +99,7 @@ func (ss statSums) global() GlobalStats {
 		gs.AvgFieldLen[fTitle] = ss.titleTok / n
 		gs.AvgFieldLen[fBody] = ss.bodyTok / n
 		gs.AvgFieldLen[fURL] = ss.urlTok / n
+		gs.AvgFieldLen[fAnchor] = ss.anchorTok / n
 	}
 	return gs
 }
@@ -110,6 +118,7 @@ func sumsFromStats(gs GlobalStats) statSums {
 		titleTok:   gs.AvgFieldLen[fTitle] * n,
 		bodyTok:    gs.AvgFieldLen[fBody] * n,
 		urlTok:     gs.AvgFieldLen[fURL] * n,
+		anchorTok:  gs.AvgFieldLen[fAnchor] * n,
 	}
 }
 

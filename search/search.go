@@ -53,8 +53,9 @@ type Query struct {
 	// deployment's L2 scores land on one scale so the aggregator's merge stays exact (doc
 	// 11, "Exactness up the tree", the partitioned-GlobalStats case). It is nil on the
 	// single-broker path, where the broker's own fleet averages are already the
-	// collection averages, and the field order is the online extractor's: title, body, url.
-	AvgFieldLen *[3]float64
+	// collection averages, and the field order is the online extractor's: title, body, url,
+	// anchor.
+	AvgFieldLen *[4]float64
 
 	// L0, when positive, overrides the shard's default L0 candidate width per plane, the
 	// first rung of the broker's degradation ladder: under budget pressure the broker

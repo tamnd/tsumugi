@@ -18,7 +18,7 @@ type recordingSearcher struct {
 	df      map[string]uint32
 	stats   GlobalStats
 	gotIDF  map[string]float64
-	gotAvg  *[3]float64
+	gotAvg  *[4]float64
 	gotTerm []string
 }
 

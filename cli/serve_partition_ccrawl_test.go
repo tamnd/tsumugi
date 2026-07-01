@@ -26,22 +26,33 @@ func lengthModelCCrawl(t *testing.T) *rank.Model {
 	nf := len(feature.DefaultSchema())
 	width := nf + int(search.NumOnline)
 	bodyCol := nf + int(search.OnBM25Body)
+	const groups, perGroup = 80, 12
 	d := &rank.Dataset{NumFeatures: width}
 	var s uint64 = 7
 	rnd := func() float64 {
 		s = s*6364136223846793005 + 1442695040888963407
 		return float64(s>>11) / float64(1<<53)
 	}
-	for q := 0; q < 80; q++ {
-		d.Groups = append(d.Groups, 12)
-		for i := 0; i < 12; i++ {
+	// Draw the body values first, so their position in the RNG stream is independent of the
+	// online-vector width. Growing the online vector by a feature then only appends noise
+	// columns rather than shifting every body value, so the learned body relationship, and the
+	// split points that discriminate the single-term BM25 range the queries land in, are stable.
+	body := make([]float64, groups*perGroup)
+	for i := range body {
+		body[i] = rnd() * 20
+	}
+	k := 0
+	for q := 0; q < groups; q++ {
+		d.Groups = append(d.Groups, perGroup)
+		for i := 0; i < perGroup; i++ {
 			row := make([]float64, width)
 			for f := range row {
 				row[f] = rnd()
 			}
-			row[bodyCol] = rnd() * 20
+			row[bodyCol] = body[k]
 			d.Features = append(d.Features, row)
-			d.Labels = append(d.Labels, row[bodyCol])
+			d.Labels = append(d.Labels, body[k])
+			k++
 		}
 	}
 	p := rank.DefaultParams()

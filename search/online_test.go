@@ -20,20 +20,22 @@ import (
 // when it is absent so the suite still runs on a machine without the corpus.
 const ccrawlParquet = "/Users/apple/data/ccrawl/markdown/CC-MAIN-2026-25/000000.parquet"
 
-// textDoc is a candidate's stored text, the three forward-region columns the online
-// features decode.
+// textDoc is a candidate's stored text, the four forward-region columns the online
+// features decode. anchor is the inbound link text the anchor BM25F reads, empty for the
+// documents whose tests do not exercise the anchor field.
 type textDoc struct {
-	url, title, body string
+	url, title, body, anchor string
 }
 
-// buildForward builds a forward region over the text docs with the url, title, and
-// body columns the extractor reads, the same schema the build writes.
+// buildForward builds a forward region over the text docs with the url, title, body, and
+// anchor columns the extractor reads, the same schema the build writes.
 func buildForward(t testing.TB, docs []textDoc) *forward.Region {
 	t.Helper()
 	cols := []forward.Column{
 		{Name: "url", Type: forward.ColString},
 		{Name: "title", Type: forward.ColString},
 		{Name: "body", Type: forward.ColString, Flags: forward.FlagBlob},
+		{Name: "anchor", Type: forward.ColString},
 	}
 	fb := forward.NewBuilder(cols)
 	for i, d := range docs {
@@ -41,6 +43,7 @@ func buildForward(t testing.TB, docs []textDoc) *forward.Region {
 		fb.Set(id, "url", []byte(d.url))
 		fb.Set(id, "title", []byte(d.title))
 		fb.Set(id, "body", []byte(d.body))
+		fb.Set(id, "anchor", []byte(d.anchor))
 	}
 	r, err := forward.Open(fb.Build())
 	if err != nil {
@@ -58,6 +61,7 @@ func buildForwardDict(t testing.TB, docs []textDoc) *forward.Region {
 		{Name: "url", Type: forward.ColString, Codec: forward.CodecZstdDict},
 		{Name: "title", Type: forward.ColString, Codec: forward.CodecZstdDict},
 		{Name: "body", Type: forward.ColString, Codec: forward.CodecZstdDict, Flags: forward.FlagBlob},
+		{Name: "anchor", Type: forward.ColString, Codec: forward.CodecZstdDict},
 	}
 	fb := forward.NewBuilder(cols)
 	for i, d := range docs {
@@ -65,6 +69,7 @@ func buildForwardDict(t testing.TB, docs []textDoc) *forward.Region {
 		fb.Set(id, "url", []byte(d.url))
 		fb.Set(id, "title", []byte(d.title))
 		fb.Set(id, "body", []byte(d.body))
+		fb.Set(id, "anchor", []byte(d.anchor))
 	}
 	r, err := forward.Open(fb.Build())
 	if err != nil {
@@ -78,7 +83,7 @@ func buildForwardDict(t testing.TB, docs []textDoc) *forward.Region {
 func extract(t testing.TB, q Query, docs []textDoc, idf map[string]float64, avgBody float64, id uint32) []float64 {
 	t.Helper()
 	fwd := buildForward(t, docs)
-	e := newOnlineExtractor(q, fwd, nil, idf, [3]float64{fBody: avgBody})
+	e := newOnlineExtractor(q, fwd, nil, idf, [4]float64{fBody: avgBody})
 	return e.features(id)
 }
 
@@ -105,6 +110,69 @@ func TestOnlineBM25RewardsIDF(t *testing.T) {
 	common := extract(t, Query{Text: "apple"}, docs, map[string]float64{"apple": 0.5}, 2, 0)
 	if rare[OnBM25Body] <= common[OnBM25Body] {
 		t.Fatalf("rarer term should score higher: rare %.4f, common %.4f", rare[OnBM25Body], common[OnBM25Body])
+	}
+}
+
+// TestOnlineAnchorBM25ScoresInboundText is the online counterpart of slice 98's offline
+// gate: a survivor whose query term appears only in its inbound anchor field, never in
+// its own body, title, or url, scores a positive anchor BM25 and a positive field-weighted
+// total, so the L2 reranker credits the off-page describes-me signal the same way the
+// retrieval plane already did.
+func TestOnlineAnchorBM25ScoresInboundText(t *testing.T) {
+	docs := []textDoc{
+		{body: "banana cherry date", anchor: "apple apple"},
+	}
+	f := extract(t, Query{Text: "apple"}, docs, map[string]float64{"apple": 1.0}, 3, 0)
+	if f[OnBM25Anchor] <= 0 {
+		t.Fatalf("a term in the anchor field should score a positive anchor bm25, got %.4f", f[OnBM25Anchor])
+	}
+	if f[OnBM25Body] != 0 {
+		t.Fatalf("the term is absent from the body, so body bm25 should be zero, got %.4f", f[OnBM25Body])
+	}
+	if f[OnBM25FTotal] <= 0 {
+		t.Fatalf("an anchor-only match should still lift the field-weighted total, got %.4f", f[OnBM25FTotal])
+	}
+}
+
+// TestOnlineAnchorWeightExceedsURL checks the anchor field carries its 2.0 field weight
+// in the online BM25F total, above the url field's 1.0: two documents match the same term
+// the same number of times with the same idf, one in the anchor field and one in the url,
+// and the anchor match yields the higher field-weighted total because its field weight is
+// larger. This is the online mirror of the offline BM25F weighting slice 98 relied on.
+func TestOnlineAnchorWeightExceedsURL(t *testing.T) {
+	idf := map[string]float64{"apple": 1.0}
+	anchorDoc := []textDoc{{body: "banana", anchor: "apple"}}
+	urlDoc := []textDoc{{body: "banana", url: "apple"}}
+	// avgField zero for every field leaves the length normalization at 1, so the only
+	// difference between the two totals is the field weight.
+	fa := newOnlineExtractor(Query{Text: "apple"}, buildForward(t, anchorDoc), nil, idf, [4]float64{}).features(0)
+	fu := newOnlineExtractor(Query{Text: "apple"}, buildForward(t, urlDoc), nil, idf, [4]float64{}).features(0)
+	if fa[OnBM25FTotal] <= fu[OnBM25FTotal] {
+		t.Fatalf("anchor weight 2.0 should outscore url weight 1.0: anchor %.4f, url %.4f", fa[OnBM25FTotal], fu[OnBM25FTotal])
+	}
+}
+
+// TestOnlineAnchorLengthNormalization checks the anchor field's BM25 is length-normalized
+// against its own fleet average, the same b_f normalization the other fields get: with an
+// anchor fleet average set, a longer anchor field normalizes a single match down relative to
+// a short one, so a term buried in a padded anchor field scores below the same term in a terse
+// one. A zero anchor average leaves the field unnormalized, the pre-fleet-stats fallback.
+func TestOnlineAnchorLengthNormalization(t *testing.T) {
+	idf := map[string]float64{"apple": 1.0}
+	short := []textDoc{{anchor: "apple"}}
+	long := []textDoc{{anchor: "apple filler filler filler filler filler filler filler"}}
+	q := Query{Text: "apple"}
+	// Fleet average anchor length of 2 tokens, so the long field (8 tokens) is penalized and
+	// the short field (1 token) rewarded relative to it.
+	fShort := newOnlineExtractor(q, buildForward(t, short), nil, idf, [4]float64{fAnchor: 2}).features(0)
+	fLong := newOnlineExtractor(q, buildForward(t, long), nil, idf, [4]float64{fAnchor: 2}).features(0)
+	if fShort[OnBM25Anchor] <= fLong[OnBM25Anchor] {
+		t.Fatalf("a match in a shorter anchor field should score higher: short %.4f, long %.4f", fShort[OnBM25Anchor], fLong[OnBM25Anchor])
+	}
+	// With no fleet average the normalization falls away, so both score the raw term frequency.
+	fUnnorm := newOnlineExtractor(q, buildForward(t, long), nil, idf, [4]float64{}).features(0)
+	if fUnnorm[OnBM25Anchor] <= fLong[OnBM25Anchor] {
+		t.Fatalf("unnormalized anchor bm25 should exceed the length-penalized one: unnorm %.4f, norm %.4f", fUnnorm[OnBM25Anchor], fLong[OnBM25Anchor])
 	}
 }
 
@@ -247,7 +315,7 @@ func TestOnlineDenseCosine(t *testing.T) {
 	}
 	docs := []textDoc{{body: "a"}, {body: "b"}}
 	fwd := buildForward(t, docs)
-	e := newOnlineExtractor(Query{Vector: base}, fwd, vr, nil, [3]float64{fBody: 1})
+	e := newOnlineExtractor(Query{Vector: base}, fwd, vr, nil, [4]float64{fBody: 1})
 	same := e.features(0)[OnDenseCosine]
 	diff := e.features(1)[OnDenseCosine]
 	if same < 0.99 {
@@ -377,7 +445,7 @@ func trainExactMatchModel(t testing.TB) *rank.Model {
 
 func TestOnlineMissingValues(t *testing.T) {
 	// No forward region: text features are zero, not invented.
-	e := newOnlineExtractor(Query{Text: "apple"}, nil, nil, map[string]float64{"apple": 1}, [3]float64{fBody: 5})
+	e := newOnlineExtractor(Query{Text: "apple"}, nil, nil, map[string]float64{"apple": 1}, [4]float64{fBody: 5})
 	f := e.features(0)
 	if f[OnBM25Body] != 0 || f[OnTermCoverage] != 0 {
 		t.Fatalf("absent text should leave text features zero, got bm25 %.4f cov %.4f", f[OnBM25Body], f[OnTermCoverage])
@@ -425,7 +493,7 @@ func TestOnlineFeaturesOnCCrawl(t *testing.T) {
 	for _, term := range terms {
 		idf[term] = 1.0
 	}
-	e := newOnlineExtractor(q, fwd, nil, idf, [3]float64{fBody: 200})
+	e := newOnlineExtractor(q, fwd, nil, idf, [4]float64{fBody: 200})
 
 	for id := range docs {
 		f := e.features(uint32(id))
@@ -483,7 +551,7 @@ func BenchmarkOnlineExtract(b *testing.B) {
 	for _, t := range lexical.Analyze(q.Text) {
 		idf[t] = 1.0
 	}
-	e := newOnlineExtractor(q, fwd, nil, idf, [3]float64{fBody: 200})
+	e := newOnlineExtractor(q, fwd, nil, idf, [4]float64{fBody: 200})
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -512,7 +580,7 @@ func BenchmarkOnlineExtractDict(b *testing.B) {
 	for _, t := range lexical.Analyze(q.Text) {
 		idf[t] = 1.0
 	}
-	e := newOnlineExtractor(q, fwd, nil, idf, [3]float64{fBody: 200})
+	e := newOnlineExtractor(q, fwd, nil, idf, [4]float64{fBody: 200})
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -589,8 +657,8 @@ func TestOnlineFeaturesBlockedMatchDict(t *testing.T) {
 		for _, tok := range lexical.Analyze(q.Text) {
 			idf[tok] = 1.0
 		}
-		eDict := newOnlineExtractor(q, dictFwd, nil, idf, [3]float64{fBody: 200})
-		eBlk := newOnlineExtractor(q, blkFwd, nil, idf, [3]float64{fBody: 200})
+		eDict := newOnlineExtractor(q, dictFwd, nil, idf, [4]float64{fBody: 200})
+		eBlk := newOnlineExtractor(q, blkFwd, nil, idf, [4]float64{fBody: 200})
 		for id := 0; id < len(docs); id++ {
 			a := eDict.features(uint32(id))
 			b := eBlk.features(uint32(id))
@@ -631,7 +699,7 @@ func BenchmarkOnlineExtractBlocked(b *testing.B) {
 	for _, t := range lexical.Analyze(q.Text) {
 		idf[t] = 1.0
 	}
-	e := newOnlineExtractor(q, fwd, nil, idf, [3]float64{fBody: 200})
+	e := newOnlineExtractor(q, fwd, nil, idf, [4]float64{fBody: 200})
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -666,7 +734,7 @@ func benchExtractLarge(b *testing.B, build func(testing.TB, []textDoc) *forward.
 	for _, t := range lexical.Analyze(q.Text) {
 		idf[t] = 1.0
 	}
-	e := newOnlineExtractor(q, fwd, nil, idf, [3]float64{fBody: 200})
+	e := newOnlineExtractor(q, fwd, nil, idf, [4]float64{fBody: 200})
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
