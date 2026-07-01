@@ -64,6 +64,22 @@ func BenchmarkCascadeRerank(b *testing.B) {
 	}
 }
 
+// BenchmarkTrain times a full LambdaMART fit over a mid-size ranking set: the
+// leaf-wise, histogram-binned trainer that produces the served ensemble. The
+// histogram binning is computed once and reused across rounds, so this measures the
+// per-round leaf-wise growth cost that the histogram method keeps linear in the
+// sample count.
+func BenchmarkTrain(b *testing.B) {
+	d := makeRankData(1, 200, 12, 16)
+	p := DefaultParams()
+	p.Rounds = 100
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = Train(d, p)
+	}
+}
+
 // BenchmarkNaiveRerank is the cost baseline the QuickScorer form has to beat: the
 // same 200 documents over the same ensemble with the naive root-to-leaf walk.
 func BenchmarkNaiveRerank(b *testing.B) {
