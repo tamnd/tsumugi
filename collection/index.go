@@ -35,10 +35,11 @@ const IndexName = "index.tsm"
 // indexMagic marks the artifact, distinct from a shard's TSM1.
 const indexMagic = "TSMI"
 
-// indexVersion 3 adds the per-field fleet average lengths to the body, on top of the
-// version 2 collection-wide analyzer hash. A reader refuses an older version, so a stale
-// artifact triggers a rebuild or the shard-scan fallback rather than a misread.
-const indexVersion = 3
+// indexVersion 4 adds the anchor field's fleet average length as a fourth per-field
+// entry, on top of the version 3 title/body/url averages and the version 2 collection-wide
+// analyzer hash. A reader refuses an older version, so a stale artifact triggers a rebuild
+// or the shard-scan fallback rather than a misread.
+const indexVersion = 4
 
 // Stats are the fleet-wide collection statistics, summed across every shard. A single
 // shard describes only its slice of the collection, so any scoring that normalizes by
@@ -49,13 +50,13 @@ type Stats struct {
 	TokenCount float64
 	AvgDocLen  float64
 
-	// AvgFieldLen is the fleet average length in tokens of the title, body, and url
-	// fields, in the online extractor's field order. The broker's per-field BM25F
+	// AvgFieldLen is the fleet average length in tokens of the title, body, url, and
+	// anchor fields, in the online extractor's field order. The broker's per-field BM25F
 	// normalizes each field by its own fleet average rather than the conflated average
 	// document length, so a candidate's field-weighted score is identical regardless of
 	// the shard it came from. Persisting them here lets a serve load the per-field
 	// denominators from one file rather than rescanning every shard's footer.
-	AvgFieldLen [3]float64
+	AvgFieldLen [4]float64
 }
 
 // Index is a loaded collection artifact: the manifest of shards, the fleet-wide
@@ -111,7 +112,7 @@ func WriteIndex(dir string, epoch uint64) error {
 		numShd:     len(infos),
 	}
 	hashSeen := false
-	var titleTok, bodyTok, urlTok float64
+	var titleTok, bodyTok, urlTok, anchorTok float64
 	for si, info := range infos {
 		r, err := tsumugi.Open(info.Path)
 		if err != nil {
@@ -134,6 +135,9 @@ func WriteIndex(dir string, epoch uint64) error {
 		}
 		if v, ok := r.Stat(tsumugi.StatURLTokenCount); ok {
 			urlTok += v
+		}
+		if v, ok := r.Stat(tsumugi.StatAnchorTokenCount); ok {
+			anchorTok += v
 		}
 		// Record the collection-wide analyzer hash, refusing a collection whose shards
 		// disagree: a mixed-analyzer collection cannot be queried consistently, so the
@@ -160,6 +164,7 @@ func WriteIndex(dir string, epoch uint64) error {
 		ix.Stats.AvgFieldLen[0] = titleTok / n
 		ix.Stats.AvgFieldLen[1] = bodyTok / n
 		ix.Stats.AvgFieldLen[2] = urlTok / n
+		ix.Stats.AvgFieldLen[3] = anchorTok / n
 	}
 
 	buf := ix.encode()
@@ -309,6 +314,7 @@ func (ix *Index) encodeBody() []byte {
 	b = codec.AppendUint64(b, math.Float64bits(ix.Stats.AvgFieldLen[0]))
 	b = codec.AppendUint64(b, math.Float64bits(ix.Stats.AvgFieldLen[1]))
 	b = codec.AppendUint64(b, math.Float64bits(ix.Stats.AvgFieldLen[2]))
+	b = codec.AppendUint64(b, math.Float64bits(ix.Stats.AvgFieldLen[3]))
 	b = codec.AppendUint64(b, ix.AnalyzerHash)
 
 	b = codec.AppendUint32(b, uint32(len(ix.Shards)))
@@ -383,6 +389,7 @@ func decodeIndex(b []byte) (*Index, error) {
 	ix.Stats.AvgFieldLen[0] = math.Float64frombits(p.u64())
 	ix.Stats.AvgFieldLen[1] = math.Float64frombits(p.u64())
 	ix.Stats.AvgFieldLen[2] = math.Float64frombits(p.u64())
+	ix.Stats.AvgFieldLen[3] = math.Float64frombits(p.u64())
 	ix.AnalyzerHash = p.u64()
 
 	nShard := int(p.u32())

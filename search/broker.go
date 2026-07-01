@@ -619,7 +619,7 @@ func (b *Broker) candidates(ctx context.Context, q Query, level DegradeLevel) (*
 // makes the parallel extraction byte-for-byte equal to the serial l2feat it replaces.
 // A survivor whose owner is unknown (no shard claimed it, the matrix-only fallback)
 // takes its gathered matrix row unchanged, exactly as the serial path returned base.
-func (b *Broker) extractRows(survivors []rank.Candidate, feats map[uint32][]float64, owner map[uint32]int, st *brokerState, q Query, avgField [3]float64) [][]float64 {
+func (b *Broker) extractRows(survivors []rank.Candidate, feats map[uint32][]float64, owner map[uint32]int, st *brokerState, q Query, avgField [4]float64) [][]float64 {
 	rows := make([][]float64, len(survivors))
 	if len(survivors) == 0 {
 		return rows

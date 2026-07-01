@@ -50,6 +50,7 @@ const (
 	OnQueryLength                             // number of distinct analyzed query terms, broadcast
 	OnIdfSum                                  // sum of query-term idf, broadcast
 	OnIdfMax                                  // the rarest query term's idf, broadcast
+	OnBM25Anchor                              // BM25 restricted to the inbound-anchor field
 	NumOnline                                 // count of online features, the online vector width
 )
 
@@ -75,7 +76,7 @@ type onlineExtractor struct {
 	vec        *vector.Region  // the int8 rerank vectors, for the dense cosine
 	qvec       []float32       // the dense query vector, nil when the query carries none
 	params     lexical.Params  // the BM25F knobs, the same the lexical plane scores with
-	avgField   [3]float64      // fleet average field length for title, body, url; zero means no normalization
+	avgField   [4]float64      // fleet average field length for title, body, url, anchor; zero means no normalization
 	queryLen   float64         // broadcast: distinct query-term count
 	idfSum     float64         // broadcast: sum of query-term idf
 	idfMax     float64         // broadcast: the rarest query term's idf
@@ -95,13 +96,15 @@ type onlineExtractor struct {
 }
 
 // field indices into the extractor's per-field arrays, kept local so the online
-// path names title, body, and url without importing the lexical field constants
-// that also carry the anchor field this build does not materialize.
+// path names the four fields without importing the lexical field constants; the order
+// matches lexical.Field so a per-field weight and length normalizer line up with the
+// offline BM25F the retrieval score is built from.
 const (
-	fTitle = 0
-	fBody  = 1
-	fURL   = 2
-	nField = 3
+	fTitle  = 0
+	fBody   = 1
+	fURL    = 2
+	fAnchor = 3
+	nField  = 4
 )
 
 // maxBodyScanRunes caps how far the online scan reads into the body field, the
@@ -123,12 +126,12 @@ const maxBodyScanRunes = 10000
 
 // newOnlineExtractor analyzes the query once and binds the regions the online
 // features read. idfOf is the per-term idf the broker pushed down, or nil to fall
-// back to a neutral idf; avgField is the fleet average length of the title, body, and
-// url fields the per-field BM25 normalizes each field by, a zero entry leaving that
+// back to a neutral idf; avgField is the fleet average length of the title, body, url,
+// and anchor fields the per-field BM25 normalizes each field by, a zero entry leaving that
 // field unnormalized. A query with no text yields an extractor whose text features
 // are all zero, which is the right answer for a pure-vector query: it has no terms to
 // cover or locate.
-func newOnlineExtractor(q Query, fwd *forward.Region, vec *vector.Region, idfOf map[string]float64, avgField [3]float64) *onlineExtractor {
+func newOnlineExtractor(q Query, fwd *forward.Region, vec *vector.Region, idfOf map[string]float64, avgField [4]float64) *onlineExtractor {
 	ordered := q.lexTerms()
 	seen := make(map[string]bool, len(ordered))
 	var terms []string
@@ -195,8 +198,8 @@ func termIDF(idf map[string]float64, t string) float64 {
 }
 
 // features returns the online feature vector for one candidate, in OnlineFeature
-// order. It decodes the candidate's title, body, and url from the forward region,
-// tokenizes each, and computes the per-field BM25, the coverage and exact-match
+// order. It decodes the candidate's title, body, url, and inbound-anchor field from the
+// forward region, tokenizes each, and computes the per-field BM25, the coverage and exact-match
 // signals, the proximity signals from the body token positions, and the url-match
 // signals, then the dense cosine from the vector region and the broadcast
 // query-shape signals. A query with no terms still returns the broadcast columns
@@ -212,13 +215,15 @@ func (e *onlineExtractor) features(localID uint32) []float64 {
 	tfTitle, streamTitle, lenTitle := e.scanField(localID, "title", fTitle)
 	tfBody, streamBody, lenBody := e.scanField(localID, "body", fBody)
 	tfURL, _, lenURL := e.scanField(localID, "url", fURL)
+	tfAnchor, _, lenAnchor := e.scanField(localID, "anchor", fAnchor)
 
 	// Per-field BM25 and the field-weighted total. The total mirrors the lexical
 	// plane's BM25F so the feature agrees with the retrieval score it refines.
 	out[OnBM25Title] = e.bm25(tfTitle, lenTitle, fTitle)
 	out[OnBM25Body] = e.bm25(tfBody, lenBody, fBody)
 	out[OnBM25URL] = e.bm25(tfURL, lenURL, fURL)
-	out[OnBM25FTotal] = e.bm25f(tfTitle, tfBody, tfURL, lenTitle, lenBody, lenURL)
+	out[OnBM25Anchor] = e.bm25(tfAnchor, lenAnchor, fAnchor)
+	out[OnBM25FTotal] = e.bm25f(tfTitle, tfBody, tfURL, tfAnchor, lenTitle, lenBody, lenURL, lenAnchor)
 
 	// Coverage and field hit counts from the per-field tf: a query term hits a field
 	// when its count there is non-zero, and it is covered when it hits any field.
@@ -419,8 +424,11 @@ func (e *onlineExtractor) bm25(tf []int, flen, f int) float64 {
 // and length-normalized, the weighted frequencies are summed across fields into tfF,
 // and the term contributes idf * tfF/(k1+tfF). Summed over the query terms this is
 // the field-weighted total the retrieval score is built from, so the feature and the
-// L0 score move together.
-func (e *onlineExtractor) bm25f(tfT, tfB, tfU []int, lenT, lenB, lenU int) float64 {
+// L0 score move together. The anchor field carries the 2.0 weight the offline BM25F
+// gives it, so a survivor named by inbound anchor text scores the same field-weighted
+// total the retrieval plane already ranked it by, closing the gap slice 98 left when it
+// populated the anchor field offline but left this online total three-field.
+func (e *onlineExtractor) bm25f(tfT, tfB, tfU, tfA []int, lenT, lenB, lenU, lenA int) float64 {
 	if len(e.terms) == 0 {
 		return 0
 	}
@@ -428,9 +436,11 @@ func (e *onlineExtractor) bm25f(tfT, tfB, tfU []int, lenT, lenB, lenU int) float
 	wT := e.params.Weight[lexical.FieldTitle]
 	wB := e.params.Weight[lexical.FieldBody]
 	wU := e.params.Weight[lexical.FieldURL]
+	wA := e.params.Weight[lexical.FieldAnchor]
 	normT := e.fieldNorm(lenT, fTitle)
 	normB := e.fieldNorm(lenB, fBody)
 	normU := e.fieldNorm(lenU, fURL)
+	normA := e.fieldNorm(lenA, fAnchor)
 	var total float64
 	for i := range e.terms {
 		var tfF float64
@@ -442,6 +452,9 @@ func (e *onlineExtractor) bm25f(tfT, tfB, tfU []int, lenT, lenB, lenU int) float
 		}
 		if tfU[i] > 0 {
 			tfF += wU * float64(tfU[i]) / normU
+		}
+		if tfA[i] > 0 {
+			tfF += wA * float64(tfA[i]) / normA
 		}
 		if tfF == 0 {
 			continue

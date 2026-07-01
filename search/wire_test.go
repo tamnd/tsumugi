@@ -13,7 +13,7 @@ import (
 // query. They exercise every nilable field in both its nil and its populated state, the
 // distinction the codec preserves.
 func sampleQueries() []Query {
-	avg := [3]float64{12.5, 480.25, 7.0}
+	avg := [4]float64{12.5, 480.25, 7.0}
 	return []Query{
 		{},
 		{Text: "raw string path", K: 10},

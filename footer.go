@@ -56,13 +56,14 @@ const (
 	// normalizing both against one mean misnormalizes both. These let the broker compute
 	// the fleet average title, body, and url length separately and feed each field's BM25
 	// its own denominator, the cross-shard normalization the merged top-k rests on.
-	StatTitleTokenCount = "title_token_count"
-	StatBodyTokenCount  = "body_token_count"
-	StatURLTokenCount   = "url_token_count"
-	StatEdgeCount       = "edge_count"
-	StatNodeMin         = "node_min"
-	StatNodeMax         = "node_max"
-	StatVectorDim       = "vector_dim"
+	StatTitleTokenCount  = "title_token_count"
+	StatBodyTokenCount   = "body_token_count"
+	StatURLTokenCount    = "url_token_count"
+	StatAnchorTokenCount = "anchor_token_count"
+	StatEdgeCount        = "edge_count"
+	StatNodeMin          = "node_min"
+	StatNodeMax          = "node_max"
+	StatVectorDim        = "vector_dim"
 	// StatAnalyzerHash records the hash of the analyzer the shard was built with, the
 	// consistency guard a broker checks before it queries the shard. It is a full
 	// 64-bit value carried through the float64 stats map by AnalyzerHashStat, which

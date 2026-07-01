@@ -165,7 +165,7 @@ func (binaryCodec) encodeQuery(q Query) ([]byte, error) {
 		}
 	}
 
-	// AvgFieldLen: a present flag, then the three field averages when set.
+	// AvgFieldLen: a present flag, then the four field averages when set.
 	if q.AvgFieldLen == nil {
 		buf = append(buf, 0)
 	} else {
@@ -213,8 +213,8 @@ func (binaryCodec) decodeQuery(b []byte) (Query, error) {
 	}
 
 	if r.flag() {
-		var a [3]float64
-		a[0], a[1], a[2] = r.f64(), r.f64(), r.f64()
+		var a [4]float64
+		a[0], a[1], a[2], a[3] = r.f64(), r.f64(), r.f64(), r.f64()
 		q.AvgFieldLen = &a
 	}
 

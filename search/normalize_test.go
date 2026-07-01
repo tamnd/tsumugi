@@ -16,9 +16,9 @@ func TestOnlineBM25NormalizesTitle(t *testing.T) {
 	fwd := buildForward(t, docs)
 	// avgField title set below the field's length, so the field is longer than the
 	// fleet average and normalization must pull its score down.
-	normalized := newOnlineExtractor(q, fwd, nil, idf, [3]float64{fTitle: 2}).features(0)
+	normalized := newOnlineExtractor(q, fwd, nil, idf, [4]float64{fTitle: 2}).features(0)
 	// avgField title zero, the old no-normalization behavior, the baseline to beat.
-	unnormalized := newOnlineExtractor(q, fwd, nil, idf, [3]float64{}).features(0)
+	unnormalized := newOnlineExtractor(q, fwd, nil, idf, [4]float64{}).features(0)
 
 	if normalized[OnBM25Title] <= 0 {
 		t.Fatalf("title bm25 of a present term should be positive, got %.4f", normalized[OnBM25Title])
@@ -38,8 +38,8 @@ func TestOnlineBM25NormalizesURL(t *testing.T) {
 	idf := map[string]float64{"apple": 1.0}
 
 	fwd := buildForward(t, docs)
-	normalized := newOnlineExtractor(q, fwd, nil, idf, [3]float64{fURL: 2}).features(0)
-	unnormalized := newOnlineExtractor(q, fwd, nil, idf, [3]float64{}).features(0)
+	normalized := newOnlineExtractor(q, fwd, nil, idf, [4]float64{fURL: 2}).features(0)
+	unnormalized := newOnlineExtractor(q, fwd, nil, idf, [4]float64{}).features(0)
 
 	if normalized[OnBM25URL] <= 0 {
 		t.Fatalf("url bm25 of a present term should be positive, got %.4f", normalized[OnBM25URL])
@@ -63,7 +63,7 @@ func TestOnlineBM25FUsesPerFieldAverages(t *testing.T) {
 	}
 	q := Query{Text: "apple"}
 	idf := map[string]float64{"apple": 1.0}
-	avg := [3]float64{fTitle: 2, fBody: 3, fURL: 1}
+	avg := [4]float64{fTitle: 2, fBody: 3, fURL: 1}
 
 	fwd := buildForward(t, docs)
 	e := newOnlineExtractor(q, fwd, nil, idf, avg)

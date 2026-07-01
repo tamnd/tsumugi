@@ -367,7 +367,7 @@ func (s *Shard) Search(q Query) []Hit {
 // override; a nil map falls back to the shard-local idf when the lexical region can
 // supply it. avgField is the per-field average length BM25 normalizes each field by,
 // the fleet averages on the fan-out path or this shard's own on the single-shard path.
-func (s *Shard) newOnline(q Query, idfOf map[string]float64, avgField [3]float64) *onlineExtractor {
+func (s *Shard) newOnline(q Query, idfOf map[string]float64, avgField [4]float64) *onlineExtractor {
 	if idfOf == nil && s.lex != nil {
 		idfOf = s.localIDF(q.lexTerms())
 	}
@@ -408,11 +408,11 @@ func (s *Shard) localIDF(terms []string) map[string]float64 {
 // normalizer for the single-shard path where this shard's own statistics are the
 // collection statistics. It reads the per-field token sums the build recorded and
 // divides by the document count, indexed in the online extractor's field order
-// (title, body, url). The body falls back to the token_count sum when the per-field
+// (title, body, url, anchor). The body falls back to the token_count sum when the per-field
 // stat is absent, the way a shard built before the per-field sums normalized it;
-// title and url fall back to zero, leaving those fields unnormalized as they were.
-func (s *Shard) localAvgFieldLen() [3]float64 {
-	var avg [3]float64
+// title, url, and anchor fall back to zero, leaving those fields unnormalized as they were.
+func (s *Shard) localAvgFieldLen() [4]float64 {
+	var avg [4]float64
 	if s.docCount == 0 {
 		return avg
 	}
@@ -427,6 +427,9 @@ func (s *Shard) localAvgFieldLen() [3]float64 {
 	}
 	if v, ok := s.r.Stat(tsumugi.StatURLTokenCount); ok {
 		avg[fURL] = v / n
+	}
+	if v, ok := s.r.Stat(tsumugi.StatAnchorTokenCount); ok {
+		avg[fAnchor] = v / n
 	}
 	return avg
 }

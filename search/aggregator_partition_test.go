@@ -21,10 +21,10 @@ func TestAggregatorStatsFoldsChildren(t *testing.T) {
 	// Child A: 100 docs averaging 10 body tokens. Child B: 300 docs averaging 50. The fold is
 	// (100*10 + 300*50) / 400 = 40, not the flat mean (10+50)/2 = 30.
 	a := &recordingSearcher{shards: 1, docs: 100, stats: GlobalStats{
-		DocCount: 100, TokenCount: 1000, AvgDocLen: 10, AvgFieldLen: [3]float64{0, 10, 0},
+		DocCount: 100, TokenCount: 1000, AvgDocLen: 10, AvgFieldLen: [4]float64{0, 10, 0},
 	}}
 	b := &recordingSearcher{shards: 1, docs: 300, stats: GlobalStats{
-		DocCount: 300, TokenCount: 15000, AvgDocLen: 50, AvgFieldLen: [3]float64{0, 50, 0},
+		DocCount: 300, TokenCount: 15000, AvgDocLen: 50, AvgFieldLen: [4]float64{0, 50, 0},
 	}}
 	agg := NewAggregator([]Searcher{a, b})
 
@@ -42,7 +42,7 @@ func TestAggregatorStatsFoldsChildren(t *testing.T) {
 	// The fold composes through a sub-aggregator: a root over the aggregator and a third child
 	// reports the average over all three children's documents.
 	c := &recordingSearcher{shards: 1, docs: 100, stats: GlobalStats{
-		DocCount: 100, TokenCount: 100, AvgDocLen: 1, AvgFieldLen: [3]float64{0, 1, 0},
+		DocCount: 100, TokenCount: 100, AvgDocLen: 1, AvgFieldLen: [4]float64{0, 1, 0},
 	}}
 	root := NewAggregator([]Searcher{agg, c})
 	rgs := root.Stats()
@@ -64,10 +64,10 @@ func TestAggregatorStatsFoldsChildren(t *testing.T) {
 // with no lexical terms triggers no push.
 func TestAggregatorPushesUnifiedAvgFieldLen(t *testing.T) {
 	a := &recordingSearcher{shards: 1, docs: 100, stats: GlobalStats{
-		DocCount: 100, TokenCount: 1000, AvgDocLen: 10, AvgFieldLen: [3]float64{0, 10, 0},
+		DocCount: 100, TokenCount: 1000, AvgDocLen: 10, AvgFieldLen: [4]float64{0, 10, 0},
 	}}
 	b := &recordingSearcher{shards: 1, docs: 300, stats: GlobalStats{
-		DocCount: 300, TokenCount: 15000, AvgDocLen: 50, AvgFieldLen: [3]float64{0, 50, 0},
+		DocCount: 300, TokenCount: 15000, AvgDocLen: 50, AvgFieldLen: [4]float64{0, 50, 0},
 	}}
 	agg := NewAggregator([]Searcher{a, b})
 
@@ -89,7 +89,7 @@ func TestAggregatorPushesUnifiedAvgFieldLen(t *testing.T) {
 
 	// A query that already carries an AvgFieldLen override is left alone, so a caller can pin it.
 	a.gotAvg, b.gotAvg = nil, nil
-	pinned := [3]float64{1, 2, 3}
+	pinned := [4]float64{1, 2, 3}
 	agg.SearchComplete(context.Background(), Query{Terms: []string{"common"}, AvgFieldLen: &pinned, K: 10})
 	if a.gotAvg == nil || *a.gotAvg != pinned {
 		t.Fatalf("a pinned AvgFieldLen was overwritten: got %v", a.gotAvg)
@@ -333,7 +333,7 @@ func TestBrokerHonorsAvgFieldLenOverride(t *testing.T) {
 
 	// A different override changes the scores, proving the broker really normalizes against the
 	// pushed averages rather than ignoring them.
-	other := [3]float64{0, ownAvg[fBody] * 4, 0}
+	other := [4]float64{0, ownAvg[fBody] * 4, 0}
 	qOther := base
 	qOther.AvgFieldLen = &other
 	got := b.Search(ctx, qOther)

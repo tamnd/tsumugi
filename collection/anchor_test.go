@@ -10,6 +10,7 @@ import (
 	"github.com/tamnd/tsumugi"
 	"github.com/tamnd/tsumugi/analyze"
 	"github.com/tamnd/tsumugi/convert"
+	"github.com/tamnd/tsumugi/feature"
 	"github.com/tamnd/tsumugi/forward"
 	"github.com/tamnd/tsumugi/lexical"
 )
@@ -327,5 +328,67 @@ func TestAnchorFieldMakesInboundTermSearchable(t *testing.T) {
 				t.Fatalf("target body unexpectedly contains %q, test is not isolating the anchor field", w)
 			}
 		}
+	}
+}
+
+// TestAnchorFieldLengthFeaturePopulated checks the query-independent feature matrix
+// carries the anchor-field-length column the ranking model reads: a document with inbound
+// anchor text has a positive FeatAnchorFieldLen, and a source document that no page links
+// has none. The anchor field length is a collection-wide quantity known only after the
+// inversion, so the build sets it after assembling each document's anchor field rather than
+// in the per-document analyze stage, and this pins that it lands in the matrix.
+func TestAnchorFieldLengthFeaturePopulated(t *testing.T) {
+	tmp := t.TempDir()
+	src, targetURL := writeAnchorJSONL(t, tmp)
+	out := filepath.Join(tmp, "coll")
+	if _, err := Build(Options{Source: src, Out: out, ShardSize: 1000}); err != nil {
+		t.Fatal(err)
+	}
+	infos, err := List(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := tsumugi.Open(infos[0].Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = r.Close() }()
+
+	fb, err := r.Region(tsumugi.RegionForward)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fwd, err := forward.Open(fb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ffb, err := r.Region(tsumugi.RegionFeature)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fr, err := feature.Open(ffb)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	targetID := findByURL(t, fwd, r.DocCount(), targetURL)
+	v, ok := fr.Value(targetID, feature.FeatAnchorFieldLen)
+	if !ok {
+		t.Fatalf("target has no anchor-field-length feature")
+	}
+	if v <= 0 {
+		t.Fatalf("target with inbound anchor text should have a positive anchor field length, got %g", v)
+	}
+
+	// A source document nothing links to has an empty anchor field, so its anchor length
+	// feature is zero. This guards that the positive value above is the inbound text, not a
+	// constant the build stamps on every document.
+	sourceID := findByURL(t, fwd, r.DocCount(), "https://source.example/a")
+	sv, ok := fr.Value(sourceID, feature.FeatAnchorFieldLen)
+	if !ok {
+		t.Fatalf("source has no anchor-field-length feature")
+	}
+	if sv > 0.001 {
+		t.Fatalf("a document with no inbound anchor text should have zero anchor field length, got %g", sv)
 	}
 }
