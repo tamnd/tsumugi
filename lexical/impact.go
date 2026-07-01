@@ -1,6 +1,7 @@
 package lexical
 
 import (
+	"context"
 	"errors"
 	"math"
 	"sort"
@@ -318,6 +319,34 @@ func (r *Region) SearchImpactTerms(terms []string, k int) ([]Candidate, error) {
 	}
 	return r.prunedImpact(infos, k)
 }
+
+// SearchImpactTermsCtx is SearchImpactTerms threaded with the query's context, the deadline-
+// aware path the shard fan-out takes. The pruned traversal polls the context on a stride and
+// abandons the walk if the deadline passes, returning context.Canceled with the partial it
+// gathered so the shard drops its result rather than serve a half-walked list, the same
+// contract SearchTermsCtx gives the docID-ordered plane. A context with no deadline never
+// trips, so the un-budgeted callers keep their behavior.
+func (r *Region) SearchImpactTermsCtx(ctx context.Context, terms []string, k int) ([]Candidate, error) {
+	if !r.impact {
+		return nil, errNotImpactRegion
+	}
+	infos := r.termInfos(terms, nil)
+	if len(infos) == 0 {
+		return nil, nil
+	}
+	cands, _, completed, err := r.prunedImpactCore(ctx, infos, k)
+	if err != nil {
+		return nil, err
+	}
+	if !completed {
+		return cands, context.Canceled
+	}
+	return cands, nil
+}
+
+// IsImpact reports whether this region's posting lists are impact-ordered, so a caller
+// serving it picks the impact traversal over the docID-ordered BM25F path.
+func (r *Region) IsImpact() bool { return r.impact }
 
 // impactBlockInvariant decodes every block of every impact-ordered list and checks the
 // ordering properties the pruning rests on: the postings within a block run impact-

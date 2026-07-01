@@ -94,6 +94,47 @@ func compositeStaticRank(docs []convert.Document, s graphSignals) []float64 {
 	return rank
 }
 
+// impactQuantScale is the top of the one-byte impact range the static rank quantizes into,
+// the largest value an impact posting carries. The whole [0,255] byte is used so the rank
+// spreads across the full resolution the impact codec stores.
+const impactQuantScale = 255
+
+// quantizeImpact maps the composite static rank of each document to the one-byte impact the
+// impact-ordered lexical region orders and scores by. The composite rank is an unbounded
+// weighted sum (authority terms add, spam and near-dup subtract), so it is min-max
+// normalized over the shard and scaled to [0,255], a monotone map that preserves the rank
+// order the Block-Max Pruning walk terminates on. A degenerate shard whose ranks are all
+// equal maps every document to the top of the range rather than to zero, so query-term
+// coverage still orders the results instead of every score collapsing to zero. The build
+// and the oracle call this one function, so they agree on the impact byte by construction.
+func quantizeImpact(rank []float64) []uint8 {
+	out := make([]uint8, len(rank))
+	if len(rank) == 0 {
+		return out
+	}
+	lo, hi := rank[0], rank[0]
+	for _, v := range rank {
+		if v < lo {
+			lo = v
+		}
+		if v > hi {
+			hi = v
+		}
+	}
+	span := hi - lo
+	if span <= 0 {
+		for i := range out {
+			out[i] = impactQuantScale
+		}
+		return out
+	}
+	for i, v := range rank {
+		q := (v - lo) / span * impactQuantScale
+		out[i] = uint8(math.Round(q))
+	}
+	return out
+}
+
 // langConsistencyAt reads the language-consistency score of document i, defaulting to the
 // neutral value when the signal is absent. The full build always populates it, but the
 // direct-call tests build a graphSignals from the authority and spam columns alone, and a

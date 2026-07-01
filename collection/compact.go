@@ -10,6 +10,7 @@ import (
 	"github.com/tamnd/tsumugi"
 	"github.com/tamnd/tsumugi/convert"
 	"github.com/tamnd/tsumugi/forward"
+	"github.com/tamnd/tsumugi/lexical"
 )
 
 // Compact merges a collection's shards into fewer, larger ones at the given shard
@@ -32,6 +33,13 @@ func Compact(dir string, shardSize int, epoch uint64) (Result, error) {
 	}
 
 	docs, hosts, err := gatherDocs(infos)
+	if err != nil {
+		return Result{}, err
+	}
+	// Preserve the posting ordering the collection was built with: a compact of an
+	// impact-ordered collection must rebuild impact-ordered, or it would silently
+	// downgrade the shards to BM25F and serve them through the wrong plane.
+	impact, err := shardsAreImpact(infos)
 	if err != nil {
 		return Result{}, err
 	}
@@ -71,7 +79,7 @@ func Compact(dir string, shardSize int, epoch uint64) (Result, error) {
 	// A compact rebuilds with no curated seeds, the same default a build with none uses,
 	// so its configuration digest folds in the empty seed lists. The epoch is passed in
 	// so a pinned-epoch compact is byte-identical, the same reproducibility a build gets.
-	meta := shardMeta{epoch: epoch, configHash: buildConfigHash(shardSize, nil, nil)}
+	meta := shardMeta{epoch: epoch, configHash: buildConfigHash(shardSize, nil, nil, impact), impact: impact}
 
 	res := Result{Docs: len(docs), Hosts: hosts}
 	var base uint32
@@ -160,6 +168,37 @@ func gatherDocs(infos []ShardInfo) ([]convert.Document, int, error) {
 		_ = r.Close()
 	}
 	return docs, len(hosts), nil
+}
+
+// shardsAreImpact reports whether the collection's shards are impact-ordered, read from the
+// first shard that carries a lexical region. The build writes every shard the same way, so
+// one shard settles the mode; a collection with no lexical region anywhere is treated as
+// docID-ordered, the default a rebuild with no impact flag produces.
+func shardsAreImpact(infos []ShardInfo) (bool, error) {
+	for _, in := range infos {
+		r, err := tsumugi.Open(in.Path)
+		if err != nil {
+			return false, err
+		}
+		if !r.HasRegion(tsumugi.RegionLexical) {
+			_ = r.Close()
+			continue
+		}
+		b, err := r.Region(tsumugi.RegionLexical)
+		if err != nil {
+			_ = r.Close()
+			return false, err
+		}
+		reg, err := lexical.Open(b)
+		if err != nil {
+			_ = r.Close()
+			return false, err
+		}
+		impact := reg.IsImpact()
+		_ = r.Close()
+		return impact, nil
+	}
+	return false, nil
 }
 
 // hostOf parses the host back out of a url, the field the build ordered on, so a

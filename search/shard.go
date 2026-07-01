@@ -305,6 +305,12 @@ func (s *Shard) retrieve(ctx context.Context, q Query) (lex, dense []scored, fea
 // present, so the shard does not re-run the analysis chain on the fan-out path.
 func (s *Shard) lexSearch(ctx context.Context, q Query, k int) ([]lexical.Candidate, error) {
 	terms := q.lexTerms()
+	// An impact-ordered region scores query-term coverage weighted by the static rank the
+	// postings are ordered by; it takes no idf, so the broker's pushed-down idf does not
+	// apply and the impact traversal serves it directly.
+	if s.lex.IsImpact() {
+		return s.lex.SearchImpactTermsCtx(ctx, terms, k)
+	}
 	if q.TermIDF != nil {
 		return s.lex.SearchTermsWithIDFCtx(ctx, terms, k, q.TermIDF)
 	}

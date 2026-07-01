@@ -24,6 +24,7 @@ import (
 type shardMeta struct {
 	epoch      uint64
 	configHash uint64
+	impact     bool // build the lexical region impact-ordered from the static rank
 }
 
 // buildConfigHash digests the build configuration into the 64-bit value every shard
@@ -36,7 +37,7 @@ type shardMeta struct {
 // on. It deliberately leaves out the build epoch and the corpus: the epoch is recorded
 // separately in the header, and the digest is meant to identify the configuration, not
 // the particular crawl, so the same configuration over a different corpus keeps it.
-func buildConfigHash(shardSize int, trustSeeds, spamSeeds []string) uint64 {
+func buildConfigHash(shardSize int, trustSeeds, spamSeeds []string, impact bool) uint64 {
 	h := fnv.New64a()
 	var u [8]byte
 	put := func(v uint64) {
@@ -49,6 +50,14 @@ func buildConfigHash(shardSize int, trustSeeds, spamSeeds []string) uint64 {
 	put(indexVersion)
 	put(lexical.DefaultAnalyzer.Hash())
 	put(uint64(shardSize))
+	// The posting ordering is a configuration input: an impact-ordered build produces
+	// different posting bodies than a docID-ordered one, so the digest must separate them
+	// or a reproducibility check would call two differently-ordered collections identical.
+	if impact {
+		put(1)
+	} else {
+		put(0)
+	}
 	putSeeds := func(seeds []string) {
 		s := append([]string(nil), seeds...)
 		sort.Strings(s)
@@ -95,6 +104,15 @@ type Options struct {
 	// to the current time so an operational build still records when it ran. Zero is a
 	// valid pinned epoch, the deterministic default for a library caller or a test.
 	BuildEpoch uint64
+
+	// Impact builds the lexical region impact-ordered rather than docID-ordered: each
+	// shard's posting lists are sorted by the composite static rank quantized to a byte,
+	// and served by the early-termination traversal that scores query-term coverage
+	// weighted by that rank (spec doc 04's second ordering). It is the inference-free
+	// retrieval mode: no learned per-term weights, the static rank alone orders and scores.
+	// The dictionary and every other region are unchanged, so routing and the feature and
+	// forward planes are identical; only the posting bodies and their order differ.
+	Impact bool
 }
 
 // Result reports what a build or add produced.
@@ -223,7 +241,8 @@ func build(opts Options, baseStart uint32, indexStart int, recrawl bool) (Result
 	// re-deriving the digest per shard and guarantees the shards cannot disagree.
 	meta := shardMeta{
 		epoch:      opts.BuildEpoch,
-		configHash: buildConfigHash(opts.ShardSize, opts.TrustSeeds, opts.SpamSeeds),
+		configHash: buildConfigHash(opts.ShardSize, opts.TrustSeeds, opts.SpamSeeds, opts.Impact),
+		impact:     opts.Impact,
 	}
 
 	res := Result{Docs: len(docs), Hosts: hosts}
@@ -473,8 +492,18 @@ func writeShard(path string, docs []convert.Document, sig graphSignals, base uin
 		w.SetStat(tsumugi.StatAvgDocLen, tokens/float64(len(docs)))
 	}
 	// Build the region bytes now so the feature dequant constants and the lexical term
-	// count can be read back into the footer before the regions are written.
-	lexBytes := lb.Build()
+	// count can be read back into the footer before the regions are written. An impact
+	// build orders and scores the postings by the composite static rank quantized to a
+	// byte; the docID-ordered build is the classic BM25F region. Both reuse the same
+	// accumulated term set, so the dictionary, the bloom filter, and every other region
+	// are identical and only the posting bodies differ.
+	var lexBytes []byte
+	if meta.impact {
+		impacts := quantizeImpact(sig.staticRank)
+		lexBytes = lb.BuildImpact(func(id uint32) uint8 { return impacts[id] })
+	} else {
+		lexBytes = lb.Build()
+	}
 	featBytes := fb.Build()
 	if lr, err := lexical.Open(lexBytes); err == nil {
 		w.SetStat(tsumugi.StatTermCount, float64(lr.TermCount()))

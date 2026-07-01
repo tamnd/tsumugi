@@ -1,5 +1,7 @@
 package lexical
 
+import "context"
+
 // This is the pruned traversal the impact ordering exists for. The exhaustive impact
 // scorer decodes every posting of every list; this one decodes them highest impact first
 // and stops as soon as the top-k is settled, so on a query whose common terms fill the
@@ -97,28 +99,38 @@ func (c *impactCursor) advance() error {
 	return c.loadNext()
 }
 
-// prunedImpact is the impact-ordered top-k traversal, the serving path. It returns the same
-// top-k the exhaustive scan does, discarding the postings-examined count prunedImpactStats
-// also reports.
+// prunedImpact is the impact-ordered top-k traversal, the serving path with no deadline. It
+// returns the same top-k the exhaustive scan does, discarding the postings-examined count
+// and the completed flag prunedImpactCore also reports; without a deadline the walk always
+// completes.
 func (r *Region) prunedImpact(infos []termInfo, k int) ([]Candidate, error) {
-	cands, _, err := r.prunedImpactStats(infos, k)
+	cands, _, _, err := r.prunedImpactCore(context.Background(), infos, k)
 	return cands, err
 }
 
-// prunedImpactStats runs the traversal and also returns how many postings it examined, the
-// number the skip test asserts is below the list length and the impl note quotes for the
-// skip win. It merges the query-term cursors by descending impact then ascending docID,
-// groups the postings that share an (impact, docID) into one document, and stops once the
-// top-k is full and no remaining document can reach the k-th score.
+// prunedImpactStats runs the traversal with no deadline and returns how many postings it
+// examined, the number the skip test asserts is below the list length and the impl note
+// quotes for the skip win.
 func (r *Region) prunedImpactStats(infos []termInfo, k int) ([]Candidate, int, error) {
+	cands, examined, _, err := r.prunedImpactCore(context.Background(), infos, k)
+	return cands, examined, err
+}
+
+// prunedImpactCore is the traversal. It merges the query-term cursors by descending impact
+// then ascending docID, groups the postings that share an (impact, docID) into one document,
+// and stops once the top-k is full and no remaining document can reach the k-th score. It
+// polls ctx on the same stride BlockMax-WAND uses and returns completed=false with the
+// partial it gathered if the deadline passes mid-walk, so a preempted shard drops its result
+// rather than serve a half-walked list; it also returns the number of postings examined.
+func (r *Region) prunedImpactCore(ctx context.Context, infos []termInfo, k int) ([]Candidate, int, bool, error) {
 	if !r.impact {
-		return nil, 0, errNotImpactRegion
+		return nil, 0, false, errNotImpactRegion
 	}
 	cursors := make([]*impactCursor, 0, len(infos))
 	for _, info := range infos {
 		c, err := r.openImpactCursor(info.entry)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, false, err
 		}
 		if !c.done {
 			cursors = append(cursors, c)
@@ -139,6 +151,9 @@ func (r *Region) prunedImpactStats(infos []termInfo, k int) ([]Candidate, int, e
 	}
 
 	for len(cursors) > 0 {
+		if (examined&wandPreemptStride) == 0 && ctx.Err() != nil {
+			return tk.results(), examined, false, nil
+		}
 		// The next posting to process is the one with the highest impact, breaking a tie
 		// toward the smaller docID so a document's postings and the docID order the top-k
 		// prefers both fall out of the merge directly.
@@ -161,7 +176,7 @@ func (r *Region) prunedImpactStats(infos []termInfo, k int) ([]Candidate, int, e
 		if tk.full && newDoc {
 			if int32(len(cursors))*int32(c.curImpact) < tk.threshold {
 				finalize()
-				return tk.results(), examined, nil
+				return tk.results(), examined, true, nil
 			}
 		}
 
@@ -177,12 +192,12 @@ func (r *Region) prunedImpactStats(infos []termInfo, k int) ([]Candidate, int, e
 		}
 
 		if err := c.advance(); err != nil {
-			return nil, 0, err
+			return nil, 0, false, err
 		}
 		if c.done {
 			cursors = append(cursors[:best], cursors[best+1:]...)
 		}
 	}
 	finalize()
-	return tk.results(), examined, nil
+	return tk.results(), examined, true, nil
 }
