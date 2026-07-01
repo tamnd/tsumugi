@@ -63,6 +63,11 @@ func Compact(dir string, shardSize int, epoch uint64) (Result, error) {
 	urlDir := buildDir(docs)
 	gids := AssignGlobalIDs(docs, DefaultPartitionParams())
 
+	// Re-gather the inbound anchor fields over the reordered set the same way a fresh
+	// build does, so the compacted shards index the anchor field they would have if built
+	// whole, indexed by the same node-id order the shards slice their documents by.
+	anchors := anchorFields(docs, urlDir)
+
 	// Recompute the collection-wide link signals over the reordered set the same way a
 	// fresh build does: build every shard's graph region first, then join them with the
 	// cross-shard rank loops, so the compacted shards carry the signals as if built whole
@@ -85,7 +90,7 @@ func Compact(dir string, shardSize int, epoch uint64) (Result, error) {
 	var base uint32
 	index := 0
 	for _, sl := range layouts {
-		n, err := writeShard(shardPath(staging, index), docs[sl.lo:sl.hi], sig.slice(sl.lo, sl.hi), base, sl.gregion, meta)
+		n, err := writeShard(shardPath(staging, index), docs[sl.lo:sl.hi], anchors[sl.lo:sl.hi], sig.slice(sl.lo, sl.hi), base, sl.gregion, meta)
 		if err != nil {
 			_ = os.RemoveAll(staging)
 			return Result{}, err
